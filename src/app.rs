@@ -1,6 +1,8 @@
+use crate::input::event_to_bytes;
 use crate::ssh::{SshConfig, SshSession};
 use crate::terminal::TerminalView;
 use egui::{Color32, RichText};
+use std::time::Duration;
 
 /// Top-level application state.
 pub struct RustTermApp {
@@ -20,7 +22,7 @@ pub struct RustTermApp {
     // Whether a connect is in flight.
     connecting: bool,
 
-    // Receiver for the SSH session result (connect is async-ish).
+    // Receiver for the SSH session result (connect runs on a background thread).
     pending: Option<std::sync::mpsc::Receiver<anyhow::Result<SshSession>>>,
 }
 
@@ -28,6 +30,10 @@ struct ActiveSession {
     view: TerminalView,
     session: SshSession,
     title: String,
+    /// Whether we have requested initial keyboard focus yet. We request
+    /// focus once, then only on click; re-requesting every frame fights
+    /// the focus-lock filter and causes arrow-key flicker.
+    focus_requested: bool,
 }
 
 impl RustTermApp {
@@ -82,13 +88,12 @@ impl RustTermApp {
 
         match rx.try_recv() {
             Ok(Ok(session)) => {
-                let mut view = TerminalView::new(80, 24);
-                // Ask the remote shell to send an initial prompt / redraw.
-                // We'll feed whatever arrives via drain in update().
+                let view = TerminalView::new(80, 24);
                 self.session = Some(ActiveSession {
                     view,
                     session,
                     title: format!("{}@{}", self.username, self.host),
+                    focus_requested: false,
                 });
                 self.connecting = false;
                 self.status = "Connected.".to_owned();
@@ -101,8 +106,7 @@ impl RustTermApp {
                 self.pending = None;
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
-                // Still connecting; keep polling.
-                ctx.request_repaint_after(std::time::Duration::from_millis(50));
+                ctx.request_repaint_after(Duration::from_millis(50));
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.error = Some("Connection thread died unexpectedly.".to_owned());
@@ -143,10 +147,8 @@ impl RustTermApp {
         if self.connecting {
             ui.spinner();
             ui.label("Connecting…");
-        } else {
-            if ui.button("Connect").clicked() {
-                self.start_connect(ctx);
-            }
+        } else if ui.button("Connect").clicked() {
+            self.start_connect(ctx);
         }
 
         if let Some(err) = &self.error {
@@ -155,74 +157,84 @@ impl RustTermApp {
         }
 
         ui.add_space(8.0);
-        ui.label(RichText::new(&self.status).weak());
+        ui.label(RichText::new(self.status.as_str()).weak());
     }
 
     fn terminal_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let Some(active) = &mut self.session else {
-            return;
-        };
+        // Defer the disconnect so we don't mutate `self.session` while it is
+        // borrowed by `active`.
+        let mut disconnect = false;
 
-        // Drain pending SSH output into the terminal parser.
-        for chunk in active.session.drain_output() {
-            active.view.feed(&chunk);
-        }
-
-        // Header bar.
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(&active.title).strong());
-            ui.separator();
-            if ui.button("Disconnect").clicked() {
-                self.session = None;
-                self.status = "Disconnected.".to_owned();
-                return;
+        if let Some(active) = &mut self.session {
+            // Drain pending SSH output into the terminal parser.
+            for chunk in active.session.drain_output() {
+                active.view.feed(&chunk);
             }
-        });
 
-        ui.separator();
+            // Forward any grid resize to the remote pty.
+            if let Some((cols, rows)) = active.view.take_resize() {
+                active.session.resize(cols, rows);
+            }
 
-        // Terminal area fills the rest of the window.
-        let response = active.view.ui(ui);
+            // Header bar.
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(active.title.as_str()).strong());
+                ui.separator();
+                if ui.button("Disconnect").clicked() {
+                    disconnect = true;
+                }
+            });
+            ui.separator();
 
-        // Keyboard input: feed printable chars and common control keys.
-        if response.has_focus() || response.clicked() {
-            let events = ui.input(|i| i.events.clone());
-            for event in events {
-                match event {
-                    egui::Event::Text(text) => {
-                        active.session.write(text.into_bytes());
+            // Terminal area fills the rest of the window.
+            let response = active.view.ui(ui);
+
+            // Request focus on first appearance and on click only.
+            // Do NOT re-request every frame: that fights the lock filter
+            // and makes arrow keys flicker through the Disconnect button.
+            if !active.focus_requested {
+                response.request_focus();
+                active.focus_requested = true;
+            }
+            if response.clicked() {
+                response.request_focus();
+            }
+
+            // Install the lock filter every frame, after the focus request.
+            // It is only consulted while this widget has focus, and it
+            // stops egui from turning Tab / arrows / Escape into global
+            // focus navigation.
+            ui.memory_mut(|m| {
+                m.set_focus_lock_filter(
+                    response.id,
+                    egui::EventFilter {
+                        tab: true,
+                        horizontal_arrows: true,
+                        vertical_arrows: true,
+                        escape: true,
+                    },
+                );
+            });
+
+            if response.has_focus() {
+                let events = ui.input(|i| i.events.clone());
+                let mods = ui.input(|i| i.modifiers);
+
+                for event in events {
+                    if let Some(bytes) = event_to_bytes(&event, mods) {
+                        active.session.write(bytes);
                     }
-                    egui::Event::Key {
-                        key,
-                        pressed: true,
-                        modifiers,
-                        ..
-                    } => {
-                        let bytes = match key {
-                            egui::Key::Enter => Some(b"\r".to_vec()),
-                            egui::Key::Backspace => Some(vec![0x7f]),
-                            egui::Key::Tab => Some(b"\t".to_vec()),
-                            egui::Key::Escape => Some(vec![0x1b]),
-                            egui::Key::ArrowUp => Some(b"\x1b[A".to_vec()),
-                            egui::Key::ArrowDown => Some(b"\x1b[B".to_vec()),
-                            egui::Key::ArrowRight => Some(b"\x1b[C".to_vec()),
-                            egui::Key::ArrowLeft => Some(b"\x1b[D".to_vec()),
-                            egui::Key::C if modifiers.ctrl => Some(vec![0x03]),
-                            egui::Key::D if modifiers.ctrl => Some(vec![0x04]),
-                            egui::Key::L if modifiers.ctrl => Some(vec![0x0c]),
-                            _ => None,
-                        };
-                        if let Some(b) = bytes {
-                            active.session.write(b);
-                        }
-                    }
-                    _ => {}
                 }
             }
+
+            // Keep repainting so SSH output shows up promptly.
+            ctx.request_repaint_after(Duration::from_millis(30));
         }
 
-        // Keep repainting so SSH output shows up promptly.
-        ctx.request_repaint_after(std::time::Duration::from_millis(30));
+        if disconnect {
+            self.session = None;
+            self.status = "Disconnected.".to_owned();
+        }
     }
 }
 

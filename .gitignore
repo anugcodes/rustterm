@@ -1,0 +1,44 @@
+# ---------- Rust / Cargo ----------
+/target/
+**/*.rs.bk
+*.pdb
+
+# Cargo.lock is intentionally NOT ignored:
+# this is a binary, not a library. Commit it for reproducible builds.
+
+# ---------- Editors / IDEs ----------
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*~
+.project
+.settings/
+
+# ---------- OS junk ----------
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------- Local env / secrets ----------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+!src/**/*.key.rs
+
+# ---------- Logs / temp / scratch ----------
+*.log
+logs/
+tmp/
+temp/
+*.tmp
+*.bak
+
+# ---------- Project-specific ----------
+# Temp folder used by the "edit and auto-upload" feature
+.rustterm-tmp/
+# Local session exports that may contain hostnames
+sessions.local.json

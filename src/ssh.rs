@@ -4,7 +4,9 @@
 //! to read bytes from and write bytes to.
 
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use russh::client;
+use russh::keys::key::PublicKey;
 use russh::ChannelMsg;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -18,23 +20,24 @@ pub struct SshConfig {
 
 /// A live SSH session with an interactive shell.
 pub struct SshSession {
-    // Handle to send input to the remote shell.
+    /// Handle to send input to the remote shell.
     pub input_tx: mpsc::UnboundedSender<Vec<u8>>,
-    // Receiver for output bytes from the remote shell.
+    /// Receiver for output bytes from the remote shell.
     pub output_rx: std::sync::mpsc::Receiver<Vec<u8>>,
-    // Dimensions (cols, rows) — send resize events here.
+    /// Dimensions (cols, rows) — send resize events here.
     pub resize_tx: mpsc::UnboundedSender<(u32, u32)>,
 }
 
 struct Client;
 
+#[async_trait]
 impl client::Handler for Client {
     type Error = russh::Error;
 
     async fn check_server_key(
         &mut self,
-        _server_public_key: &russh::keys::ssh_key::PublicKey,
-    ) -> Result<bool, Self::Error> {
+        _server_public_key: &PublicKey,
+    ) -> std::result::Result<bool, Self::Error> {
         // TODO: verify against known_hosts for security.
         Ok(true)
     }
@@ -56,9 +59,11 @@ impl SshSession {
                 .expect("tokio runtime");
 
             rt.block_on(async move {
-                if let Err(e) = run_session(config, &mut input_rx, &mut resize_rx, &output_tx).await
+                if let Err(e) =
+                    run_session(config, &mut input_rx, &mut resize_rx, &output_tx).await
                 {
                     eprintln!("SSH session error: {e:#}");
+                    let _ = output_tx.send(format!("\r\n[ssh error] {e:#}\r\n").into_bytes());
                 }
             });
         });
@@ -101,13 +106,16 @@ async fn run_session(
         .await
         .context("TCP/SSH connect")?;
 
-    let auth = session
+    let authenticated = session
         .authenticate_password(&config.username, &config.password)
         .await
         .context("authenticate_password")?;
 
-    if !auth.success() {
-        anyhow::bail!("password authentication failed");
+    if !authenticated {
+        anyhow::bail!(
+            "password authentication failed for user '{}'",
+            config.username
+        );
     }
 
     let mut channel = session
@@ -125,18 +133,17 @@ async fn run_session(
         .await
         .context("request_shell")?;
 
-    // Main event loop: forward input → channel, channel output → output_tx.
     loop {
         tokio::select! {
-            // Input from the UI.
             Some(data) = input_rx.recv() => {
                 channel.data(&data[..]).await.context("channel.data")?;
             }
-            // Resize requests.
             Some((cols, rows)) = resize_rx.recv() => {
-                channel.window_change(cols, rows, 0, 0).await.context("window_change")?;
+                channel
+                    .window_change(cols, rows, 0, 0)
+                    .await
+                    .context("window_change")?;
             }
-            // Output from the server.
             msg = channel.wait() => {
                 match msg {
                     Some(ChannelMsg::Data { data }) => {

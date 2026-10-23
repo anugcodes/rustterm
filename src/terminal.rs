@@ -4,11 +4,12 @@
 //! and only implement the rendering glue.
 
 use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::term::{Config as TermConfig, Term};
-use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
-use egui::{Color32, FontId, Galley, Pos2, Rect, Stroke, Vec2};
+use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, StdSyncHandler};
+use egui::{Color32, FontId, Pos2, Rect, Vec2};
 
-/// Simple dimensions implementation for Term.
+/// Minimal grid dimensions for `Term`.
 struct TermSize {
     cols: usize,
     rows: usize,
@@ -42,51 +43,58 @@ pub struct TerminalView {
     cols: usize,
     rows: usize,
     font_size: f32,
-    scroll_offset: i32,
+    /// Set when the grid is resized, so the caller can forward it over SSH.
+    pending_resize: Option<(u32, u32)>,
 }
 
 impl TerminalView {
     pub fn new(cols: usize, rows: usize) -> Self {
         let size = TermSize { cols, rows };
-        let config = TermConfig::default();
-        let term = Term::new(config, &size, EventProxy);
-        let processor = Processor::new();
+        let term = Term::new(TermConfig::default(), &size, EventProxy);
         Self {
             term,
-            processor,
+            processor: Processor::new(),
             cols,
             rows,
             font_size: 14.0,
-            scroll_offset: 0,
+            pending_resize: None,
         }
     }
 
     /// Feed raw bytes from the SSH channel into the VT parser.
+    ///
+    /// vte 0.13's `Processor::advance` consumes a single byte, so we loop.
     pub fn feed(&mut self, bytes: &[u8]) {
-        self.processor.advance(&mut self.term, bytes);
+        for &byte in bytes {
+            self.processor.advance(&mut self.term, byte);
+        }
     }
 
-    /// Resize the terminal grid.
+    /// Resize the terminal grid. `Term::resize` takes the dimensions by value.
     pub fn resize(&mut self, cols: usize, rows: usize) {
         if cols == self.cols && rows == self.rows {
             return;
         }
         self.cols = cols;
         self.rows = rows;
-        let size = TermSize { cols, rows };
-        self.term.resize(size);
+        self.term.resize(TermSize { cols, rows });
+        self.pending_resize = Some((cols as u32, rows as u32));
     }
 
-    pub fn cols(&self) -> usize {
-        self.cols
+    /// Take a pending resize request, if any.
+    pub fn take_resize(&mut self) -> Option<(u32, u32)> {
+        self.pending_resize.take()
     }
 
-    pub fn rows(&self) -> usize {
-        self.rows
-    }
+    //     pub fn cols(&self) -> usize {
+    //         self.cols
+    //     }
+    //
+    //     pub fn rows(&self) -> usize {
+    //         self.rows
+    //     }
 
-    /// Render the terminal grid into the given egui UI, returning a response
-    /// so the caller can attach keyboard focus.
+    /// Render the terminal grid into the given egui UI.
     pub fn ui(&mut self, ui: &mut egui::Ui) -> egui::Response {
         let available = ui.available_size();
         let char_width = self.font_size * 0.6;
@@ -108,8 +116,13 @@ impl TerminalView {
 
             for row in 0..self.rows {
                 for col in 0..self.cols {
-                    let cell = &grid[alacritty_terminal::index::Line(row as i32)
-                        + alacritty_terminal::index::Column(col)];
+                    // Grid indexing requires a `Point`; `Line + Column` is
+                    // deliberately not implemented by alacritty_terminal.
+                    let point = Point {
+                        line: Line(row as i32),
+                        column: Column(col),
+                    };
+                    let cell = &grid[point];
 
                     let ch = cell.c;
                     if ch == ' ' || ch == '\0' {
@@ -119,37 +132,18 @@ impl TerminalView {
                     let x = rect.left() + col as f32 * char_width;
                     let y = rect.top() + row as f32 * char_height;
 
-                    let color = cell.fg;
-                    let egui_color = match color {
-                        alacritty_terminal::vte::ansi::Color::Named(
-                            alacritty_terminal::vte::ansi::NamedColor::Foreground,
-                        ) => Color32::from_rgb(220, 220, 220),
-                        alacritty_terminal::vte::ansi::Color::Named(
-                            alacritty_terminal::vte::ansi::NamedColor::Background,
-                        ) => Color32::from_rgb(20, 20, 25),
-                        alacritty_terminal::vte::ansi::Color::Named(named) => {
-                            named_color_to_egui(named)
-                        }
-                        alacritty_terminal::vte::ansi::Color::Spec(rgb) => {
-                            Color32::from_rgb(rgb.r, rgb.g, rgb.b)
-                        }
-                        alacritty_terminal::vte::ansi::Color::Indexed(idx) => {
-                            indexed_color_to_egui(idx)
-                        }
-                    };
-
                     painter.text(
                         Pos2::new(x, y),
                         egui::Align2::LEFT_TOP,
                         ch,
                         font_id.clone(),
-                        egui_color,
+                        color_to_egui(cell.fg),
                     );
                 }
             }
 
             // Cursor: simple block at the current cursor position.
-            let cursor = self.term.grid().cursor.point;
+            let cursor = grid.cursor.point;
             let cx = rect.left() + cursor.column.0 as f32 * char_width;
             let cy = rect.top() + cursor.line.0 as f32 * char_height;
             painter.rect_filled(
@@ -163,8 +157,16 @@ impl TerminalView {
     }
 }
 
-fn named_color_to_egui(named: alacritty_terminal::vte::ansi::NamedColor) -> Color32 {
-    use alacritty_terminal::vte::ansi::NamedColor::*;
+fn color_to_egui(color: Color) -> Color32 {
+    match color {
+        Color::Named(named) => named_color_to_egui(named),
+        Color::Spec(rgb) => Color32::from_rgb(rgb.r, rgb.g, rgb.b),
+        Color::Indexed(idx) => indexed_color_to_egui(idx),
+    }
+}
+
+fn named_color_to_egui(named: NamedColor) -> Color32 {
+    use NamedColor::*;
     match named {
         Black => Color32::from_rgb(0, 0, 0),
         Red => Color32::from_rgb(205, 49, 49),
@@ -192,22 +194,22 @@ fn indexed_color_to_egui(idx: u8) -> Color32 {
     // Basic 256-color approximation; alacritty provides a palette if you need exact.
     if idx < 16 {
         let named = match idx {
-            0 => alacritty_terminal::vte::ansi::NamedColor::Black,
-            1 => alacritty_terminal::vte::ansi::NamedColor::Red,
-            2 => alacritty_terminal::vte::ansi::NamedColor::Green,
-            3 => alacritty_terminal::vte::ansi::NamedColor::Yellow,
-            4 => alacritty_terminal::vte::ansi::NamedColor::Blue,
-            5 => alacritty_terminal::vte::ansi::NamedColor::Magenta,
-            6 => alacritty_terminal::vte::ansi::NamedColor::Cyan,
-            7 => alacritty_terminal::vte::ansi::NamedColor::White,
-            8 => alacritty_terminal::vte::ansi::NamedColor::BrightBlack,
-            9 => alacritty_terminal::vte::ansi::NamedColor::BrightRed,
-            10 => alacritty_terminal::vte::ansi::NamedColor::BrightGreen,
-            11 => alacritty_terminal::vte::ansi::NamedColor::BrightYellow,
-            12 => alacritty_terminal::vte::ansi::NamedColor::BrightBlue,
-            13 => alacritty_terminal::vte::ansi::NamedColor::BrightMagenta,
-            14 => alacritty_terminal::vte::ansi::NamedColor::BrightCyan,
-            _ => alacritty_terminal::vte::ansi::NamedColor::BrightWhite,
+            0 => NamedColor::Black,
+            1 => NamedColor::Red,
+            2 => NamedColor::Green,
+            3 => NamedColor::Yellow,
+            4 => NamedColor::Blue,
+            5 => NamedColor::Magenta,
+            6 => NamedColor::Cyan,
+            7 => NamedColor::White,
+            8 => NamedColor::BrightBlack,
+            9 => NamedColor::BrightRed,
+            10 => NamedColor::BrightGreen,
+            11 => NamedColor::BrightYellow,
+            12 => NamedColor::BrightBlue,
+            13 => NamedColor::BrightMagenta,
+            14 => NamedColor::BrightCyan,
+            _ => NamedColor::BrightWhite,
         };
         named_color_to_egui(named)
     } else {

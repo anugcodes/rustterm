@@ -96,7 +96,7 @@ fn sftp_status_bar(ui: &mut egui::Ui, theme: &Theme, explorer: &mut SftpExplorer
         }
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let response = ui.menu_button(egui::RichText::new("⋯").size(15.0), |ui| {
+            let response = ui.menu_button(egui::RichText::new("☰").size(14.0), |ui| {
                 ui.label(egui::RichText::new("Session messages").strong());
                 ui.add_space(2.0);
                 for entry in explorer.status.history() {
@@ -138,7 +138,7 @@ fn status_color(theme: &Theme, kind: StatusKind) -> egui::Color32 {
 fn status_icon(kind: StatusKind) -> &'static str {
     match kind {
         StatusKind::Info => "•",
-        StatusKind::Success => "✓",
+        StatusKind::Success => "✔",
         StatusKind::Error => "×",
     }
 }
@@ -519,33 +519,40 @@ impl RustTermApp {
 
         ui.add_space(2.0);
         ui.horizontal(|ui| {
-            // Keep the Files toggle outside the scroll area so a long tab list
-            // cannot hide it.
-            if self.active != NEW_SESSION_TAB {
-                if ui
-                    .selectable_label(self.show_sftp, "Files")
-                    .on_hover_text("Show or hide the remote file panel")
-                    .clicked()
-                {
-                    self.show_sftp = !self.show_sftp;
-                }
+            // The theme picker is drawn first in a right-to-left layout so it
+            // stays pinned to the far edge no matter how many tabs are open.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.theme_menu_ui(ui);
+                ui.add_space(4.0);
                 ui.separator();
-            }
+                ui.add_space(2.0);
 
-            let scroll_width = (ui.available_width() - 40.0).max(120.0);
-            ui.allocate_ui_with_layout(
-                egui::vec2(scroll_width, ui.available_height()),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| {
+                // Everything left of the separator flows as usual. The scroll
+                // area now receives exactly the remaining width.
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    // Keep the Files toggle outside the scroll area so a long
+                    // tab list cannot hide it.
+                    if self.active != NEW_SESSION_TAB {
+                        if ui
+                            .selectable_label(self.show_sftp, "Files")
+                            .on_hover_text("Show or hide the remote file panel")
+                            .clicked()
+                        {
+                            self.show_sftp = !self.show_sftp;
+                        }
+                        ui.separator();
+                    }
+
                     egui::ScrollArea::horizontal()
                         .id_salt("tab_bar_scroll")
+                        .auto_shrink([false, true])
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 // New Session — always first, never closable.
                                 if ui
                                     .selectable_label(
                                         self.active == NEW_SESSION_TAB,
-                                        "＋ New Session",
+                                        "+ New Session",
                                     )
                                     .clicked()
                                 {
@@ -570,11 +577,8 @@ impl RustTermApp {
                                 }
                             });
                         });
-                },
-            );
-
-            ui.add_space(4.0);
-            self.theme_menu_ui(ui);
+                });
+            });
         });
 
         if let Some(tab) = switch_to {
@@ -592,7 +596,7 @@ impl RustTermApp {
     /// Small theme picker shown at the right edge of the tab bar.
     fn theme_menu_ui(&mut self, ui: &mut egui::Ui) {
         let mut chosen: Option<ThemeId> = None;
-        ui.menu_button(egui::RichText::new("◐").size(16.0), |ui| {
+        ui.menu_button("🎨 Theme", |ui| {
             ui.label(egui::RichText::new("Theme").strong());
             ui.add_space(2.0);
             for id in ThemeId::ALL {
@@ -1043,7 +1047,7 @@ impl RustTermApp {
                                         theme.palette.success
                                     };
                                     ui.horizontal(|ui| {
-                                        ui.label(egui::RichText::new("●").color(color).size(10.0));
+                                        ui.label(egui::RichText::new("•").color(color).size(10.0));
                                         ui.add(
                                             egui::Label::new(
                                                 egui::RichText::new(&self.status.text).color(color),
@@ -1121,24 +1125,25 @@ impl RustTermApp {
         let can_paste = explorer.clipboard.is_some() && !busy;
 
         ui.horizontal_wrapped(|ui| {
-            if theme::icon_button(ui, theme, "⌂", "Go to the login directory", !busy).clicked() {
+            if theme::icon_button(ui, theme, "🏠", "Go to the login directory", !busy).clicked() {
                 explorer.load_home(ssh);
                 activity = true;
             }
-            if theme::icon_button(ui, theme, "↑", "Up one level", can_up && !busy).clicked() {
+            if theme::icon_button(ui, theme, "⬆", "Up one level", can_up && !busy).clicked() {
                 explorer.up(ssh);
                 activity = true;
             }
-            if theme::icon_button(ui, theme, "↻", "Refresh this directory", !busy).clicked() {
+            if theme::icon_button(ui, theme, "🔄", "Refresh this directory", !busy).clicked() {
                 explorer.refresh(ssh);
                 activity = true;
             }
             ui.separator();
-            if theme::icon_button(ui, theme, "＋", "Create a folder here", !busy).clicked() {
+            if theme::icon_button(ui, theme, "➕", "Create a folder here", !busy).clicked() {
                 explorer.begin_new_folder();
                 activity = true;
             }
-            if theme::icon_button(ui, theme, "⧉", "Copy the selected entry", can_copy).clicked() {
+            if theme::icon_button(ui, theme, "🗐", "Copy the selected entry", can_copy).clicked()
+            {
                 if let Some(entry) = &selected {
                     explorer.copy_entry(entry);
                 }
@@ -1154,7 +1159,7 @@ impl RustTermApp {
             if theme::icon_toggle(
                 ui,
                 theme,
-                "◉",
+                "👁",
                 "Show or hide dotfiles",
                 explorer.show_hidden,
             )
@@ -1173,7 +1178,7 @@ impl RustTermApp {
             if theme::icon_button(
                 ui,
                 theme,
-                "⟳",
+                "⚡",
                 "Reconnect SFTP without dropping the terminal",
                 !busy,
             )
@@ -1199,7 +1204,7 @@ impl RustTermApp {
                 explorer.navigate(ssh, path);
                 activity = true;
             }
-            if theme::icon_button(ui, theme, "→", "Open this path", true).clicked() {
+            if theme::icon_button(ui, theme, "➡", "Open this path", true).clicked() {
                 let path = explorer.path_edit.clone();
                 explorer.navigate(ssh, path);
                 activity = true;

@@ -37,8 +37,6 @@ use crate::ssh::{HostKeyPrompt, RemoteEntry, SshConfig, SshSession, Wake};
 use crate::terminal::{TermAction, TerminalView};
 use crate::theme::{self, Theme, ThemeId};
 
-use egui_extras::{Column, TableBuilder};
-
 const NEW_SESSION_TAB: usize = 0;
 const DEFAULT_COLS: usize = 80;
 const DEFAULT_ROWS: usize = 24;
@@ -59,14 +57,238 @@ fn field_label(ui: &mut egui::Ui, theme: &Theme, text: &str) {
     ui.label(egui::RichText::new(text).small().color(theme.palette.muted));
 }
 
-/// Muted, compact table header label.
-fn table_header(ui: &mut egui::Ui, theme: &Theme, text: &str) {
-    ui.label(
-        egui::RichText::new(text)
-            .small()
-            .strong()
-            .color(theme.palette.muted),
+/// Single-line input with the text vertically centred in a fixed-height box.
+fn text_field<'a>(theme: &Theme, text: &'a mut String) -> egui::TextEdit<'a> {
+    egui::TextEdit::singleline(text)
+        .vertical_align(egui::Align::Center)
+        .margin(egui::Margin::symmetric(theme.metrics.pad, 2.0))
+        .min_size(egui::vec2(0.0, theme.metrics.control_height))
+}
+
+/// Fixed-width form label, vertically centred against the input beside it.
+fn form_label(ui: &mut egui::Ui, theme: &Theme, text: &str, width: f32) {
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(width, theme.metrics.control_height),
+        egui::Sense::hover(),
     );
+    ui.painter().text(
+        rect.left_center(),
+        egui::Align2::LEFT_CENTER,
+        text,
+        theme::body_font(theme),
+        theme.palette.muted,
+    );
+}
+
+/// Fixed-width table cell label; returns its response for tooltips.
+fn sized_label(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    text: &str,
+    width: f32,
+    color: egui::Color32,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(width, theme.metrics.row_height),
+        egui::Sense::hover(),
+    );
+    paint_cell(
+        ui,
+        rect,
+        text,
+        theme::body_font(theme),
+        color,
+        egui::Align::Min,
+    );
+    response
+}
+
+/// Laid-out galley for one table cell: one line, truncated with an ellipsis.
+fn cell_galley(
+    ui: &egui::Ui,
+    text: &str,
+    font: egui::FontId,
+    color: egui::Color32,
+    max_width: f32,
+) -> Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::single_section(
+        text.to_owned(),
+        egui::TextFormat {
+            font_id: font,
+            color,
+            ..Default::default()
+        },
+    );
+    job.wrap.max_width = max_width.max(8.0);
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
+    job.wrap.overflow_character = Some('…');
+    ui.fonts(|fonts| fonts.layout_job(job))
+}
+
+/// Paint one table cell, left-, centre- or right-aligned inside `rect`.
+fn paint_cell(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    text: &str,
+    font: egui::FontId,
+    color: egui::Color32,
+    align: egui::Align,
+) {
+    if rect.width() <= 0.0 {
+        return;
+    }
+    let galley = cell_galley(ui, text, font, color, rect.width());
+    let size = galley.size();
+    let pos = match align {
+        egui::Align::Min => egui::pos2(rect.left(), rect.center().y - size.y / 2.0),
+        egui::Align::Max => egui::pos2(rect.right() - size.x, rect.center().y - size.y / 2.0),
+        egui::Align::Center => egui::pos2(
+            rect.center().x - size.x / 2.0,
+            rect.center().y - size.y / 2.0,
+        ),
+    };
+    ui.painter().galley(pos, galley, color);
+}
+
+/// One tab, drawn as a single box with the close button inside it.
+///
+/// Returns the tab response and whether its close button was clicked.
+fn tab_button(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    label: &str,
+    selected: bool,
+    closable: bool,
+) -> (egui::Response, bool) {
+    const MAX_LABEL_WIDTH: f32 = 190.0;
+    let label_width = cell_galley(
+        ui,
+        label,
+        theme::body_font(theme),
+        theme.palette.text,
+        MAX_LABEL_WIDTH,
+    )
+    .size()
+    .x;
+    let close_width = if closable { 22.0 } else { 0.0 };
+    let width =
+        (label_width + theme.metrics.pad * 2.0 + close_width).max(theme.metrics.tab_min_width);
+    let height = theme.metrics.control_height + 4.0;
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
+
+    let fill = if selected {
+        theme.palette.surface
+    } else if response.hovered() {
+        theme.palette.surface_hover
+    } else {
+        theme.palette.panel
+    };
+    let border = if selected {
+        theme.palette.accent
+    } else {
+        theme.palette.border
+    };
+    let painter = ui.painter().clone();
+    painter.rect_filled(rect, egui::Rounding::ZERO, fill);
+    painter.rect_stroke(
+        rect,
+        egui::Rounding::ZERO,
+        egui::Stroke::new(1.0_f32, border),
+    );
+
+    let galley = cell_galley(
+        ui,
+        label,
+        theme::body_font(theme),
+        theme.palette.text,
+        MAX_LABEL_WIDTH,
+    );
+    painter.galley(
+        egui::pos2(
+            rect.left() + theme.metrics.pad,
+            rect.center().y - galley.size().y / 2.0,
+        ),
+        galley,
+        theme.palette.text,
+    );
+
+    let mut close_clicked = false;
+    if closable {
+        let close_rect =
+            egui::Rect::from_min_max(egui::pos2(rect.right() - close_width, rect.top()), rect.max);
+        let hovered = ui.rect_contains_pointer(close_rect);
+        if hovered {
+            painter.rect_filled(close_rect, egui::Rounding::ZERO, theme.palette.danger_soft);
+        }
+        let colour = if hovered {
+            theme.palette.danger
+        } else {
+            theme.palette.muted
+        };
+        painter.text(
+            close_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "×",
+            theme::body_font(theme),
+            colour,
+        );
+        let close_response = ui
+            .interact(close_rect, response.id.with("close"), egui::Sense::click())
+            .on_hover_text("Close session");
+        close_clicked = close_response.clicked();
+    }
+
+    (response, close_clicked)
+}
+
+/// Column widths of the SFTP table, persisted per session.
+///
+/// `Name` takes whatever is left, so only the three metadata columns need to
+/// be stored.
+#[derive(Debug, Clone, Copy)]
+struct SftpColumns {
+    owner: f32,
+    modified: f32,
+    size: f32,
+}
+
+impl Default for SftpColumns {
+    fn default() -> Self {
+        Self {
+            owner: 64.0,
+            modified: 122.0,
+            size: 52.0,
+        }
+    }
+}
+
+const NAME_MIN_WIDTH: f32 = 80.0;
+
+impl SftpColumns {
+    fn name_width(self, total: f32) -> f32 {
+        (total - self.owner - self.modified - self.size).max(NAME_MIN_WIDTH)
+    }
+}
+
+/// Rectangle of every column in one table row.
+struct SftpLayout {
+    owner: egui::Rect,
+    modified: egui::Rect,
+    size: egui::Rect,
+}
+
+impl SftpLayout {
+    fn new(rect: egui::Rect, columns: SftpColumns) -> Self {
+        let owner_x = rect.left() + columns.name_width(rect.width());
+        let modified_x = owner_x + columns.owner;
+        let size_x = modified_x + columns.modified;
+        Self {
+            owner: egui::Rect::from_x_y_ranges(owner_x..=modified_x, rect.y_range()),
+            modified: egui::Rect::from_x_y_ranges(modified_x..=size_x, rect.y_range()),
+            size: egui::Rect::from_x_y_ranges(size_x..=rect.right(), rect.y_range()),
+        }
+    }
 }
 
 /// Latest SFTP message, operation state and message history.
@@ -143,6 +365,117 @@ fn status_icon(kind: StatusKind) -> &'static str {
     }
 }
 
+/// Draw the SFTP column header and its resize handles.
+///
+/// The handles live only in the header row, never on the file rows. Each one
+/// adjusts the column that starts at its divider, so the divider always
+/// follows the pointer.
+fn sftp_header(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    columns: &mut SftpColumns,
+    index: usize,
+    rect: egui::Rect,
+    width: f32,
+) {
+    let rect = egui::Rect::from_min_size(rect.min, egui::vec2(width, rect.height()));
+    let layout = SftpLayout::new(rect, *columns);
+    let font = theme::body_font(theme);
+    let painter = ui.painter().clone();
+    painter.rect_filled(rect, egui::Rounding::ZERO, theme.palette.panel);
+
+    let name_rect = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + 22.0, rect.top()),
+        egui::pos2(layout.owner.left() - 2.0, rect.bottom()),
+    );
+    paint_cell(
+        ui,
+        name_rect,
+        "Name",
+        font.clone(),
+        theme.palette.muted,
+        egui::Align::Min,
+    );
+    paint_cell(
+        ui,
+        layout.owner.shrink2(egui::vec2(4.0, 0.0)),
+        "Owner",
+        font.clone(),
+        theme.palette.muted,
+        egui::Align::Min,
+    );
+    paint_cell(
+        ui,
+        layout.modified.shrink2(egui::vec2(4.0, 0.0)),
+        "Modified",
+        font.clone(),
+        theme.palette.muted,
+        egui::Align::Min,
+    );
+    paint_cell(
+        ui,
+        layout.size.shrink2(egui::vec2(4.0, 0.0)),
+        "Size",
+        font,
+        theme.palette.muted,
+        egui::Align::Max,
+    );
+
+    let separators = [
+        ("owner", layout.owner.left()),
+        ("modified", layout.modified.left()),
+        ("size", layout.size.left()),
+    ];
+    for (_, x) in separators {
+        painter.vline(
+            x,
+            rect.y_range(),
+            egui::Stroke::new(1.0_f32, theme.palette.border),
+        );
+    }
+    painter.hline(
+        rect.x_range(),
+        rect.bottom(),
+        egui::Stroke::new(1.0_f32, theme.palette.border_strong),
+    );
+
+    let total = rect.width();
+    for (which, x) in separators {
+        let handle = egui::Rect::from_min_max(
+            egui::pos2(x - 3.0, rect.top()),
+            egui::pos2(x + 3.0, rect.bottom()),
+        );
+        let response = ui.interact(
+            handle,
+            egui::Id::new(("sftp_col_resize", index, which)),
+            egui::Sense::click_and_drag(),
+        );
+        if response.hovered() || response.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+        }
+        if !response.dragged() {
+            continue;
+        }
+        let Some(pointer) = response.interact_pointer_pos() else {
+            continue;
+        };
+        match which {
+            "owner" => {
+                let max = (total - NAME_MIN_WIDTH - columns.modified - columns.size).max(56.0);
+                columns.owner =
+                    (rect.right() - pointer.x - columns.modified - columns.size).clamp(56.0, max);
+            }
+            "modified" => {
+                let max = (total - NAME_MIN_WIDTH - columns.owner - columns.size).max(74.0);
+                columns.modified = (rect.right() - pointer.x - columns.size).clamp(74.0, max);
+            }
+            _ => {
+                columns.size = (rect.right() - pointer.x).clamp(44.0, 140.0);
+            }
+        }
+    }
+}
+
 pub struct RustTermApp {
     sessions: Vec<ActiveSession>,
     /// 0 = New Session form; `i > 0` = `sessions[i - 1]`.
@@ -151,10 +484,10 @@ pub struct RustTermApp {
     connecting: Option<ConnectingState>,
     /// Persisted profiles loaded at startup (F19: no passwords stored).
     store: SessionStore,
-    /// Name used by the "Save profile" button.
+    /// Name used when "Save as profile" is checked.
     profile_name: String,
-    /// Highlighted entry in the saved-session list.
-    selected_profile: Option<usize>,
+    /// Whether Connect should also store the form as a profile.
+    save_as_profile: bool,
     status: StatusMessage,
     /// Whether the SFTP side panel is shown for connected sessions.
     show_sftp: bool,
@@ -175,6 +508,8 @@ struct ActiveSession {
     terminal: TerminalView,
     /// Per-session remote file browser. Each tab keeps its own directory.
     sftp: SftpExplorer,
+    /// Resized column widths of the file table.
+    sftp_columns: SftpColumns,
     /// Set once so the terminal takes focus on first appearance.
     focus_requested: bool,
 }
@@ -236,7 +571,7 @@ impl Default for RustTermApp {
             connecting: None,
             store,
             profile_name: String::new(),
-            selected_profile: None,
+            save_as_profile: false,
             status,
             show_sftp: true,
             theme: settings.theme,
@@ -376,6 +711,7 @@ impl RustTermApp {
                     ssh,
                     terminal: TerminalView::new(DEFAULT_COLS, DEFAULT_ROWS, input_tx),
                     sftp,
+                    sftp_columns: SftpColumns::default(),
                     focus_requested: false,
                 });
                 // New session is the last tab; make it active.
@@ -406,27 +742,75 @@ impl RustTermApp {
 
         let mut answer: Option<bool> = None;
 
+        let theme = self.theme.theme();
         egui::Window::new("Unknown host key")
+            .id(egui::Id::new("host_key_prompt"))
+            .title_bar(false)
             .collapsible(false)
             .resizable(false)
+            .default_size(egui::vec2(480.0, 1.0))
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .frame(theme::modal_frame(theme))
             .show(ctx, |ui| {
-                ui.set_max_width(480.0);
-                ui.label(format!(
-                    "The authenticity of host '{}:{}' can't be established.",
-                    prompt.host, prompt.port
-                ));
-                ui.add_space(6.0);
-                ui.label("Host key fingerprint:");
-                ui.monospace(&prompt.fingerprint);
-                ui.add_space(8.0);
-                ui.label("Accept this key and record it in ~/.ssh/known_hosts?");
-                ui.add_space(8.0);
+                ui.set_width(440.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Accept & save").clicked() {
+                    ui.label(
+                        egui::RichText::new("Unknown host key")
+                            .size(18.0)
+                            .strong()
+                            .color(theme.palette.text),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("×").on_hover_text("Reject").clicked() {
+                            answer = Some(false);
+                        }
+                    });
+                });
+                ui.add_space(theme.metrics.pad);
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(format!(
+                            "The authenticity of host '{}:{}' can't be established.",
+                            prompt.host, prompt.port
+                        ))
+                        .color(theme.palette.text),
+                    )
+                    .wrap(),
+                );
+                ui.add_space(theme.metrics.pad);
+                theme::muted(ui, theme, "Host key fingerprint");
+                egui::Frame::none()
+                    .fill(theme.palette.input_bg)
+                    .stroke(egui::Stroke::new(1.0_f32, theme.palette.border))
+                    .inner_margin(egui::Margin::symmetric(theme.metrics.pad, 4.0))
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&prompt.fingerprint)
+                                    .monospace()
+                                    .color(theme.palette.text),
+                            )
+                            .wrap(),
+                        );
+                    });
+                ui.add_space(theme.metrics.pad);
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new("Accept this key and record it in ~/.ssh/known_hosts?")
+                            .color(theme.palette.text),
+                    )
+                    .wrap(),
+                );
+                ui.add_space(theme.metrics.card_padding);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let accept = theme::primary_button(theme, "Accept & save")
+                        .min_size(egui::vec2(128.0, theme.metrics.control_height));
+                    if ui.add(accept).clicked() {
                         answer = Some(true);
                     }
-                    if ui.button("Reject").clicked() {
+                    let reject = egui::Button::new("Reject")
+                        .min_size(egui::vec2(92.0, theme.metrics.control_height));
+                    if ui.add(reject).clicked() {
                         answer = Some(false);
                     }
                 });
@@ -514,66 +898,62 @@ impl RustTermApp {
     }
 
     fn tabs_ui(&mut self, ui: &mut egui::Ui) {
+        let theme = self.theme.theme();
         let mut switch_to: Option<usize> = None;
         let mut close: Option<usize> = None;
 
-        ui.add_space(2.0);
         ui.horizontal(|ui| {
             // The theme picker is drawn first in a right-to-left layout so it
             // stays pinned to the far edge no matter how many tabs are open.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 self.theme_menu_ui(ui);
-                ui.add_space(4.0);
+                ui.add_space(2.0);
                 ui.separator();
                 ui.add_space(2.0);
 
-                // Everything left of the separator flows as usual. The scroll
-                // area now receives exactly the remaining width.
-                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    // Keep the Files toggle outside the scroll area so a long
-                    // tab list cannot hide it.
-                    if self.active != NEW_SESSION_TAB {
-                        if ui
-                            .selectable_label(self.show_sftp, "Files")
-                            .on_hover_text("Show or hide the remote file panel")
-                            .clicked()
-                        {
-                            self.show_sftp = !self.show_sftp;
-                        }
-                        ui.separator();
+                // Keep the Files toggle outside the scroll area so a long tab
+                // list cannot hide it.
+                if self.active != NEW_SESSION_TAB {
+                    if ui
+                        .selectable_label(self.show_sftp, "Files")
+                        .on_hover_text("Show or hide the remote file panel")
+                        .clicked()
+                    {
+                        self.show_sftp = !self.show_sftp;
                     }
+                    ui.add_space(4.0);
+                }
 
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     egui::ScrollArea::horizontal()
                         .id_salt("tab_bar_scroll")
                         .auto_shrink([false, true])
+                        .scroll_bar_visibility(
+                            egui::containers::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                        )
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
-                                // New Session — always first, never closable.
-                                if ui
-                                    .selectable_label(
-                                        self.active == NEW_SESSION_TAB,
-                                        "+ New Session",
-                                    )
-                                    .clicked()
-                                {
+                                ui.spacing_mut().item_spacing.x = 4.0;
+                                let (new_tab, _) =
+                                    tab_button(ui, theme, "+ New Session", self.active == 0, false);
+                                if new_tab.clicked() {
                                     switch_to = Some(NEW_SESSION_TAB);
                                 }
 
-                                for (i, s) in self.sessions.iter().enumerate() {
+                                for (i, session) in self.sessions.iter().enumerate() {
                                     let tab_index = i + 1;
-                                    let selected = self.active == tab_index;
-                                    ui.horizontal(|ui| {
-                                        if ui.selectable_label(selected, &s.title).clicked() {
-                                            switch_to = Some(tab_index);
-                                        }
-                                        if ui
-                                            .small_button("×")
-                                            .on_hover_text("Close session")
-                                            .clicked()
-                                        {
-                                            close = Some(i);
-                                        }
-                                    });
+                                    let (tab, close_clicked) = tab_button(
+                                        ui,
+                                        theme,
+                                        &session.title,
+                                        self.active == tab_index,
+                                        true,
+                                    );
+                                    if close_clicked || tab.middle_clicked() {
+                                        close = Some(i);
+                                    } else if tab.clicked() {
+                                        switch_to = Some(tab_index);
+                                    }
                                 }
                             });
                         });
@@ -597,19 +977,12 @@ impl RustTermApp {
     fn theme_menu_ui(&mut self, ui: &mut egui::Ui) {
         let mut chosen: Option<ThemeId> = None;
         ui.menu_button("🎨 Theme", |ui| {
-            ui.label(egui::RichText::new("Theme").strong());
-            ui.add_space(2.0);
             for id in ThemeId::ALL {
                 if ui.selectable_label(self.theme == id, id.name()).clicked() {
                     chosen = Some(id);
+                    ui.close_menu();
                 }
             }
-            ui.separator();
-            theme::muted(
-                ui,
-                self.theme.theme(),
-                "More themes can be added in src/theme.rs.",
-            );
         })
         .response
         .on_hover_text("Choose a theme");
@@ -640,7 +1013,7 @@ impl RustTermApp {
         // The password is only ever read from the keyring, never from TOML.
         self.form.password.clear();
         self.profile_name = profile.name.clone();
-        self.selected_profile = Some(index);
+        self.save_as_profile = false;
         self.clear_status();
 
         if profile.save_password {
@@ -648,7 +1021,7 @@ impl RustTermApp {
                 match secrets::load(&profile.name) {
                     Ok(Some(password)) => self.form.password = password,
                     Ok(None) => self.set_error(format!(
-                        "No password is stored for '{}'. Type one and press Save profile to store it.",
+                        "No password is stored for '{}'. Type one and tick Save as profile again.",
                         profile.name
                     )),
                     Err(err) => {
@@ -665,14 +1038,15 @@ impl RustTermApp {
         }
     }
 
-    fn save_profile(&mut self) {
+    /// Store the current form as a profile. Returns `true` on success.
+    fn save_profile(&mut self) -> bool {
         let host = self.form.host.trim().to_string();
         let user = self.form.user.trim().to_string();
         let port: u16 = match self.form.port.trim().parse() {
             Ok(port) => port,
             Err(_) => {
                 self.set_error("Port must be a number");
-                return;
+                return false;
             }
         };
         let requested = self.form.save_password;
@@ -714,13 +1088,13 @@ impl RustTermApp {
         };
         if let Err(message) = profile.validate() {
             self.set_error(message);
-            return;
+            return false;
         }
 
         if KEYRING_ENABLED && requested {
             if self.form.password.is_empty() {
                 self.set_error("Type a password to store it in the system keyring");
-                return;
+                return false;
             }
             // Store the secret first: if the keyring is unavailable, do not
             // write a profile that claims to have a stored password.
@@ -728,40 +1102,38 @@ impl RustTermApp {
                 self.set_error(format!(
                     "Could not store the password in the system keyring: {err}"
                 ));
-                return;
+                return false;
             }
         }
 
         let saved_name = profile.name.clone();
         match self.store.upsert(profile) {
-            Ok(index) => {
+            Ok(_) => {
                 self.profile_name = saved_name.clone();
-                self.selected_profile = Some(index);
 
                 if KEYRING_ENABLED && !requested && had_stored_password {
                     if let Err(err) = secrets::delete(&saved_name) {
                         self.set_error(format!(
                             "Profile saved, but its keyring password could not be removed: {err}"
                         ));
-                        return;
+                        return true;
                     }
                 }
 
                 self.set_info(format!("Saved profile '{saved_name}'"));
+                true
             }
-            Err(err) => self.set_error(format!("Could not save profile: {err}")),
+            Err(err) => {
+                self.set_error(format!("Could not save profile: {err}"));
+                false
+            }
         }
     }
 
-    fn delete_selected_profile(&mut self) {
-        let Some(index) = self.selected_profile else {
-            return;
-        };
-
+    /// Remove the profile at `index`, including any stored password.
+    fn delete_profile(&mut self, index: usize) {
         match self.store.remove(index) {
             Ok(Some(profile)) => {
-                self.selected_profile = None;
-
                 if KEYRING_ENABLED && profile.save_password {
                     if let Err(err) = secrets::delete(&profile.name) {
                         self.set_error(format!(
@@ -774,119 +1146,81 @@ impl RustTermApp {
 
                 self.set_info(format!("Deleted profile '{}'", profile.name));
             }
-            Ok(None) => self.selected_profile = None,
+            Ok(None) => {}
             Err(err) => {
-                // The profile is still on disk; leave it selected.
+                // The profile is still on disk.
                 self.set_error(format!("Could not delete profile: {err}"));
             }
         }
     }
 
-    /// Name field + save button, drawn inside the Profile card.
-    fn save_profile_ui(&mut self, ui: &mut egui::Ui, theme: &Theme) {
-        let mut save_clicked = false;
-        let name_hint = if self.form.save_password {
-            "required to save password"
-        } else {
-            "blank = user@host"
-        };
-
-        field_label(ui, theme, "Profile name");
-        ui.horizontal(|ui| {
-            let button_width = 112.0_f32;
-            let name_width =
-                (ui.available_width() - button_width - ui.spacing().item_spacing.x).max(120.0);
-            ui.add_sized(
-                [name_width, theme.metrics.control_height],
-                egui::TextEdit::singleline(&mut self.profile_name).hint_text(name_hint),
-            );
-            let button = egui::Button::new("Save profile")
-                .min_size(egui::vec2(button_width, theme.metrics.control_height));
-            if ui.add(button).clicked() {
-                save_clicked = true;
-            }
-        })
-        .response
-        .on_hover_text(
-            "Saves host, port and user; if the keyring box is checked, \
-             the password too (requires a profile name).",
-        );
-
-        if save_clicked {
-            self.save_profile();
-            // The name field was drawn before a blank name was replaced with
-            // `user@host`, so redraw to show the stored name.
-            ui.ctx().request_repaint();
-        }
-    }
-
-    /// Saved-profile list plus the delete control.
-    fn saved_sessions_ui(&mut self, ui: &mut egui::Ui, theme: &Theme) {
+    /// Minimal saved-profile table: one row per profile with Load / Delete.
+    fn saved_profiles_ui(&mut self, ui: &mut egui::Ui, theme: &Theme) {
         let profiles = self.store.profiles().to_vec();
-        let mut delete_clicked = false;
-        let mut load: Option<usize> = None;
-
-        theme::section_label(ui, theme, "Saved sessions");
+        theme::section_label(ui, theme, &format!("Saved profiles ({})", profiles.len()))
+            .on_hover_text(format!("Stored in {}", self.store.path().display()));
         if profiles.is_empty() {
             theme::muted(
                 ui,
                 theme,
-                "No saved sessions yet. Fill in the form above and press Save profile.",
+                "Nothing saved yet. Tick “Save as profile” above to keep this connection.",
             );
             return;
         }
 
-        theme::muted(ui, theme, format!("{} saved", profiles.len()));
-        ui.add_space(4.0);
+        let row_height = theme.metrics.row_height;
+        let load_width = 48.0;
+        let name_width = 132.0;
+        ui.spacing_mut().button_padding = egui::vec2(theme.metrics.pad, 2.0);
+        let mut load: Option<usize> = None;
+        let mut delete: Option<usize> = None;
+
+        // Header row, same font size as the values below it.
+        ui.horizontal(|ui| {
+            ui.add_space(load_width + ui.spacing().item_spacing.x);
+            sized_label(ui, theme, "Name", name_width, theme.palette.muted);
+            let target_width =
+                (ui.available_width() - theme.metrics.control_height - 4.0).max(60.0);
+            sized_label(ui, theme, "Target", target_width, theme.palette.muted);
+        });
+
         egui::ScrollArea::vertical()
-            .id_salt("saved_sessions")
-            .max_height(170.0)
+            .id_salt("saved_profiles")
+            .max_height((row_height + 8.0) * 4.0)
+            .auto_shrink([false, true])
             .show(ui, |ui| {
                 for (index, profile) in profiles.iter().enumerate() {
-                    let selected = self.selected_profile == Some(index);
-                    let text = format!(
-                        "{}   ·   {}@{}:{}",
-                        profile.name, profile.user, profile.host, profile.port
-                    );
-                    let response = ui.selectable_label(selected, text);
-                    if response.clicked() {
-                        load = Some(index);
-                    }
-                    // No double-click shortcut: passwords are not stored, so a
-                    // one-click connect would usually fail authentication.
-                    response.on_hover_text("Click to load into the form");
+                    ui.horizontal(|ui| {
+                        let load_button =
+                            egui::Button::new("Load").min_size(egui::vec2(load_width, row_height));
+                        if ui.add(load_button).clicked() {
+                            load = Some(index);
+                        }
+
+                        sized_label(ui, theme, &profile.name, name_width, theme.palette.text)
+                            .on_hover_text(&profile.name);
+
+                        let target = format!("{}@{}:{}", profile.user, profile.host, profile.port);
+                        let target_width =
+                            (ui.available_width() - theme.metrics.control_height - 4.0).max(60.0);
+                        sized_label(ui, theme, &target, target_width, theme.palette.muted)
+                            .on_hover_text(&target);
+
+                        if theme::icon_button(ui, theme, "×", "Delete this profile", true).clicked()
+                        {
+                            delete = Some(index);
+                        }
+                    });
                 }
             });
 
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            let can_delete = self.selected_profile.is_some();
-            if ui
-                .add_enabled(can_delete, egui::Button::new("Delete selected"))
-                .on_hover_text("Removes the profile from sessions.toml")
-                .clicked()
-            {
-                delete_clicked = true;
-            }
-            ui.add(
-                egui::Label::new(
-                    egui::RichText::new(format!("File: {}", self.store.path().display()))
-                        .small()
-                        .color(theme.palette.muted),
-                )
-                .truncate(),
-            );
-        });
-
         if let Some(index) = load {
             self.load_profile(index);
-            // The form is drawn above this list, so it must be redrawn with
-            // the newly loaded values (and any keyring error).
+            // The form was drawn above this table.
             ui.ctx().request_repaint();
         }
-        if delete_clicked {
-            self.delete_selected_profile();
-            // Redraw the list without the removed entry.
+        if let Some(index) = delete {
+            self.delete_profile(index);
             ui.ctx().request_repaint();
         }
     }
@@ -897,197 +1231,210 @@ impl RustTermApp {
             .id_salt("new_session_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                ui.add_space(24.0);
-                let width = 560.0_f32.min((ui.available_width() - 24.0).max(280.0));
+                ui.add_space(theme.metrics.card_padding);
+                let width = 600.0_f32.min((ui.available_width() - 24.0).max(320.0));
                 let leading = ((ui.available_width() - width) * 0.5).max(0.0);
 
+                let page_height = ui.available_height().max(320.0);
                 ui.horizontal(|ui| {
                     ui.add_space(leading);
                     ui.allocate_ui_with_layout(
-                        egui::vec2(width, 0.0),
+                        egui::vec2(width, page_height),
                         egui::Layout::top_down(egui::Align::Min),
                         |ui| {
                             ui.set_width(width);
                             ui.label(
                                 egui::RichText::new("New SSH session")
-                                    .size(24.0)
-                                    .strong()
+                                    .size(theme.metrics.heading_size)
                                     .color(theme.palette.text),
                             );
                             theme::muted(ui, theme, "Connect to a remote machine over SSH.");
-                            ui.add_space(16.0);
+                            ui.add_space(theme.metrics.card_padding);
 
                             theme::card_frame(theme).show(ui, |ui| {
                                 ui.set_width(width - theme.metrics.card_padding * 2.0);
-                                theme::section_label(ui, theme, "Connection");
-                                ui.add_space(8.0);
+                                // Compact rows: checkboxes and labels use the
+                                // interaction height, inputs set their own.
+                                ui.spacing_mut().interact_size.y = 20.0;
+                                let control = theme.metrics.control_height;
+                                let label_width = ui
+                                    .painter()
+                                    .layout_no_wrap(
+                                        "Password".to_owned(),
+                                        theme::body_font(theme),
+                                        theme.palette.muted,
+                                    )
+                                    .size()
+                                    .x
+                                    + 8.0;
+                                let gap = ui.spacing().item_spacing.x;
 
+                                // Host and port share one row to save space.
                                 ui.horizontal(|ui| {
-                                    let port_width = 82.0_f32;
+                                    let port_width = 62.0;
+                                    let port_label_width = ui
+                                        .painter()
+                                        .layout_no_wrap(
+                                            "Port".to_owned(),
+                                            theme::body_font(theme),
+                                            theme.palette.muted,
+                                        )
+                                        .size()
+                                        .x
+                                        + 8.0;
                                     let host_width = (ui.available_width()
+                                        - label_width
+                                        - port_label_width
                                         - port_width
-                                        - ui.spacing().item_spacing.x)
-                                        .max(140.0);
-                                    ui.vertical(|ui| {
-                                        field_label(ui, theme, "Host");
-                                        ui.add_sized(
-                                            [host_width, theme.metrics.control_height],
-                                            egui::TextEdit::singleline(&mut self.form.host)
-                                                .hint_text("example.com"),
-                                        );
-                                    });
-                                    ui.vertical(|ui| {
-                                        field_label(ui, theme, "Port");
-                                        ui.add_sized(
-                                            [port_width, theme.metrics.control_height],
-                                            egui::TextEdit::singleline(&mut self.form.port)
-                                                .hint_text("22"),
-                                        );
-                                    });
+                                        - gap * 3.0)
+                                        .max(120.0);
+                                    form_label(ui, theme, "Host", label_width);
+                                    ui.add_sized(
+                                        [host_width, control],
+                                        text_field(theme, &mut self.form.host)
+                                            .hint_text("example.com"),
+                                    );
+                                    form_label(ui, theme, "Port", port_label_width);
+                                    ui.add_sized(
+                                        [port_width, control],
+                                        text_field(theme, &mut self.form.port).hint_text("22"),
+                                    );
                                 });
 
-                                ui.add_space(8.0);
-                                field_label(ui, theme, "User");
-                                ui.add_sized(
-                                    [ui.available_width(), theme.metrics.control_height],
-                                    egui::TextEdit::singleline(&mut self.form.user)
-                                        .hint_text("username"),
-                                );
-
-                                ui.add_space(8.0);
-                                field_label(ui, theme, "Password");
-                                ui.add_sized(
-                                    [ui.available_width(), theme.metrics.control_height],
-                                    egui::TextEdit::singleline(&mut self.form.password)
-                                        .password(true)
-                                        .hint_text("Password"),
-                                )
-                                .on_hover_text(
-                                    "Used when key/agent authentication is disabled or fails.",
-                                );
-
-                                ui.add_space(8.0);
-                                egui::CollapsingHeader::new(
-                                    egui::RichText::new("Authentication").strong(),
-                                )
-                                .id_salt("auth_options")
-                                .default_open(self.form.use_key || self.form.use_agent)
-                                .show(ui, |ui| {
-                                    ui.add_space(4.0);
-                                    ui.checkbox(&mut self.form.use_key, "Use a private key")
-                                        .on_hover_text(
-                                            "Tried before the password. Leave the path blank to \
-                                             use ~/.ssh/id_ed25519, id_ecdsa, id_rsa or id_dsa.",
-                                        );
-                                    ui.add_enabled(
-                                        self.form.use_key,
-                                        egui::TextEdit::singleline(&mut self.form.key_path)
-                                            .hint_text("Key path (blank = auto-detect)")
-                                            .desired_width(ui.available_width()),
+                                ui.horizontal(|ui| {
+                                    form_label(ui, theme, "User", label_width);
+                                    let field_width = ui.available_width();
+                                    ui.add_sized(
+                                        [field_width, control],
+                                        text_field(theme, &mut self.form.user)
+                                            .hint_text("username"),
                                     );
-                                    ui.add_space(2.0);
-                                    ui.checkbox(
-                                        &mut self.form.use_agent,
-                                        "Use SSH agent identities",
+                                });
+
+                                ui.horizontal(|ui| {
+                                    form_label(ui, theme, "Password", label_width);
+                                    let field_width = ui.available_width();
+                                    ui.add_sized(
+                                        [field_width, control],
+                                        text_field(theme, &mut self.form.password)
+                                            .password(true)
+                                            .hint_text("Optional with a key or agent"),
                                     )
                                     .on_hover_text(
+                                        "Used when key/agent authentication is disabled or fails.",
+                                    );
+                                });
+
+                                ui.add_space(2.0);
+                                ui.checkbox(&mut self.form.use_key, "Use a private key")
+                                    .on_hover_text(
+                                        "Tried before the password. Leave the path blank to use \
+                                         ~/.ssh/id_ed25519, id_ecdsa, id_rsa or id_dsa.",
+                                    );
+                                if self.form.use_key {
+                                    ui.horizontal(|ui| {
+                                        form_label(ui, theme, "", label_width);
+                                        let field_width = ui.available_width();
+                                        ui.add_sized(
+                                            [field_width, control],
+                                            text_field(theme, &mut self.form.key_path)
+                                                .hint_text("Key path (blank = auto-detect)"),
+                                        );
+                                    });
+                                }
+                                ui.checkbox(&mut self.form.use_agent, "Use SSH agent identities")
+                                    .on_hover_text(
                                         "Tried after a key file and before the password. Best for \
-                                         passphrase-protected keys loaded with ssh-add.",
+                                     passphrase-protected keys loaded with ssh-add.",
                                     );
 
-                                    // Hidden entirely in lean builds
-                                    // (`--no-default-features`).
-                                    if KEYRING_ENABLED {
-                                        ui.checkbox(
-                                            &mut self.form.save_password,
-                                            "Save password in the system keyring",
-                                        )
-                                        .on_hover_text(
-                                            "Optional, per profile. Requires an explicit profile \
-                                             name. Stored by the OS keyring, never in \
-                                             sessions.toml.",
-                                        );
-                                    }
-                                });
-
-                                ui.add_space(12.0);
-                                let connecting = self.connecting.is_some();
-                                let connecting_label = self.connecting.as_ref().map(|state| {
-                                    if state.prompt.is_some() {
-                                        "Waiting for host key confirmation…".to_string()
-                                    } else {
-                                        format!("Connecting to {}…", state.label)
-                                    }
-                                });
-
-                                ui.horizontal(|ui| {
-                                    let button = egui::Button::new(
-                                        egui::RichText::new("Connect")
-                                            .strong()
-                                            .color(egui::Color32::WHITE),
+                                // Hidden entirely in lean builds
+                                // (`--no-default-features`).
+                                if KEYRING_ENABLED {
+                                    ui.checkbox(
+                                        &mut self.form.save_password,
+                                        "Save password in the system keyring",
                                     )
-                                    .fill(theme.palette.accent)
-                                    .stroke(egui::Stroke::NONE)
-                                    .min_size(egui::vec2(120.0, 32.0))
-                                    .rounding(egui::Rounding::same(theme.metrics.radius));
+                                    .on_hover_text(
+                                        "Optional, per profile. Requires an explicit profile name. \
+                                         Stored by the OS keyring, never in sessions.toml.",
+                                    );
+                                }
+
+                                ui.add_space(4.0);
+                                ui.horizontal(|ui| {
+                                    ui.checkbox(&mut self.save_as_profile, "Save as profile")
+                                        .on_hover_text(
+                                            "Also stores host, port, user and auth settings in \
+                                             sessions.toml when you connect.",
+                                        );
+                                    let field_width = ui.available_width();
+                                    ui.add_enabled_ui(self.save_as_profile, |ui| {
+                                        ui.add_sized(
+                                            [field_width, control],
+                                            text_field(theme, &mut self.profile_name)
+                                                .hint_text("Profile name (blank = user@host)"),
+                                        );
+                                    });
+                                });
+
+                                ui.add_space(6.0);
+                                let connecting = self.connecting.is_some();
+                                let mut connect_clicked = false;
+                                ui.horizontal(|ui| {
+                                    let button = theme::primary_button(theme, "Connect")
+                                        .min_size(egui::vec2(104.0, control));
                                     if ui.add_enabled(!connecting, button).clicked() {
-                                        self.start_connect(ui.ctx());
+                                        connect_clicked = true;
                                     }
-                                    if let Some(label) = connecting_label {
+                                    if let Some(state) = &self.connecting {
                                         ui.spinner();
+                                        let label = if state.prompt.is_some() {
+                                            "Waiting for host key confirmation…".to_string()
+                                        } else {
+                                            format!("Connecting to {}…", state.label)
+                                        };
                                         theme::muted(ui, theme, label);
                                     }
                                 });
 
+                                if connect_clicked {
+                                    // Saving first keeps a failing profile out of
+                                    // the connection attempt.
+                                    if !self.save_as_profile || self.save_profile() {
+                                        self.start_connect(ui.ctx());
+                                    }
+                                }
+
                                 if !self.status.text.is_empty() {
-                                    ui.add_space(10.0);
                                     let color = if self.status.is_error {
                                         theme.palette.danger
                                     } else {
                                         theme.palette.success
                                     };
-                                    ui.horizontal(|ui| {
-                                        ui.label(egui::RichText::new("•").color(color).size(10.0));
-                                        ui.add(
-                                            egui::Label::new(
-                                                egui::RichText::new(&self.status.text).color(color),
-                                            )
-                                            .wrap(),
-                                        );
-                                    });
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(&self.status.text)
+                                                .size(theme.metrics.small_size)
+                                                .color(color),
+                                        )
+                                        .wrap(),
+                                    );
                                 }
+
+                                ui.add_space(theme.metrics.card_padding);
+                                ui.separator();
+                                ui.add_space(2.0);
+                                self.saved_profiles_ui(ui, theme);
                             });
 
-                            ui.add_space(14.0);
-                            theme::card_frame(theme).show(ui, |ui| {
-                                ui.set_width(width - theme.metrics.card_padding * 2.0);
-                                theme::section_label(ui, theme, "Profile");
-                                theme::muted(
-                                    ui,
-                                    theme,
-                                    "Save this connection for one-click reuse.",
-                                );
-                                ui.add_space(6.0);
-                                self.save_profile_ui(ui, theme);
-                            });
-
-                            ui.add_space(14.0);
-                            theme::card_frame(theme).show(ui, |ui| {
-                                ui.set_width(width - theme.metrics.card_padding * 2.0);
-                                self.saved_sessions_ui(ui, theme);
-                            });
-
-                            ui.add_space(24.0);
+                            ui.add_space(theme.metrics.card_padding);
                         },
                     );
                 });
             });
     }
 
-    /// Render the remote file browser for one session.
-    ///
-    /// Returns `true` when the panel started a request, changed selection or was
-    /// hidden, so the caller can request another frame.
     /// Render the remote file browser for one session.
     ///
     /// Returns `true` when the panel started a request, changed selection or was
@@ -1100,23 +1447,14 @@ impl RustTermApp {
         // Split the borrow: the explorer mutates while the session only answers
         // requests.
         let (ssh, explorer) = (&session.ssh, &mut session.sftp);
+        let columns = &mut session.sftp_columns;
         let mut activity = false;
         let mut hide = false;
 
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new("Remote files")
-                    .strong()
-                    .size(15.0)
-                    .color(theme.palette.text),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if theme::icon_button(ui, theme, "×", "Hide the file panel", true).clicked() {
-                    hide = true;
-                }
-            });
-        });
-        ui.add_space(2.0);
+        // Never let a wide child grow the panel's stored width.
+        let content_width = ui.available_width();
+        ui.set_max_width(content_width);
+        ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
 
         let busy = explorer.is_busy();
         let selected = explorer.selected_entry().cloned();
@@ -1124,7 +1462,7 @@ impl RustTermApp {
         let can_copy = selected.is_some() && !busy;
         let can_paste = explorer.clipboard.is_some() && !busy;
 
-        ui.horizontal_wrapped(|ui| {
+        ui.horizontal(|ui| {
             if theme::icon_button(ui, theme, "🏠", "Go to the login directory", !busy).clicked() {
                 explorer.load_home(ssh);
                 activity = true;
@@ -1137,7 +1475,6 @@ impl RustTermApp {
                 explorer.refresh(ssh);
                 activity = true;
             }
-            ui.separator();
             if theme::icon_button(ui, theme, "➕", "Create a folder here", !busy).clicked() {
                 explorer.begin_new_folder();
                 activity = true;
@@ -1155,7 +1492,6 @@ impl RustTermApp {
                 explorer.paste(ssh);
                 activity = true;
             }
-            ui.separator();
             if theme::icon_toggle(
                 ui,
                 theme,
@@ -1190,14 +1526,20 @@ impl RustTermApp {
             if explorer.loading {
                 ui.spinner();
             }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if theme::icon_button(ui, theme, "×", "Hide the file panel", true).clicked() {
+                    hide = true;
+                }
+            });
         });
 
         ui.horizontal(|ui| {
-            let go_width = 28.0_f32;
-            let width = (ui.available_width() - go_width - ui.spacing().item_spacing.x).max(80.0);
+            let go_width = theme.metrics.control_height;
+            let width = (ui.available_width() - go_width - 4.0).max(80.0);
             let edit = ui.add_sized(
                 [width, theme.metrics.control_height],
-                egui::TextEdit::singleline(&mut explorer.path_edit).hint_text("Remote path"),
+                text_field(theme, &mut explorer.path_edit).hint_text("Remote path"),
             );
             if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                 let path = explorer.path_edit.clone();
@@ -1214,30 +1556,25 @@ impl RustTermApp {
         // Fixed message bar at the bottom. Declared before the table so the
         // table gets the remaining height.
         egui::TopBottomPanel::bottom(egui::Id::new(("sftp_status", index)))
-            .exact_height(30.0)
+            .exact_height(theme.metrics.row_height + 4.0)
             .frame(
                 egui::Frame::none()
                     .fill(theme.palette.panel)
                     .stroke(egui::Stroke::new(1.0_f32, theme.palette.border))
-                    .inner_margin(egui::Margin::symmetric(8.0, 4.0)),
+                    .inner_margin(egui::Margin::symmetric(4.0, 2.0)),
             )
             .show_inside(ui, |ui| {
                 sftp_status_bar(ui, theme, explorer);
             });
 
         if let Some(reason) = explorer.unavailable.clone() {
-            ui.add_space(16.0);
+            ui.add_space(theme.metrics.card_padding);
             ui.vertical_centered(|ui| {
-                ui.label(
-                    egui::RichText::new("SFTP is unavailable")
-                        .strong()
-                        .color(theme.palette.warning),
-                );
-                ui.add_space(4.0);
+                ui.label(egui::RichText::new("SFTP is unavailable").color(theme.palette.warning));
                 ui.add(
                     egui::Label::new(egui::RichText::new(reason).color(theme.palette.muted)).wrap(),
                 );
-                ui.add_space(8.0);
+                ui.add_space(4.0);
                 if ui.button("Reconnect SFTP").clicked() {
                     explorer.reconnect(ssh);
                     activity = true;
@@ -1282,191 +1619,193 @@ impl RustTermApp {
         let mut row_action: Option<RowAction> = None;
         let mut select_row: Option<usize> = None;
 
-        let max_height = ui.available_height().max(80.0);
         let row_height = theme.metrics.row_height;
-        TableBuilder::new(ui)
-            .id_salt(("sftp_table", index))
-            .striped(true)
-            .resizable(true)
-            .sense(egui::Sense::click())
-            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-            .column(Column::remainder().at_least(120.0))
-            .column(Column::initial(80.0).at_least(52.0).resizable(true))
-            .column(Column::initial(112.0).at_least(88.0).resizable(true))
-            .column(Column::initial(64.0).at_least(48.0).resizable(true))
-            .min_scrolled_height(0.0)
-            .max_scroll_height(max_height)
-            .header(24.0, |mut header| {
-                header.col(|ui| {
-                    table_header(ui, theme, "Name");
-                });
-                header.col(|ui| {
-                    table_header(ui, theme, "Owner");
-                });
-                header.col(|ui| {
-                    table_header(ui, theme, "Modified");
-                });
-                header.col(|ui| {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        table_header(ui, theme, "Size");
-                    });
-                });
-            })
-            .body(|mut body| {
-                if visible_indices.is_empty() {
-                    body.row(row_height, |mut row| {
-                        row.col(|ui| {
-                            theme::muted(ui, theme, empty_message);
-                        });
-                        row.col(|_| {});
-                        row.col(|_| {});
-                        row.col(|_| {});
-                    });
-                } else {
-                    body.rows(row_height, visible_indices.len(), |mut row| {
-                        let visible_index = row.index();
-                        let entry_index = visible_indices[visible_index];
-                        let entry = &explorer.entries[entry_index];
-                        row.set_selected(explorer.selected == Some(entry_index));
-                        let icon = if entry.is_dir {
-                            "📁"
-                        } else if entry.is_symlink {
-                            "🔗"
-                        } else {
-                            "📄"
-                        };
+        let (header_rect, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), row_height),
+            egui::Sense::hover(),
+        );
 
-                        row.col(|ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new(icon).size(13.0));
-                                ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(&entry.name).color(theme.palette.text),
-                                    )
-                                    .truncate(),
-                                )
-                                .on_hover_text(&entry.name);
-                            });
-                        });
-                        row.col(|ui| {
-                            let owner = format_owner(entry);
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(owner)
-                                        .small()
-                                        .color(theme.palette.muted),
-                                )
-                                .truncate(),
-                            )
-                            .on_hover_text(owner);
-                        });
-                        row.col(|ui| {
-                            let modified = format_timestamp(entry.modified);
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(&modified)
-                                        .small()
-                                        .color(theme.palette.muted),
-                                )
-                                .truncate(),
-                            )
-                            .on_hover_text(format!(
-                                "{modified}\n{}",
-                                entry
-                                    .modified
-                                    .map(format_age)
-                                    .unwrap_or_else(|| "unknown".to_string())
-                            ));
-                        });
-                        row.col(|ui| {
-                            let size = if entry.is_dir {
-                                "—".to_string()
-                            } else {
-                                format_size(entry.size)
-                            };
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.label(
-                                        egui::RichText::new(size)
-                                            .small()
-                                            .color(theme.palette.muted),
-                                    );
-                                },
-                            );
-                        });
+        let row_count = visible_indices.len().max(1);
+        let output = egui::ScrollArea::vertical()
+            .id_salt(("sftp_scroll", index))
+            .auto_shrink([false, false])
+            .show_rows(ui, row_height, row_count, |ui, range| {
+                for visible_index in range {
+                    let (rect, response) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), row_height),
+                        egui::Sense::click(),
+                    );
 
-                        let mut details = entry.path.clone();
+                    if visible_indices.is_empty() {
+                        paint_cell(
+                            ui,
+                            rect.shrink2(egui::vec2(4.0, 0.0)),
+                            empty_message,
+                            theme::body_font(theme),
+                            theme.palette.muted,
+                            egui::Align::Min,
+                        );
+                        continue;
+                    }
+
+                    let entry_index = visible_indices[visible_index];
+                    let entry = &explorer.entries[entry_index];
+                    let is_selected = explorer.selected == Some(entry_index);
+                    let fill = if is_selected {
+                        theme.palette.selection
+                    } else if response.hovered() {
+                        theme.palette.surface_hover
+                    } else if visible_index % 2 == 1 {
+                        theme.palette.stripe
+                    } else {
+                        theme.palette.panel
+                    };
+                    ui.painter().rect_filled(rect, egui::Rounding::ZERO, fill);
+
+                    let layout = SftpLayout::new(rect, *columns);
+                    let font = theme::body_font(theme);
+                    let icon = if entry.is_dir {
+                        "🗀"
+                    } else if entry.is_symlink {
+                        "🔗"
+                    } else {
+                        "🗋"
+                    };
+                    let icon_rect = egui::Rect::from_min_max(
+                        egui::pos2(rect.left() + 4.0, rect.top()),
+                        egui::pos2(rect.left() + 22.0, rect.bottom()),
+                    );
+                    paint_cell(
+                        ui,
+                        icon_rect,
+                        icon,
+                        theme::body_font(theme),
+                        theme.palette.muted,
+                        egui::Align::Center,
+                    );
+                    let name_rect = egui::Rect::from_min_max(
+                        egui::pos2(rect.left() + 22.0, rect.top()),
+                        egui::pos2(layout.owner.left() - 2.0, rect.bottom()),
+                    );
+                    paint_cell(
+                        ui,
+                        name_rect,
+                        &entry.name,
+                        font.clone(),
+                        theme.palette.text,
+                        egui::Align::Min,
+                    );
+                    paint_cell(
+                        ui,
+                        layout.owner.shrink2(egui::vec2(4.0, 0.0)),
+                        format_owner(entry),
+                        font.clone(),
+                        theme.palette.muted,
+                        egui::Align::Min,
+                    );
+                    paint_cell(
+                        ui,
+                        layout.modified.shrink2(egui::vec2(4.0, 0.0)),
+                        &format_timestamp(entry.modified),
+                        font.clone(),
+                        theme.palette.muted,
+                        egui::Align::Min,
+                    );
+                    let size = if entry.is_dir {
+                        "—".to_string()
+                    } else {
+                        format_size(entry.size)
+                    };
+                    paint_cell(
+                        ui,
+                        layout.size.shrink2(egui::vec2(4.0, 0.0)),
+                        &size,
+                        font,
+                        theme.palette.muted,
+                        egui::Align::Max,
+                    );
+
+                    let mut details = entry.path.clone();
+                    if entry.is_dir {
+                        details.push_str("\ndirectory");
+                    } else {
+                        details.push_str(&format!("\n{}", format_size(entry.size)));
+                    }
+                    if entry.is_symlink {
+                        details.push_str(" · symlink");
+                    }
+                    details.push_str(&format!(
+                        "\nowner {} · modified {}",
+                        format_owner(entry),
+                        format_timestamp(entry.modified)
+                    ));
+                    if let Some(modified) = entry.modified {
+                        details.push_str(&format!("\n{}", format_age(modified)));
+                    }
+
+                    let response = response.on_hover_text(details);
+                    if response.clicked() {
+                        select_row = Some(entry_index);
+                    }
+                    if response.double_clicked() {
                         if entry.is_dir {
-                            details.push_str("\ndirectory");
+                            row_action = Some(RowAction::Navigate(entry.path.clone()));
                         } else {
-                            details.push_str(&format!("\n{}", format_size(entry.size)));
+                            row_action = Some(RowAction::OpenWith(entry.clone()));
                         }
-                        if entry.is_symlink {
-                            details.push_str(" · symlink");
-                        }
-                        details.push_str(&format!(
-                            "\nowner {} · modified {}",
-                            format_owner(entry),
-                            format_timestamp(entry.modified)
-                        ));
-                        if let Some(modified) = entry.modified {
-                            details.push_str(&format!("\n{}", format_age(modified)));
-                        }
-
-                        let response = row.response();
-                        response.clone().on_hover_text(details);
-                        if response.clicked() {
-                            select_row = Some(entry_index);
-                        }
-                        if response.double_clicked() {
-                            if entry.is_dir {
+                    }
+                    if response.secondary_clicked() {
+                        select_row = Some(entry_index);
+                    }
+                    response.context_menu(|ui| {
+                        ui.label(egui::RichText::new(&entry.name));
+                        ui.separator();
+                        if entry.is_dir {
+                            if ui.button("Open").clicked() {
                                 row_action = Some(RowAction::Navigate(entry.path.clone()));
-                            } else {
-                                row_action = Some(RowAction::OpenWith(entry.clone()));
+                                ui.close_menu();
                             }
+                            if has_clipboard && ui.button("Paste into this folder").clicked() {
+                                row_action = Some(RowAction::Paste(entry.path.clone()));
+                                ui.close_menu();
+                            }
+                        } else if ui.button("Open with…").clicked() {
+                            row_action = Some(RowAction::OpenWith(entry.clone()));
+                            ui.close_menu();
                         }
-                        if response.secondary_clicked() {
-                            select_row = Some(entry_index);
+                        if ui.button("Rename…").clicked() {
+                            row_action = Some(RowAction::Rename(entry.clone()));
+                            ui.close_menu();
                         }
-                        response.context_menu(|ui| {
-                            ui.label(egui::RichText::new(&entry.name).strong());
-                            ui.separator();
-                            if entry.is_dir {
-                                if ui.button("Open").clicked() {
-                                    row_action = Some(RowAction::Navigate(entry.path.clone()));
-                                    ui.close_menu();
-                                }
-                                if has_clipboard && ui.button("Paste into this folder").clicked() {
-                                    row_action = Some(RowAction::Paste(entry.path.clone()));
-                                    ui.close_menu();
-                                }
-                            } else if ui.button("Open with…").clicked() {
-                                row_action = Some(RowAction::OpenWith(entry.clone()));
-                                ui.close_menu();
-                            }
-                            if ui.button("Rename…").clicked() {
-                                row_action = Some(RowAction::Rename(entry.clone()));
-                                ui.close_menu();
-                            }
-                            if ui.button("Copy path").clicked() {
-                                row_action = Some(RowAction::CopyPath(entry.clone()));
-                                ui.close_menu();
-                            }
-                            ui.separator();
-                            if ui
-                                .add(egui::Button::new(
+                        if ui.button("Copy path").clicked() {
+                            row_action = Some(RowAction::CopyPath(entry.clone()));
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui
+                            .add(
+                                egui::Button::new(
                                     egui::RichText::new("Delete…").color(theme.palette.danger),
-                                ))
-                                .clicked()
-                            {
-                                row_action = Some(RowAction::Delete(entry.clone()));
-                                ui.close_menu();
-                            }
-                        });
+                                )
+                                .rounding(egui::Rounding::ZERO),
+                            )
+                            .clicked()
+                        {
+                            row_action = Some(RowAction::Delete(entry.clone()));
+                            ui.close_menu();
+                        }
                     });
                 }
             });
+
+        sftp_header(
+            ui,
+            theme,
+            columns,
+            index,
+            header_rect,
+            output.inner_rect.width(),
+        );
 
         if let Some(index) = select_row {
             explorer.selected = Some(index);
@@ -1531,6 +1870,7 @@ impl RustTermApp {
             .title_bar(false)
             .collapsible(false)
             .resizable(false)
+            .default_size(egui::vec2(424.0, 1.0))
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .frame(theme::modal_frame(theme))
             .show(ctx, |ui| {
@@ -1549,15 +1889,14 @@ impl RustTermApp {
                     });
                 });
                 theme::muted(ui, theme, subtitle);
-                ui.add_space(14.0);
+                ui.add_space(theme.metrics.pad);
 
                 match &kind {
                     SftpDialogKind::Rename { .. } => {
                         field_label(ui, theme, "New name");
                         let edit = ui.add_sized(
                             [ui.available_width(), theme.metrics.control_height],
-                            egui::TextEdit::singleline(&mut dialog.name)
-                                .hint_text("File or folder name"),
+                            text_field(theme, &mut dialog.name).hint_text("File or folder name"),
                         );
                         if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                             submit = true;
@@ -1571,7 +1910,7 @@ impl RustTermApp {
                         field_label(ui, theme, "Folder name");
                         let edit = ui.add_sized(
                             [ui.available_width(), theme.metrics.control_height],
-                            egui::TextEdit::singleline(&mut dialog.name).hint_text("New folder"),
+                            text_field(theme, &mut dialog.name).hint_text("New folder"),
                         );
                         if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                             submit = true;
@@ -1623,7 +1962,7 @@ impl RustTermApp {
                     }
                 }
 
-                ui.add_space(18.0);
+                ui.add_space(theme.metrics.card_padding);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let primary = match &kind {
                         SftpDialogKind::Rename { .. } => "Rename",
@@ -1631,38 +1970,17 @@ impl RustTermApp {
                         SftpDialogKind::Delete { .. } => "Delete",
                     };
                     let primary_button = if matches!(kind, SftpDialogKind::Delete { .. }) {
-                        egui::Button::new(
-                            egui::RichText::new(primary)
-                                .strong()
-                                .color(egui::Color32::WHITE),
-                        )
-                        .fill(theme.palette.danger)
-                        .stroke(egui::Stroke::NONE)
+                        theme::danger_button(theme, primary)
                     } else {
-                        egui::Button::new(
-                            egui::RichText::new(primary)
-                                .strong()
-                                .color(egui::Color32::WHITE),
-                        )
-                        .fill(theme.palette.accent)
-                        .stroke(egui::Stroke::NONE)
-                    };
-                    if ui
-                        .add_sized(
-                            [92.0, theme.metrics.control_height],
-                            primary_button,
-                        )
-                        .clicked()
-                    {
+                        theme::primary_button(theme, primary)
+                    }
+                    .min_size(egui::vec2(92.0, theme.metrics.control_height));
+                    if ui.add(primary_button).clicked() {
                         submit = true;
                     }
-                    if ui
-                        .add_sized(
-                            [92.0, theme.metrics.control_height],
-                            egui::Button::new("Cancel"),
-                        )
-                        .clicked()
-                    {
+                    let cancel_button = egui::Button::new("Cancel")
+                        .min_size(egui::vec2(92.0, theme.metrics.control_height));
+                    if ui.add(cancel_button).clicked() {
                         cancel = true;
                     }
                 });
@@ -1699,6 +2017,7 @@ impl RustTermApp {
             .title_bar(false)
             .collapsible(false)
             .resizable(false)
+            .default_size(egui::vec2(424.0, 1.0))
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .frame(theme::modal_frame(theme))
             .show(ctx, |ui| {
@@ -1760,26 +2079,14 @@ impl RustTermApp {
 
                 ui.add_space(18.0);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let open = egui::Button::new(
-                        egui::RichText::new("Open")
-                            .strong()
-                            .color(egui::Color32::WHITE),
-                    )
-                    .fill(theme.palette.accent)
-                    .stroke(egui::Stroke::NONE);
-                    if ui
-                        .add_sized([92.0, theme.metrics.control_height], open)
-                        .clicked()
-                    {
+                    let open = theme::primary_button(theme, "Open")
+                        .min_size(egui::vec2(92.0, theme.metrics.control_height));
+                    if ui.add(open).clicked() {
                         submit = true;
                     }
-                    if ui
-                        .add_sized(
-                            [92.0, theme.metrics.control_height],
-                            egui::Button::new("Cancel"),
-                        )
-                        .clicked()
-                    {
+                    let cancel_button = egui::Button::new("Cancel")
+                        .min_size(egui::vec2(92.0, theme.metrics.control_height));
+                    if ui.add(cancel_button).clicked() {
                         cancel = true;
                     }
                 });
@@ -1809,7 +2116,24 @@ impl RustTermApp {
         index: usize,
     ) -> (bool, bool) {
         let session = &mut self.sessions[index];
+        let theme = self.theme.theme();
         let mut activity = false;
+
+        // Keep the action row visible without taking height away from the
+        // terminal: it is declared as a bottom panel before the terminal.
+        let mut disconnect_clicked = false;
+        egui::TopBottomPanel::bottom(egui::Id::new(("terminal_actions", index)))
+            .exact_height(theme.metrics.control_height + 8.0)
+            .frame(
+                egui::Frame::none()
+                    .fill(theme.palette.bg)
+                    .inner_margin(egui::Margin::symmetric(4.0, 4.0)),
+            )
+            .show_inside(ui, |ui| {
+                if ui.button("Disconnect").clicked() {
+                    disconnect_clicked = true;
+                }
+            });
 
         let response = session.terminal.ui(ui);
 
@@ -1905,13 +2229,6 @@ impl RustTermApp {
             session.ssh.resize(cols as u16, rows as u16);
         }
 
-        ui.add_space(4.0);
-        let mut disconnect_clicked = false;
-        ui.horizontal(|ui| {
-            if ui.button("Disconnect").clicked() {
-                disconnect_clicked = true;
-            }
-        });
         (disconnect_clicked, activity)
     }
 }
@@ -1924,21 +2241,28 @@ impl eframe::App for RustTermApp {
         // another session is visible. New output is what wakes egui, so this
         // happens before the UI is painted.
         let mut activity = self.pump_sessions(ctx);
+        let theme = self.theme.theme();
 
-        egui::TopBottomPanel::top("tab_bar").show(ctx, |ui| {
-            self.tabs_ui(ui);
-        });
+        egui::TopBottomPanel::top("tab_bar")
+            .frame(theme::panel_frame(theme))
+            .show(ctx, |ui| {
+                self.tabs_ui(ui);
+            });
 
         // The remote file panel belongs to the active session and sits left of
         // the terminal. It must be declared before the central panel so egui can
-        // reserve its width.
+        // reserve its width. The cap keeps the terminal visible: the panel can
+        // never take more than a little over half of the window.
         if self.show_sftp {
             if let Some(idx) = self.active.checked_sub(1) {
                 if idx < self.sessions.len() {
+                    let max_width = (ctx.screen_rect().width() * 0.55).clamp(320.0, 720.0);
                     egui::SidePanel::left("sftp_panel")
                         .resizable(true)
-                        .default_width(420.0)
+                        .default_width(450.0)
                         .min_width(340.0)
+                        .max_width(max_width)
+                        .frame(theme::panel_frame(theme))
                         .show(ctx, |ui| {
                             activity |= self.sftp_ui(ui, idx);
                         });
@@ -1949,7 +2273,6 @@ impl eframe::App for RustTermApp {
         }
 
         let mut disconnect_requested = false;
-        let theme = self.theme.theme();
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(theme.palette.bg))
             .show(ctx, |ui| {

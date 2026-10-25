@@ -7,10 +7,10 @@
 A fast, lightweight, native Linux alternative to MobaXterm. SSH terminal tabs with an SFTP side panel that follows your session. Written in Rust.
 
 > **Status:** working terminal with tabs. Colours, scrollback, copy/paste, mouse
-> reporting, TOFU host-key verification, saved sessions, keyring passwords,
-> public-key/agent auth and the SFTP side panel (sortable table, reconnect,
-> rename, delete, copy/paste, hidden files and an **Open with…** editor picker)
-> are done. The UI has a shared, persisted theme system. General upload/download
+> reporting, TOFU host-key verification, saved profiles, keyring passwords,
+> public-key/agent auth and the SFTP side panel (reconnect, rename, delete,
+> copy/paste, hidden files and an **Open with…** editor picker) are done. The UI
+> is flat and boxy with a shared, persisted theme system. General upload/download
 > transfers are next; the panel does not yet follow shell `cd`.
 
 ## Screenshots
@@ -26,15 +26,18 @@ _(coming soon)_
 - [x] Mouse reporting for full-screen apps (htop, vim, tmux, mc)
 - [x] Application cursor keys (DECCKM) so ncurses programs get real arrow keys
 - [x] Host-key verification (TOFU) against `~/.ssh/known_hosts`
-- [x] Saved sessions + optional system-keyring passwords
+- [x] Saved profiles + optional system-keyring passwords
 - [x] Public-key and ssh-agent authentication
-- [x] SFTP side panel per session: **Name / Owner / Modified / Size** table
+- [x] SFTP side panel per session: **Name / Owner / Modified / Size** table with
+      header-only column resizing
 - [x] SFTP message status bar with history and per-operation progress
 - [x] SFTP reconnect without dropping the terminal
 - [x] SFTP rename, delete, new folder, copy/paste and file operations
 - [x] Open remote files in a local editor via an **Open with…** picker
       (`$VISUAL`/`$EDITOR`, Zed, gvim, VS Code, desktop default, custom command)
-- [x] Centred New Session page with saved-profile management
+- [x] Compact New Session page: one connection card with an optional
+      **Save as profile** field and a **Load / delete** saved-profile table
+- [x] Flat, boxy UI (square corners, 1 px borders, no shadows or hover glow)
 - [x] Global UI themes (Midnight / Graphite) with the choice persisted
 - [ ] SFTP panel follows the shell's working directory
 - [ ] Upload/download with drag and drop
@@ -45,7 +48,7 @@ _(coming soon)_
 
 | Concern | Crate |
 |---|---|
-| UI | `egui` + `eframe` + `egui_extras` (tables) |
+| UI | `egui` + `eframe` (hand-rolled SFTP table) |
 | SSH | `russh` (pure Rust) |
 | SFTP | `russh-sftp` |
 | Terminal | `alacritty_terminal` |

@@ -33,7 +33,7 @@ open protocols.
 |---|---|---|
 | 1 | SSH terminal with colors, resize, copy/paste | **Done** — colors, resize, scrollback, bg colors, copy/paste. |
 | 2 | Multiple SSH sessions in tabs | **Done** |
-| 3 | Saved sessions, key auth, keyring passwords | **Done** — profiles, optional keyring passwords, key file + ssh-agent auth. |
+| 3 | Saved profiles, key auth, keyring passwords | **Done** — profiles, optional keyring passwords, key file + ssh-agent auth. |
 | 4 | SFTP side panel following the active session's path | **Done except shell-cd following** — per-tab browsing, resizable Name/Owner/Modified/Size table, reconnect, right-click menu, hidden toggle, copy/paste, status bar with history. The panel does not follow shell `cd` (no OSC 7), and symlinks are not navigated. |
 | 5 | Upload/download, drag & drop, progress | **Next** — copy/editor downloads already stream file contents; general transfers, progress and drag & drop are not implemented. |
 | 6 | Open remote file in local editor, auto-upload on save | **Partial** — the **Open with…** picker downloads to a temp file and launches `$VISUAL`/`$EDITOR`, Zed, gvim, VS Code, the desktop default or a custom command. Automatic upload-on-save is V2. |
@@ -68,7 +68,7 @@ open protocols.
 
 ```
 
-Cargo.toml                  # eframe/egui 0.29, egui_extras 0.29, russh 0.45, russh-sftp 3.0, alacritty_terminal 0.24, chrono 0.4, toml
+Cargo.toml                  # eframe/egui 0.29, russh 0.45, russh-sftp 3.0, alacritty_terminal 0.24, chrono 0.4, toml
 Cargo.lock                  # COMMITTED (binary crate — reproducible builds)
 README.md                   # badges use YOUR_USERNAME placeholder — fix before push
 LICENSE                     # MIT
@@ -269,21 +269,29 @@ SftpExplorer::poll ── sftp_home/list/rename/delete/create_dir/copy/fetch() �
 ## 7. What works today (verified)
 
 - **Tabs**: Multiple concurrent SSH sessions. `+ New Session` tab is always present
-and not closable. Closing a tab disconnects its SSH cleanly. The theme picker is
-pinned to the far right of the tab bar.
-- **New Session page**: a centred 560 px column inside a scroll area, with
-  Connection, Profile and Saved sessions cards. Connect shows an in-flight
-  spinner; save/load/delete of profiles live in the same page.
+and not closable. Each tab is a single box (minimum 168 px) with the label and
+the close `×` inside it; middle-click also closes. The theme picker is pinned to
+the far right of the tab bar.
+- **New Session page**: a centred column (maximum 600 px) inside a scroll area.
+  One card holds the connection fields, the auth options, an optional **Save as
+  profile** checkbox with its name field, the primary Connect button and an
+  inline status line. Below a separator is the compact **Saved profiles** table
+  (**Name / Target**, **Load**, per-row **×**) with an empty-state hint. Labels
+  share one gutter and all inputs are 26 px with vertically centred text.
 - **Themes**: a shared `theme::Palette`/`Metrics` registry styles the whole app
   (top bar, cards, tables, dialogs, status bar). **Midnight** (default) and
   **Graphite** ship today; the choice is persisted in
   `~/.config/rustterm/settings.toml` (`$XDG_CONFIG_HOME` respected). Terminal
-  ANSI colours are independent of the UI theme.
-- **Saved profiles**: On the New Session tab, fill in host/port/user, optional
-  profile name (blank → `user@host`), and press **Save profile**. Profiles are
-  written atomically to `~/.config/rustterm/sessions.toml`
-  (`$XDG_CONFIG_HOME` respected). Clicking one loads it into the form; **Delete
-  selected** removes it. Saving an existing name updates it.
+  ANSI colours are independent of the UI theme. The design is flat and boxy:
+  zero rounding, no shadows, hover changes fill only, 1 px borders, floating
+  scrollbars and one shared padding scale.
+- **Saved profiles**: On the New Session tab, fill in host/port/user, tick
+  **Save as profile**, optionally type a profile name (blank → `user@host`), and
+  press **Connect**. The profile is written *before* the connection starts, so a
+  validation error aborts the attempt instead of connecting silently. Profiles
+  are written atomically to `~/.config/rustterm/sessions.toml`
+  (`$XDG_CONFIG_HOME` respected). **Load** fills the form back in; the row's
+  **×** deletes it. Saving an existing name updates it in place.
 - **Optional keyring passwords (F19)**: tick **Save password in the system
   keyring** before saving. The secret goes to the OS keyring under service
   `rustterm` and account = profile name; an explicit profile name is mandatory
@@ -302,9 +310,12 @@ pinned to the far right of the tab bar.
   list every attempted method (missing file, encrypted key, rejected key,
   agent unavailable, wrong password) instead of a bare "rejected".
 - **SFTP side panel**: a second channel per session opens the `sftp` subsystem at
-  connect time. The left panel (420 px default, 340 px minimum) starts in the
-  remote login directory (`canonicalize(".")`) and renders a sticky-header table
-  with **Name / Owner / Modified / Size** columns (resizable, elided, striped).
+  connect time. The left panel (450 px default, 340 px minimum, capped at 55% of
+  the window or 720 px) starts in the remote login directory
+  (`canonicalize(".")`) and renders a fixed-header table with **Name / Owner /
+  Modified / Size** columns (hand-rolled, elided, striped). Column dividers exist
+  only in the header; dragging one resizes the column to its right. The header
+  uses the same font size and weight as the rows.
   Single-click selects; double-click opens a folder or brings up **Open with…**
   for a file; right-click selects and opens the row menu. **Home**, **Up**,
   **Refresh**, **Reconnect** and an editable path + **Enter**/➡ navigate.
@@ -415,7 +426,7 @@ Hardcoded `80x24` until the first `ui()` frame. Produces a small reflow on conne
 Read once per frame rather than per event.
 
 **F18 — Tests (B)**
-`terminal.rs` has unit tests for `bg_runs`, the colour mapping and the mouse encoding; `input.rs` has tests for the key encoding incl. DECCKM; `sessions.rs` covers persistence, validation and profile defaults; `sftp.rs` covers path join/parent, sorting, formatting, name validation, copy guard and editor resolution; `ssh.rs` covers `/etc/passwd` parsing and remote path joining. **42 tests**, run with `cargo test`. Still missing: automated network tests for public-key auth and the SFTP transport (both were verified with temporary russh-server probes, not committed tests).
+`terminal.rs` has unit tests for `bg_runs`, the colour mapping and the mouse encoding; `input.rs` has tests for the key encoding incl. DECCKM; `sessions.rs` covers persistence, validation and profile defaults; `sftp.rs` covers path join/parent, sorting, formatting, name validation, copy guard and editor resolution; `ssh.rs` covers `/etc/passwd` parsing and remote path joining. **48 tests**, run with `cargo test`. Still missing: automated network tests for public-key auth and the SFTP transport (both were verified with temporary russh-server probes, not committed tests).
 
 **F19 — Password storage / memory hygiene (B, mostly resolved)**
 Passwords are never written to `sessions.toml`. Opt-in keyring storage is
@@ -474,10 +485,18 @@ program.
 7. **Only bundled fonts are available.** Proportional text falls back through
    Ubuntu-Light → NotoEmoji → emoji-icon-font. Glyphs outside those fonts render
    as tofu boxes: avoid `＋`, `⌂`, `↑`, `→`, `⧉`, `◉`, `◐`, `✓`, `●`, `⋯`.
-   Use `+`, `🏠`, `⬆`, `➡`, `🗐`, `👁`, `✔`, `•`, `☰`, `🎨` or plain text.
-8. **`egui_extras::TableBuilder` rows are closures.** Capture actions in an
-   `Option` and apply them after the table body; the explorer cannot be borrowed
-   mutably inside a row while the table iterates it.
+   Use `+`, `🏠`, `⬆`, `➡`, `🗀`, `🗋`, `🗐`, `👁`, `✔`, `•`, `☰`, `🎨` or
+   plain text.
+8. **Hand-rolled tables need `inner_rect`, not `available_width`.** The SFTP
+   listing draws the header *after* the scrolling body, using
+   `ScrollArea::show_rows` and `output.inner_rect.width()`; `available_width`
+   there included the scrollbar and misaligned the columns. Capture row actions
+   in an `Option` and apply them after the loop, because the explorer cannot be
+   borrowed mutably while it is being iterated.
+9. **`egui::Window` has a 420 px default inner height.** A short modal therefore
+   looks empty. `.auto_sized()` is not the fix — it sets an infinite default size
+   and expands to the whole area. Use `.default_size(vec2(width, 1.0))` with a
+   fixed inner width so the window tracks its content.
 
 ---
 
@@ -620,10 +639,12 @@ through a `pty` so the byte sequences can be injected.
    - Keyboard `Ctrl+C`/`Ctrl+V` were deliberately **not** bound in the panel;
      terminal copy/paste must not be stolen. The toolbar/context menu are always
      available.
-8. **UI overhaul** ✅ done — `egui_extras` SFTP table, icon toolbar with
-   tooltips, bottom status bar with history, font-safe glyphs, **Open with…**
-   modal, padded delete/rename dialogs, centred New Session page, and a global
-   persisted theme system (`src/theme.rs`, `src/settings.rs`).
+8. **UI overhaul** ✅ done — hand-rolled fixed-header SFTP table with
+   header-only column resizing, icon toolbar with tooltips, bottom status bar
+   with history, font-safe glyphs, **Open with…** modal, compact content-sized
+   dialogs, flat boxy theme with a global persisted registry (`src/theme.rs`,
+   `src/settings.rs`), in-tab close buttons, and a compact New Session page with
+   saved-profile management folded into the connection card.
 9. **Transfers** ← next — upload/download with progress bars, queue and drag &
    drop; reuse the streaming read/write helpers from copy/editor download.
 
@@ -717,26 +738,31 @@ editor launch, exact timestamp formatting, and testable name/copy guards.
 `app.rs` draws two-line rows (name + owner/timestamp), the extra toolbar, row
 context menus and the modal dialogs. `chrono` was added for local timestamps.
 
-Verified with **42 tests** (both feature sets), clippy `-D warnings`, fmt and a
-release build. GUI file-operation probing against a live server is still in the
+Verified with **42 tests** at the time (48 today; both feature sets), clippy
+`-D warnings`, fmt and a release build. GUI file-operation probing against a live server is still in the
 manual checklist (`USAGE.md` §14), including recursive delete, copy of files and
 folders, symlink copy, hidden filtering, editor launch and reconnect.
 
 **Step 7 — UI overhaul.** ✅ done.
-`egui_extras::TableBuilder` renders the SFTP listing (Name/Owner/Modified/Size,
-resizable columns, sticky header) instead of two-line rows. The selected-file
-footer and inline error block were replaced by a bottom status bar backed by
-`StatusLog` (last 50 messages, ☰ history, Clear). The toolbar is icon-only with
-tooltips; right-click is the only menu gesture. **Open with…** is a modal with
-availability checks and a custom command. Dialogs share `theme::modal_frame`
-with padded content and right-aligned actions. The New Session page is a centred
-column of cards. `src/theme.rs` + `src/settings.rs` provide a global theme
-registry (Midnight, Graphite) persisted in
-`~/.config/rustterm/settings.toml`.
+The SFTP listing (Name/Owner/Modified/Size) is hand-rolled: a fixed header plus
+`ScrollArea::show_rows`, with column dividers only in the header. `egui_extras`
+was removed. The selected-file footer and inline error block were replaced by a
+bottom status bar backed by `StatusLog` (last 50 messages, ☰ history, Clear).
+The toolbar is icon-only with tooltips; right-click is the only menu gesture.
+**Open with…** is a modal with availability checks and a custom command. Dialogs
+share `theme::modal_frame`, size to their content and right-align their actions.
+The New Session page is a compact centred column: one connection card (with
+auth options and the optional **Save as profile** field) plus a **Name/Target**
+profile table. `src/theme.rs` + `src/settings.rs` provide a flat, persisted theme
+registry (Midnight, Graphite) in `~/.config/rustterm/settings.toml`; corners are
+square, shadows and hover glow are gone, and one padding/control-height scale is
+shared by forms, tables, dialogs and tabs.
 
 Verified with **48 tests** (both feature sets), clippy `-D warnings`, fmt and a
-release build. The New Session page, tab bar and theme switching were checked on
-screen; live-SFTP GUI checks remain in `USAGE.md` §14.
+release build. On screen: New Session at 900×700 and 700×400, the tab close `×`,
+panel cap/hide/show, header resizing, the SFTP rename/new-folder/delete and
+**Open with…** dialogs, the host-key prompt (accept and reject) and theme
+switching/persistence. The remaining live-SFTP items are in `USAGE.md` §14.
 
 **Step 8 — Transfers.** ← next
 Upload/download over the existing `SftpSession`, with progress reporting, a
@@ -851,7 +877,7 @@ Maintained by the assistant. Update after each successful `cargo build`.
 | Public-key / agent auth | `ssh.rs`, `app.rs`, `sessions.rs` | `SshConfig::{use_key,key_path,use_agent}`, `authenticate()`, `authenticate_with_agent()`, `key_candidates()`, `expand_tilde()`, `SessionProfile::{use_key,key_path,use_agent}` | ✅ done (31 tests; file key + agent + password verified against a temporary russh server; GUI-unverified) |
 | SFTP panel | `sftp.rs` (new), `ssh.rs`, `app.rs`, `main.rs`, `Cargo.toml` | `SshSession::{sftp_unavailable,sftp_home,sftp_list}`, `RemoteEntry`, `SftpExplorer::{start,poll,load_home,navigate,refresh,up,selected_entry}`, `join_path`, `parent_path`, `sort_entries`, `format_size`, `format_age`, `RustTermApp::sftp_ui`, `show_sftp` | ✅ done (36 tests; transport verified against a temporary in-process russh SFTP server; GUI-unverified) |
 | SFTP follow-ups | `sftp.rs`, `ssh.rs`, `app.rs`, `Cargo.toml` | `SshSession::{sftp_reconnect,sftp_rename,sftp_delete,sftp_create_dir,sftp_copy,sftp_fetch}`, `SftpClient`, `SharedSftp`, `RemoteEntry::owner`, `SftpExplorer::{reconnect,copy_entry,paste,paste_into,begin_rename,begin_delete,begin_new_folder,begin_new_folder_in,submit_dialog,open_in_editor}`, `SftpDialog`, `EditorChoice`, `format_timestamp`, `RustTermApp::{sftp_ui,sftp_dialogs_ui}`, `chrono` | ✅ done (42 tests both feature sets; clippy/fmt/release clean; GUI-unverified) |
-| UI overhaul | `theme.rs` (new), `settings.rs` (new), `app.rs`, `sftp.rs`, `main.rs`, `Cargo.toml` | `theme::{ThemeId,Theme,Palette,Metrics,apply,card_frame,modal_frame,callout_frame,icon_button,icon_toggle}`, `Settings::{load_default,load_from,save_default,save_to}`, `SftpExplorer::status`, `StatusLog`, `EditorPicker`, `SftpExplorer::{begin_open_with,submit_open_with,cancel_open_with}`, `RustTermApp::{tabs_ui,theme_menu_ui,editor_picker_ui}`, `egui_extras::{TableBuilder,Column}` | ✅ done (48 tests; clippy/fmt/release clean; New Session + theme verified in GUI, live-SFTP pass pending) |
+| UI overhaul | `theme.rs` (new), `settings.rs` (new), `app.rs`, `sftp.rs`, `main.rs`, `Cargo.toml` | `theme::{ThemeId,Theme,Palette,Metrics,apply,body_font,panel_frame,card_frame,modal_frame,callout_frame,section_label,muted,primary_button,danger_button,icon_button,icon_toggle}`, `Settings::{load_default,load_from,save_default,save_to}`, `SftpExplorer::status`, `StatusLog`, `EditorPicker`, `SftpExplorer::{begin_open_with,submit_open_with,cancel_open_with}`, `RustTermApp::{tabs_ui,tab_button,theme_menu_ui,editor_picker_ui,text_field,form_label,sized_label,sftp_header,SftpColumns,SftpLayout}`, hand-rolled SFTP table (`ScrollArea::show_rows`), `egui_extras` removed | ✅ done (48 tests; clippy/fmt/release clean; New Session, tabs, panel, dialogs, host-key prompt and themes verified in the GUI; remaining live-SFTP items in `USAGE.md` §14) |
 | Next: transfers | `ssh.rs`, `sftp.rs`, `app.rs` | TBD — upload/download, progress, queue, drag & drop | ⏳ pending |
 ⚙
 

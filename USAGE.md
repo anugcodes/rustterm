@@ -282,13 +282,15 @@ dependencies at `opt-level = 2`. For the best throughput use
       exchange algorithm" error, and only one host-key prompt on first use.
 - [ ] Idle CPU still stays ~0% while connected.
 
-## 12. Saved session profiles — [U]
+## 12. Saved profiles — [U]
 
-**How:** on the **New Session** tab, fill in Host/Port/User, optionally type a
-**Profile name** (leave it blank to use `user@host`), and press **Save profile**.
-The profile appears in the list below. Click an entry to load its host, port and
-user back into the form, then type the password and press **Connect**. Select an
-entry and press **Delete selected** to remove it.
+**How:** on the **New Session** tab, fill in Host/Port/User, tick **Save as
+profile**, optionally type a **Profile name** (leave it blank to use
+`user@host`), and press **Connect**. The profile is written *before* the
+connection starts, so a bad port, missing host or name error stops the attempt
+with an inline message instead of connecting silently. Profiles are listed at the
+bottom of the page in a compact **Name / Target** table: **Load** fills the form
+back in and the row's **×** deletes the profile.
 
 Profiles are stored atomically in:
 
@@ -304,8 +306,8 @@ already exists updates it in place. Load/save problems are shown inline
 ### Optional keyring password
 
 Tick **Save password in the system keyring** (under the Password field) before
-pressing **Save profile** to store the password too. This is strictly opt-in and
-per profile. When it is ticked:
+ticking **Save as profile** and connecting, to store the password too. This is
+strictly opt-in and per profile. When it is ticked:
 
 - an explicit **Profile name is mandatory** — a blank name is rejected with
   `Profile name is required when saving the password`;
@@ -320,10 +322,10 @@ Loading such a profile fills the password box from the keyring. If the entry is
 missing or cannot be read, an error is shown and you can type the password
 manually; **Connect** always uses whatever is in the password box.
 
-Unticking the box and saving again deletes the stored secret. Deleting the
-profile also deletes its keyring entry. Entries appear in **Seahorse** (Passwords
-and Keys) under `rustterm` / `<profile name>`, or with
-`secret-tool search service rustterm`.
+Unticking the box and connecting with **Save as profile** ticked again deletes
+the stored secret. Deleting the profile also deletes its keyring entry. Entries
+appear in **Seahorse** (Passwords and Keys) under `rustterm` / `<profile name>`,
+or with `secret-tool search service rustterm`.
 
 ### Lean builds without keyring support
 
@@ -364,36 +366,38 @@ save_password = true          # secret lives in the OS keyring
 
 **Verify**
 
-- [ ] Launch with no config file. The list says "No saved sessions yet."
-- [ ] Fill Host `172.31.251.23`, Port `22`, User `anuragb`, leave the name
-      blank, press **Save profile** → green `Saved profile 'anuragb@172.31.251.23'`
-      and one entry appears without restarting.
-- [ ] `cat ~/.config/rustterm/sessions.toml` → it contains name/host/port/user
-      and **no plaintext password** (only an optional `save_password` flag).
-- [ ] Click the saved entry → Host/Port/User are filled in, the password box is
-      empty, the name box shows the profile name, and the entry is highlighted.
+- [ ] Launch with no config file. The table says “Nothing saved yet. Tick
+      “Save as profile” above to keep this connection.”
+- [ ] Fill Host `172.31.251.23`, Port `22`, User `anuragb`, tick **Save as
+      profile**, leave the name blank and press **Connect** → the profile is
+      created before the connection attempt; `cat ~/.config/rustterm/sessions.toml`
+      shows name/host/port/user and **no plaintext password**. Stop at the host-key
+      prompt and close the tab if you do not want to log in.
+- [ ] Press **Load** on an entry → Host/Port/User are filled in, the name field
+      shows the profile name, and the password box is empty (unless a keyring
+      password is stored).
 - [ ] Type the password and **Connect** → the session opens normally.
 - [ ] **Name is mandatory for keyring saves**: tick **Save password in the
-      system keyring**, clear the Profile name, press **Save profile** → red
-      `Profile name is required when saving the password`; no file change.
-- [ ] **Store**: enter name `legacy`, tick the box, type the password, press
-      **Save profile** → green confirmation. The TOML gains
-      `save_password = true` but no password text.
-- [ ] **Load**: click another profile, then `legacy` → the password box is
-      filled automatically from the keyring and the box stays ticked.
+      system keyring** and **Save as profile**, clear the name, press **Connect**
+      → red `Profile name is required when saving the password`; no file change.
+- [ ] **Store**: enter name `legacy`, tick both boxes, type the password, press
+      **Connect** → saved and connected. The TOML gains `save_password = true`
+      but no password text.
+- [ ] **Load**: press **Load** on another profile, then `legacy` → the password
+      box is filled automatically from the keyring and the box stays ticked.
 - [ ] Connect with the auto-filled password → login succeeds.
 - [ ] The secret exists in the OS keyring: Seahorse shows `rustterm` / `legacy`,
       or `secret-tool search service rustterm` finds it.
-- [ ] **Stop storing**: untick the box and press **Save profile** → green
-      confirmation; the keyring entry is gone and loading `legacy` no longer
+- [ ] **Stop storing**: untick the password box, tick **Save as profile**, press
+      **Connect** → the keyring entry is gone and loading `legacy` no longer
       fills a password.
-- [ ] Re-tick, save, then **Delete selected** → profile and keyring entry both
-      disappear.
-- [ ] **Missing secret recovery**: remove the entry manually in Seahorse, click
-      the profile → red `No password is stored for '…'`; type the password and
-      **Connect** still works.
+- [ ] Re-tick, save, then press the row's **×** → the profile and keyring entry
+      both disappear.
+- [ ] **Missing secret recovery**: remove the entry manually in Seahorse, press
+      **Load** on the profile → red `No password is stored for '…'`; type the
+      password and **Connect** still works.
 - [ ] **No keyring available** (only on a system without Secret Service): tick
-      the box, press Save → red keyring error; no profile is written, and
+      the box, press Connect → red keyring error; no profile is written, and
       password-based connections still work.
 - [ ] **Lean build**: `cargo run --no-default-features` → the keyring checkbox is
       absent; saving profiles and connecting with a typed password work as before.
@@ -401,24 +405,23 @@ save_password = true          # secret lives in the OS keyring
       a full build, load it in the lean build → red “this build has no keyring
       support”; type the password and **Connect** still works. Re-saving keeps
       `save_password = true` in the TOML.
-- [ ] Quit and `cargo run` again → the profile is still listed, and keyring
+- [ ] Quit and `cargo run` again → the profiles are still listed, and keyring
       passwords load again.
 - [ ] Save a second profile with a custom name, e.g. `prod`. Both entries appear;
-      the list scrolls after roughly five entries.
-- [ ] With `prod` loaded, change the port and press **Save profile** again →
+      the list scrolls after four rows.
+- [ ] Load `prod`, change the port, tick **Save as profile** and Connect →
       still one `prod` entry, now with the new port (no duplicate).
-- [ ] Select `prod`, press **Delete selected** → it disappears immediately and
-      is gone after a restart.
-- [ ] Clear Host, press **Save profile** → red `Host is required`; the file is
-      unchanged.
-- [ ] Set Port to `abc`, press **Save profile** → red `Port must be a number`.
-- [ ] Set Port to `0`, press **Save profile** → red `Port must be between 1 and 65535`.
+- [ ] Press the row's **×** on `prod` → it disappears immediately and is gone
+      after a restart.
+- [ ] Clear Host, tick **Save as profile**, press **Connect** → red `Host is
+      required`; the file is unchanged and no connection is attempted.
+- [ ] Set Port to `abc`, press **Connect** → red `Port must be a number`.
+- [ ] Set Port to `0`, press **Connect** → red `Port must be between 1 and 65535`.
 - [ ] Malformed-file resilience: back up the file, replace it with `garbage = =`,
       relaunch → a red parse error is shown but the app still starts and can
       connect manually. Saving a new profile replaces the malformed file.
 - [ ] `XDG_CONFIG_HOME=/tmp/rt-config cargo run` → profiles are read/written
       under `/tmp/rt-config/rustterm/sessions.toml`.
-
 ---
 
 ## 13. Public-key and ssh-agent authentication — [U]
@@ -478,17 +481,22 @@ Setup: a local sshd with `PubkeyAuthentication yes`, plus
 
 ## 14. SFTP side panel — [U]
 
-**How:** after a successful connection, a **Remote files** panel appears on the
-left (420 px by default, resizable down to 340 px). It opens at the remote login
-directory (`canonicalize(".")`, usually `$HOME`) and lists entries in a table
-with a sticky header: **Name**, **Owner**, **Modified** and **Size**. The
+**How:** after a successful connection, the remote file panel appears on the
+left. It opens at 450 px, can be dragged between 340 px and 55% of the window
+(capped at 720 px), so the terminal always stays visible. It starts at the remote
+login directory (`canonicalize(".")`, usually `$HOME`) and lists entries in a
+table with a fixed header: **Name**, **Owner**, **Modified** and **Size**. The
 **Files** toggle in the tab bar shows/hides it, and the panel's **×** hides it
-too. Each tab keeps its own directory.
+too. Each tab keeps its own width, directory and selection.
 
-- Entries are sorted **directories first**, then case-insensitive name. `📁` is a
-  directory, `📄` a regular file, `🔗` a symlink (displayed but not followed yet).
+- Entries are sorted **directories first**, then case-insensitive name. The
+  font-safe icons are `🗀` for a directory, `🗋` for a regular file and `🔗` for a
+  symlink (displayed but not followed yet).
 - Rows are striped and stay on one line; long names/owners/times are elided.
-  Hover a row for its full path, type, size, owner, exact timestamp and relative
+  The header uses the same font size as the rows and nothing is bold.
+- Column dividers exist only in the header. Drag one to resize the column to its
+  right; file rows never show resize handles.
+- Hover a row for its full path, type, size, owner, exact timestamp and relative
   age.
 - **Single click** selects a row. **Double click** opens it: folders navigate,
   files open the **Open with…** picker. A single click never opens a menu.
@@ -520,10 +528,11 @@ too. Each tab keeps its own directory.
   are shown disabled. The last choice is preselected for the session. The file
   is downloaded to a unique `rustterm-edit-<pid>-<nanos>` temp directory and
   launched asynchronously.
-- **Rename/Delete** use the same padded modal with right-aligned Cancel plus the
-  primary action. Delete names the entry, shows the remote path and warns that
-  the action cannot be undone (tinted red, and worded for recursive folder
-  removal). `Esc` cancels. Rename accepts a single path component (no `/`).
+- **Rename/Delete** use the same compact, auto-sized modal with right-aligned
+  Cancel plus the primary action. Delete names the entry, shows the remote path
+  and warns that the action cannot be undone (tinted red, and worded for
+  recursive folder removal). `Esc` cancels. Rename accepts a single path
+  component (no `/`).
 - If the SSH server has no SFTP subsystem, the panel says **SFTP is unavailable**
   with the reason in the status bar and offers **Reconnect SFTP**. Only the SFTP
   channel is retried; the terminal is unaffected.
@@ -541,11 +550,12 @@ so delete/copy tests cannot touch real data.
 
 - [ ] **Appears**: connect → the left panel lists the login directory; compare
       with `pwd` / `ls -la` in the terminal.
-- [ ] **Columns**: the header reads **Name / Owner / Modified / Size** and stays
-      visible while scrolling. Owner and local `YYYY-MM-DD HH:MM` match
-      `stat -c '%U %y' file`; folders show an em dash for size. Resize a column
-      by dragging its header edge and narrow the panel to ~340 px: text elides
-      instead of wrapping, and the header remains readable.
+- [ ] **Columns**: the header reads **Name / Owner / Modified / Size**, uses the
+      same font size as the rows, is not bold and stays visible while scrolling.
+      Owner and local `YYYY-MM-DD HH:MM` match `stat -c '%U %y' file`; folders
+      show an em dash for size. Drag a divider in the header to resize the column
+      to its right (dividers are not drawn on file rows) and narrow the panel to
+      ~340 px: text elides instead of wrapping, and the header remains readable.
 - [ ] **Sorting**: directories come first; names are case-insensitive
       alphabetical within each group.
 - [ ] **Select vs open**: one click highlights a row without navigating; double
@@ -617,15 +627,21 @@ so delete/copy tests cannot touch real data.
       and output flows while the listing/copy runs.
 - [ ] **No auto-follow (expected)**: `cd /var/log` in the terminal → the panel
       stays where it was until you navigate/refresh manually.
-- [ ] **Teardown**: close the tab with the panel open, and disconnect via
-      **Disconnect** → no crash, no stuck thread.
+- [ ] **Teardown**: close the tab with the panel open, and disconnect via the
+      **Disconnect** bar at the bottom of the terminal → no crash, no stuck
+      thread.
+- [ ] **Window cap**: with the panel open, shrink the window to ~900 px wide →
+      the panel stops at 55% (about 495 px) and the terminal stays usable; drag
+      the panel wider and it refuses to cover the terminal.
 
 ## 15. Appearance and themes — [V]
 
-**How:** the **🎨 Theme** button at the far right of the tab bar opens a small
+**How:** the **🎨 Theme** button at the far right of the tab bar opens a short
 menu with the built-in themes. Selecting one applies it to the whole app
-immediately — top bar, forms, cards, tables, dialogs and the SFTP panel. The
-choice is saved in:
+immediately — top bar, forms, cards, tables, dialogs and the SFTP panel — and
+closes the menu. The design is deliberately flat and boxy: square corners, 1 px
+borders, no drop shadows and no accent-coloured hover glow. All controls share
+the same padding and a 26 px control height. The choice is saved in:
 
 ```
 $XDG_CONFIG_HOME/rustterm/settings.toml      # if XDG_CONFIG_HOME is set
@@ -657,25 +673,36 @@ Adding a theme:
 
 ## 16. New Session page — [V]
 
-The **New Session** tab is a centred column (maximum 560 px) inside a vertical
-scroll area. It contains, from top to bottom:
+The **New Session** tab is a centred column (maximum 600 px) inside a vertical
+scroll area. One card holds the whole flow, top to bottom:
 
-- a **Connection** card: Host + Port on one row, then User and Password, with a
-  collapsible **Authentication** section (key file, ssh-agent, optional keyring
-  password);
-- a primary **Connect** button that shows a spinner and inline status while a
-  connection is in flight;
-- a **Profile** card with the profile name and **Save profile**;
-- a **Saved sessions** card listing `name · user@host:port`, with click-to-load
-  and **Delete selected**.
+- **Connection**: Host + Port on one row, then User and Password. Labels share a
+  single gutter so the inputs line up; text is vertically centred in every
+  26 px input.
+- **Use a private key** reveals a key-path field (blank auto-detects
+  `~/.ssh/id_ed25519`, `id_ecdsa`, `id_rsa` or `id_dsa`). **Use SSH agent
+  identities** is next. The optional **Save password in the system keyring**
+  checkbox is hidden in lean builds.
+- **Save as profile**: ticking the checkbox enables the profile-name field
+  (blank = `user@host`). Connect stores the profile first and aborts on an
+  invalid port/name. The status line below the button reports save and connect
+  results in place.
+- A separator, then the **Saved profiles** table: a heading with the profile
+  count (hover it to see the store path), **Name / Target** columns, **Load**
+  and **×** per row, and an empty-state hint when nothing is saved.
 
-The layout keeps modest padding and section spacing and stays readable when the
-window is narrow or short (the whole page scrolls).
+The page keeps equal padding, uses theme tokens rather than hard-coded sizes,
+and scrolls when the window is short.
 
 **Verify**
 
-- [ ] At ~1000 px and ~1600 px window widths the column stays centred and does
+- [ ] At ~900 px and ~1600 px window widths the column stays centred and does
       not stretch; no horizontal scrollbar appears.
-- [ ] Shrink the window vertically → the page scrolls; no card is clipped.
+- [ ] Shrink the window vertically → the page scrolls; no card or table row is
+      clipped.
+- [ ] The **Save as profile** name field is disabled until the checkbox is
+      ticked, just like the private-key path field.
 - [ ] Press **Connect** with empty fields → the status line inside the card
       explains what is missing and the button is usable again.
+- [ ] At ~700 px window width the Host/Port row and saved-profile columns still
+      fit; long profile targets elide with a tooltip.

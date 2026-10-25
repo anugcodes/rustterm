@@ -8,6 +8,8 @@ for the whole application. It is being implemented in small, compiling commits.
 ## 1. SFTP listing as a table
 
 - Use `egui_extras::TableBuilder` for a real table with a sticky header.
+  *(Replaced in the refinement pass by a hand-rolled fixed header + scroll area,
+  see below.)*
 - Columns: **Name** (flexible), **Owner**, **Modified**, **Size**.
 - Name cells keep the folder/file/symlink icon and a tooltip with the full name.
 - Owner and modified time use muted, compact text; size is right-aligned and
@@ -100,7 +102,8 @@ New folder…, Refresh. These remain reachable from the icon toolbar.
 
 ## Files
 
-- `Cargo.toml` — add `egui_extras` 0.29.
+- `Cargo.toml` — add `egui_extras` 0.29. *(Removed in the refinement pass; the
+  table is hand-rolled.)*
 - `src/theme.rs` — new theme registry, palette and widget helpers.
 - `src/settings.rs` — new theme persistence.
 - `src/main.rs` — register modules and apply the default theme.
@@ -124,6 +127,55 @@ keeps the last 50 entries. Fonts: only egui's bundled families are available
 (Ubuntu-Light, NotoEmoji, emoji-icon-font), so the UI uses `+ 🏠 ⬆ 🔄 ➕ 🗐 📋 👁
 ⚡ ➡ ☰ 🎨 ✔ • ×` and avoids glyphs that render as tofu.
 
+## Refinement pass (flat, boxy redesign)
+
+The first pass was structurally right but visually too soft and too tall. A
+second pass tightened it:
+
+- **Table** — `egui_extras` was dropped. The listing is now a hand-rolled fixed
+  header plus `ScrollArea::show_rows`, which keeps the header and rows perfectly
+  aligned and lets the header paint its own column dividers. Dividers exist
+  **only in the header**; dragging one resizes the column to its right. Rows no
+  longer show a resize cursor. The header and the file names use the same font
+  size and weight (no bold). Default widths: owner 64, modified 122, size 52,
+  name minimum 80 px.
+- **"Remote files" title removed** — the panel starts directly with the toolbar.
+- **Panel sizing** — default 450 px, minimum 340 px, maximum
+  `min(55% of the window, 720 px)`, still draggable. The terminal is always
+  visible, including on a 900 px-wide window.
+- **Flat theme** — `Rounding::ZERO`, no shadows, hover changes fill only (no
+  accent glow), 1 px borders, floating thin scrollbars, a 26 px control height
+  shared by buttons and inputs, and identical horizontal/vertical padding.
+- **Input alignment** — every single-line input uses `vertical_align(Center)`
+  with a `(pad, 2)` margin, so text sits on the same baseline across a row and
+  labels line up in one gutter.
+- **Tabs** — one box per tab with the close `×` inside it and the label centred;
+  minimum width 168 px. Middle-click also closes.
+- **New Session** — connection fields, auth options and the profile checkbox live
+  in **one** card. **Save as profile** is a checkbox that enables the
+  profile-name field (same pattern as the private-key path). Profiles are saved
+  before connecting, so validation failures abort the attempt. The saved list
+  became a compact **Saved profiles (n)** table with **Name / Target**, **Load**
+  and a per-row **×**, with an empty-state hint. The whole page is narrower and
+  scrolls at small window sizes.
+- **Dialogs** — all modals use `theme::modal_frame`, a custom title bar
+  (`title_bar(false)` for the SFTP dialogs) and `.default_size(vec2(width, 1.0))`
+  so they size to their content. `.auto_sized()` was tried and reverted because
+  egui expands it to the whole area. The host-key prompt was restyled to match.
+- **Theme menu** — two entries, closes on selection, no developer hint.
+- **Icons** — SFTP rows use `🗀` / `🗋` / `🔗` at body font size.
+
+### Verified on screen
+
+- Panel cap/default/minimum, hide/show preserving width, path and selection.
+- Header divider resizing, full timestamps, new icons, tab close `×`, terminal
+  reflow when the panel is hidden, bottom **Disconnect** bar.
+- New Session at 900×700 and 700×400.
+- Rename, New folder, Delete and **Open with…** dialogs (all compact and boxy).
+- Host-key prompt end-to-end (reject and accept, key written to
+  `known_hosts`, connection succeeds).
+- Midnight ↔ Graphite switching and theme persistence across a restart.
+
 ## Verification
 
 - `cargo fmt --check`
@@ -138,7 +190,7 @@ keeps the last 50 entries. Fonts: only egui's bundled families are available
 
 ## Manual checks still pending
 
-- Live SFTP server: table at the 340 px minimum, right-click menu, recursive
-  delete warning, status history during a large copy, editor launch and
-  reconnect. Run the checklist in `USAGE.md` §14.
-- Very small window sizes (< 900 px wide) with the SFTP panel open.
+- Live SFTP server: recursive delete warning, status history during a large
+  copy, editor launch and reconnect. Run the checklist in `USAGE.md` §14.
+- Very small window sizes (< 900 px wide) with the SFTP panel open — the 900 px
+  cap and the 700×400 New Session page were checked, narrower layouts were not.

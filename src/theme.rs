@@ -1,12 +1,14 @@
 //! Application-wide visual theme.
 //!
-//! All UI colours, spacing and rounding come from here so new themes can be
+//! All UI colours, spacing and padding come from here so new themes can be
 //! added without touching the individual screens. The terminal keeps its own
 //! ANSI palette; this module only styles the application chrome.
+//!
+//! The design language is deliberately flat and boxy: square corners, single
+//! pixel borders, no drop shadows and no hover glow. Padding is uniform
+//! (`Metrics::pad` for controls, `Metrics::card_padding` for frames).
 
-use eframe::egui::{
-    self, Color32, FontFamily, FontId, Margin, Rounding, Shadow, Stroke, TextStyle, Vec2,
-};
+use eframe::egui::{self, Color32, FontFamily, FontId, Margin, Rounding, Stroke, TextStyle, Vec2};
 
 /// Identifiers for the built-in themes. Add a variant and a palette below to
 /// introduce a new theme.
@@ -58,10 +60,10 @@ pub struct Palette {
     pub surface: Color32,
     pub surface_hover: Color32,
     pub border: Color32,
+    pub border_strong: Color32,
     pub text: Color32,
     pub muted: Color32,
     pub accent: Color32,
-    pub accent_hover: Color32,
     pub success: Color32,
     pub warning: Color32,
     pub danger: Color32,
@@ -74,14 +76,15 @@ pub struct Palette {
 /// Spacing and sizing tokens.
 #[derive(Debug, Clone, Copy)]
 pub struct Metrics {
-    pub radius: f32,
-    pub card_radius: f32,
-    pub modal_radius: f32,
-    pub base_spacing: f32,
+    /// Uniform padding inside buttons, inputs and small frames.
+    pub pad: f32,
+    /// Gap between elements.
+    pub gap: f32,
     pub card_padding: f32,
     pub modal_padding: f32,
     pub control_height: f32,
     pub row_height: f32,
+    pub tab_min_width: f32,
     pub body_size: f32,
     pub small_size: f32,
     pub heading_size: f32,
@@ -94,72 +97,70 @@ pub struct Theme {
     pub metrics: Metrics,
 }
 
-const MIDNIGHT_METRICS: Metrics = Metrics {
-    radius: 6.0,
-    card_radius: 8.0,
-    modal_radius: 10.0,
-    base_spacing: 8.0,
-    card_padding: 16.0,
-    modal_padding: 20.0,
-    control_height: 28.0,
-    row_height: 26.0,
-    body_size: 14.0,
-    small_size: 11.5,
-    heading_size: 20.0,
-    mono_size: 13.0,
+const METRICS: Metrics = Metrics {
+    pad: 6.0,
+    gap: 6.0,
+    card_padding: 10.0,
+    modal_padding: 12.0,
+    control_height: 26.0,
+    row_height: 24.0,
+    tab_min_width: 168.0,
+    body_size: 13.5,
+    small_size: 11.0,
+    heading_size: 17.0,
+    mono_size: 12.5,
 };
 
 pub static MIDNIGHT: Theme = Theme {
     dark: true,
     palette: Palette {
-        bg: Color32::from_rgb(15, 17, 21),
-        panel: Color32::from_rgb(20, 23, 28),
-        surface: Color32::from_rgb(25, 29, 36),
-        surface_hover: Color32::from_rgb(32, 37, 45),
-        border: Color32::from_rgb(42, 48, 58),
-        text: Color32::from_rgb(230, 232, 236),
-        muted: Color32::from_rgb(152, 161, 173),
-        accent: Color32::from_rgb(91, 157, 255),
-        accent_hover: Color32::from_rgb(124, 178, 255),
-        success: Color32::from_rgb(70, 177, 123),
-        warning: Color32::from_rgb(217, 164, 65),
-        danger: Color32::from_rgb(229, 83, 75),
-        danger_soft: Color32::from_rgba_premultiplied(57, 21, 19, 255),
-        selection: Color32::from_rgb(36, 59, 92),
-        stripe: Color32::from_rgb(22, 26, 32),
-        input_bg: Color32::from_rgb(13, 16, 20),
+        bg: Color32::from_rgb(12, 15, 19),
+        panel: Color32::from_rgb(17, 21, 26),
+        surface: Color32::from_rgb(22, 27, 33),
+        surface_hover: Color32::from_rgb(29, 35, 43),
+        border: Color32::from_rgb(38, 45, 55),
+        border_strong: Color32::from_rgb(54, 63, 76),
+        text: Color32::from_rgb(224, 229, 235),
+        muted: Color32::from_rgb(136, 147, 160),
+        accent: Color32::from_rgb(74, 134, 232),
+        success: Color32::from_rgb(78, 174, 120),
+        warning: Color32::from_rgb(214, 162, 62),
+        danger: Color32::from_rgb(226, 88, 79),
+        danger_soft: Color32::from_rgb(54, 24, 23),
+        selection: Color32::from_rgb(33, 56, 88),
+        stripe: Color32::from_rgb(15, 18, 23),
+        input_bg: Color32::from_rgb(9, 12, 15),
     },
-    metrics: MIDNIGHT_METRICS,
+    metrics: METRICS,
 };
 
 pub static GRAPHITE: Theme = Theme {
     dark: true,
     palette: Palette {
-        bg: Color32::from_rgb(23, 24, 26),
-        panel: Color32::from_rgb(29, 31, 34),
-        surface: Color32::from_rgb(35, 38, 42),
-        surface_hover: Color32::from_rgb(44, 48, 53),
-        border: Color32::from_rgb(56, 61, 67),
-        text: Color32::from_rgb(236, 237, 238),
-        muted: Color32::from_rgb(163, 168, 174),
-        accent: Color32::from_rgb(122, 162, 247),
-        accent_hover: Color32::from_rgb(148, 183, 255),
-        success: Color32::from_rgb(115, 201, 145),
-        warning: Color32::from_rgb(226, 192, 141),
-        danger: Color32::from_rgb(240, 113, 120),
-        danger_soft: Color32::from_rgba_premultiplied(60, 28, 30, 255),
-        selection: Color32::from_rgb(53, 64, 82),
-        stripe: Color32::from_rgb(30, 33, 37),
-        input_bg: Color32::from_rgb(20, 22, 25),
+        bg: Color32::from_rgb(22, 23, 25),
+        panel: Color32::from_rgb(27, 29, 32),
+        surface: Color32::from_rgb(33, 36, 40),
+        surface_hover: Color32::from_rgb(41, 45, 50),
+        border: Color32::from_rgb(52, 57, 63),
+        border_strong: Color32::from_rgb(70, 76, 84),
+        text: Color32::from_rgb(232, 234, 236),
+        muted: Color32::from_rgb(155, 161, 169),
+        accent: Color32::from_rgb(120, 158, 224),
+        success: Color32::from_rgb(112, 192, 140),
+        warning: Color32::from_rgb(219, 184, 126),
+        danger: Color32::from_rgb(232, 116, 112),
+        danger_soft: Color32::from_rgb(56, 29, 29),
+        selection: Color32::from_rgb(49, 61, 78),
+        stripe: Color32::from_rgb(25, 27, 30),
+        input_bg: Color32::from_rgb(18, 20, 22),
     },
-    metrics: MIDNIGHT_METRICS,
+    metrics: METRICS,
 };
 
 /// Install the theme's visuals, spacing and text styles on the egui context.
 pub fn apply(ctx: &egui::Context, theme: &Theme) {
     let p = &theme.palette;
     let m = &theme.metrics;
-    let rounding = Rounding::same(m.radius);
 
     let mut style = (*ctx.style()).clone();
     let mut visuals = if theme.dark {
@@ -171,9 +172,9 @@ pub fn apply(ctx: &egui::Context, theme: &Theme) {
     visuals.override_text_color = None;
     visuals.panel_fill = p.panel;
     visuals.window_fill = p.surface;
-    visuals.window_stroke = Stroke::new(1.0_f32, p.border);
-    visuals.window_rounding = Rounding::same(m.modal_radius);
-    visuals.menu_rounding = Rounding::same(m.card_radius);
+    visuals.window_stroke = Stroke::new(1.0_f32, p.border_strong);
+    visuals.window_rounding = Rounding::ZERO;
+    visuals.menu_rounding = Rounding::ZERO;
     visuals.faint_bg_color = p.stripe;
     visuals.extreme_bg_color = p.input_bg;
     visuals.code_bg_color = p.surface_hover;
@@ -182,77 +183,75 @@ pub fn apply(ctx: &egui::Context, theme: &Theme) {
     visuals.error_fg_color = p.danger;
     visuals.selection = egui::style::Selection {
         bg_fill: p.selection,
-        stroke: Stroke::new(1.0_f32, p.accent),
+        // Also the text colour of a selected selectable label.
+        stroke: Stroke::new(1.0_f32, p.text),
     };
-    visuals.window_shadow = Shadow {
-        offset: Vec2::new(0.0, 8.0),
-        blur: 24.0,
-        spread: 0.0,
-        color: Color32::from_black_alpha(110),
-    };
-    visuals.popup_shadow = Shadow {
-        offset: Vec2::new(0.0, 4.0),
-        blur: 14.0,
-        spread: 0.0,
-        color: Color32::from_black_alpha(90),
-    };
-    visuals.striped = true;
+    visuals.window_shadow = egui::epaint::Shadow::NONE;
+    visuals.popup_shadow = egui::epaint::Shadow::NONE;
+    // Tables draw their own stripes; global striping would tint unrelated
+    // widgets (combo boxes, menus) as well.
+    visuals.striped = false;
     visuals.button_frame = true;
     visuals.collapsing_header_frame = false;
-    visuals.indent_has_left_vline = true;
+    visuals.indent_has_left_vline = false;
 
-    visuals.widgets.noninteractive = egui::style::WidgetVisuals {
-        bg_fill: p.panel,
-        weak_bg_fill: p.panel,
-        bg_stroke: Stroke::new(1.0_f32, p.border),
-        rounding,
-        fg_stroke: Stroke::new(1.0_f32, p.text),
+    let square = |bg_fill, weak_bg_fill, bg_stroke, fg_stroke| egui::style::WidgetVisuals {
+        bg_fill,
+        weak_bg_fill,
+        bg_stroke,
+        rounding: Rounding::ZERO,
+        fg_stroke,
         expansion: 0.0,
     };
-    visuals.widgets.inactive = egui::style::WidgetVisuals {
-        bg_fill: p.surface,
-        weak_bg_fill: p.surface,
-        bg_stroke: Stroke::new(1.0_f32, p.border),
-        rounding,
-        fg_stroke: Stroke::new(1.0_f32, p.text),
-        expansion: 0.0,
-    };
-    visuals.widgets.hovered = egui::style::WidgetVisuals {
-        bg_fill: p.surface_hover,
-        weak_bg_fill: p.surface_hover,
-        bg_stroke: Stroke::new(1.0_f32, p.accent_hover),
-        rounding,
-        fg_stroke: Stroke::new(1.0_f32, p.text),
-        expansion: 0.0,
-    };
-    visuals.widgets.active = egui::style::WidgetVisuals {
-        bg_fill: p.surface_hover,
-        weak_bg_fill: p.surface_hover,
-        bg_stroke: Stroke::new(1.0_f32, p.accent_hover),
-        rounding,
-        fg_stroke: Stroke::new(1.0_f32, p.text),
-        expansion: 0.0,
-    };
-    visuals.widgets.open = egui::style::WidgetVisuals {
-        bg_fill: p.surface_hover,
-        weak_bg_fill: p.surface_hover,
-        bg_stroke: Stroke::new(1.0_f32, p.border),
-        rounding,
-        fg_stroke: Stroke::new(1.0_f32, p.text),
-        expansion: 0.0,
-    };
+
+    visuals.widgets.noninteractive = square(
+        p.panel,
+        p.panel,
+        Stroke::new(1.0_f32, p.border),
+        Stroke::new(1.0_f32, p.text),
+    );
+    visuals.widgets.inactive = square(
+        p.surface,
+        p.surface,
+        Stroke::new(1.0_f32, p.border),
+        Stroke::new(1.0_f32, p.text),
+    );
+    // Hover highlights the fill only: no accent-coloured border glow.
+    visuals.widgets.hovered = square(
+        p.surface_hover,
+        p.surface_hover,
+        Stroke::new(1.0_f32, p.border_strong),
+        Stroke::new(1.0_f32, p.text),
+    );
+    visuals.widgets.active = square(
+        p.surface_hover,
+        p.surface_hover,
+        Stroke::new(1.0_f32, p.accent),
+        Stroke::new(1.0_f32, p.text),
+    );
+    visuals.widgets.open = square(
+        p.surface,
+        p.surface,
+        Stroke::new(1.0_f32, p.border_strong),
+        Stroke::new(1.0_f32, p.text),
+    );
 
     style.visuals = visuals;
-    style.spacing.item_spacing = Vec2::new(m.base_spacing, m.base_spacing * 0.75);
-    style.spacing.button_padding = Vec2::new(10.0, 5.0);
-    style.spacing.window_margin = Margin::same(10.0);
-    style.spacing.menu_margin = Margin::same(6.0);
-    style.spacing.menu_width = 280.0;
-    style.spacing.indent = 18.0;
-    style.spacing.interact_size.y = m.control_height;
+    style.spacing.item_spacing = Vec2::splat(m.gap);
+    style.spacing.button_padding = Vec2::splat(m.pad);
+    style.spacing.window_margin = Margin::same(m.card_padding);
+    style.spacing.menu_margin = Margin::same(m.pad);
+    style.spacing.menu_width = 240.0;
+    style.spacing.indent = 12.0;
+    style.spacing.interact_size = Vec2::new(36.0, m.control_height);
+    style.spacing.combo_width = 180.0;
+    style.spacing.text_edit_width = 260.0;
+    // Thin scrollbars that only appear while the pointer is over the area, so
+    // they do not add visual noise to the flat surfaces.
+    style.spacing.scroll = egui::style::ScrollStyle::floating();
     style.spacing.scroll.bar_width = 8.0;
-    style.spacing.scroll.floating = false;
-    style.animation_time = 0.12;
+    style.spacing.scroll.floating_width = 4.0;
+    style.animation_time = 0.1;
     style.text_styles = [
         (
             TextStyle::Heading,
@@ -280,12 +279,24 @@ pub fn apply(ctx: &egui::Context, theme: &Theme) {
     ctx.set_style(style);
 }
 
+/// Proportional font used for body text.
+pub fn body_font(theme: &Theme) -> FontId {
+    FontId::new(theme.metrics.body_size, FontFamily::Proportional)
+}
+
+/// Frame used for the SFTP side panel and the tab strip.
+pub fn panel_frame(theme: &Theme) -> egui::Frame {
+    egui::Frame::none()
+        .fill(theme.palette.panel)
+        .inner_margin(Margin::same(theme.metrics.pad))
+}
+
 /// Frame used for grouped content on the New Session page and other cards.
 pub fn card_frame(theme: &Theme) -> egui::Frame {
     egui::Frame::none()
         .fill(theme.palette.surface)
         .stroke(Stroke::new(1.0_f32, theme.palette.border))
-        .rounding(Rounding::same(theme.metrics.card_radius))
+        .rounding(Rounding::ZERO)
         .inner_margin(Margin::same(theme.metrics.card_padding))
 }
 
@@ -293,15 +304,9 @@ pub fn card_frame(theme: &Theme) -> egui::Frame {
 pub fn modal_frame(theme: &Theme) -> egui::Frame {
     egui::Frame::none()
         .fill(theme.palette.surface)
-        .stroke(Stroke::new(1.0_f32, theme.palette.border))
-        .rounding(Rounding::same(theme.metrics.modal_radius))
+        .stroke(Stroke::new(1.0_f32, theme.palette.border_strong))
+        .rounding(Rounding::ZERO)
         .inner_margin(Margin::same(theme.metrics.modal_padding))
-        .shadow(Shadow {
-            offset: Vec2::new(0.0, 10.0),
-            blur: 30.0,
-            spread: 0.0,
-            color: Color32::from_black_alpha(120),
-        })
 }
 
 /// Tinted frame used for warnings and other callouts inside a dialog.
@@ -309,18 +314,17 @@ pub fn callout_frame(theme: &Theme, fill: Color32) -> egui::Frame {
     egui::Frame::none()
         .fill(fill)
         .stroke(Stroke::new(1.0_f32, theme.palette.border))
-        .rounding(Rounding::same(theme.metrics.radius))
-        .inner_margin(Margin::symmetric(10.0, 8.0))
+        .rounding(Rounding::ZERO)
+        .inner_margin(Margin::same(theme.metrics.pad))
 }
 
-/// Section heading used inside cards.
-pub fn section_label(ui: &mut egui::Ui, theme: &Theme, text: &str) {
+/// Small uppercase section heading used inside cards.
+pub fn section_label(ui: &mut egui::Ui, theme: &Theme, text: &str) -> egui::Response {
     ui.label(
-        egui::RichText::new(text)
-            .strong()
-            .color(theme.palette.text)
-            .size(theme.metrics.body_size),
-    );
+        egui::RichText::new(text.to_uppercase())
+            .color(theme.palette.muted)
+            .size(theme.metrics.small_size),
+    )
 }
 
 /// Muted explanatory text.
@@ -332,6 +336,30 @@ pub fn muted(ui: &mut egui::Ui, theme: &Theme, text: impl Into<String>) {
     );
 }
 
+/// Filled accent button used for the primary action of a screen.
+pub fn primary_button(theme: &Theme, text: &str) -> egui::Button<'static> {
+    egui::Button::new(
+        egui::RichText::new(text.to_owned())
+            .color(egui::Color32::WHITE)
+            .size(theme.metrics.body_size),
+    )
+    .fill(theme.palette.accent)
+    .stroke(Stroke::NONE)
+    .rounding(Rounding::ZERO)
+}
+
+/// Destructive variant of [`primary_button`].
+pub fn danger_button(theme: &Theme, text: &str) -> egui::Button<'static> {
+    egui::Button::new(
+        egui::RichText::new(text.to_owned())
+            .color(egui::Color32::WHITE)
+            .size(theme.metrics.body_size),
+    )
+    .fill(theme.palette.danger)
+    .stroke(Stroke::NONE)
+    .rounding(Rounding::ZERO)
+}
+
 /// A compact icon button with a tooltip.
 pub fn icon_button(
     ui: &mut egui::Ui,
@@ -340,9 +368,9 @@ pub fn icon_button(
     tooltip: &str,
     enabled: bool,
 ) -> egui::Response {
-    let button = egui::Button::new(egui::RichText::new(icon).size(15.0))
-        .min_size(Vec2::new(28.0, 26.0))
-        .rounding(Rounding::same(theme.metrics.radius));
+    let button = egui::Button::new(egui::RichText::new(icon).size(13.0))
+        .min_size(Vec2::splat(theme.metrics.control_height))
+        .rounding(Rounding::ZERO);
     ui.add_enabled(enabled, button).on_hover_text(tooltip)
 }
 
@@ -354,10 +382,10 @@ pub fn icon_toggle(
     tooltip: &str,
     selected: bool,
 ) -> egui::Response {
-    let button = egui::Button::new(egui::RichText::new(icon).size(15.0))
+    let button = egui::Button::new(egui::RichText::new(icon).size(13.0))
         .selected(selected)
-        .min_size(Vec2::new(28.0, 26.0))
-        .rounding(Rounding::same(theme.metrics.radius));
+        .min_size(Vec2::splat(theme.metrics.control_height))
+        .rounding(Rounding::ZERO);
     ui.add(button).on_hover_text(tooltip)
 }
 

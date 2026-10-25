@@ -613,3 +613,77 @@ dlopen of crates.
   not change the sort yet.
 - Themes style the application chrome only; the terminal ANSI palette is
   unchanged.
+
+# Step: Flat, boxy UI refinement pass
+
+## Why
+
+The first UI pass used `egui_extras` and soft egui defaults (rounded corners,
+shadowed popups, hover glow, loose padding). The result wasted vertical space,
+the SFTP panel could grow over the terminal, resize handles appeared on every
+row, and the New Session page spread one task over three cards. This pass makes
+the UI flat, compact and predictable.
+
+## What changed
+
+**`Cargo.toml` / `Cargo.lock`**
+- Removed `egui_extras`; the SFTP table is hand-rolled.
+
+**`src/theme.rs`**
+- Rebuilt the palette/metrics for a flat design: `Rounding::ZERO`,
+  `Shadow::NONE`, 1 px borders, hover changes fill only (no accent glow), a
+  shared 26 px control height, one padding scale, `Selection.stroke` in the text
+  colour and thin floating scrollbars.
+- Added `body_font`, `panel_frame`, `primary_button` and `danger_button`
+  helpers; removed `small_font` and `accent_hover`.
+
+**`src/app.rs`**
+- **SFTP panel**: default 450 px, minimum 340 px, maximum
+  `min(55% of the window, 720 px)`, still draggable. The terminal is never
+  covered, including at 900 px window width.
+- **SFTP table**: fixed header painted over a `ScrollArea::show_rows` body.
+  Column dividers exist only in the header and resize the column to their right.
+  Header and file names use the same size and weight (no bold, no "Remote
+  files" title). Icons are `🗀` / `🗋` / `🔗` at body font size; defaults are
+  owner 64, modified 122, size 52 and an 80 px name minimum.
+- **Inputs**: one shared helper applies `vertical_align(Center)`, a `(pad, 2)`
+  margin and a 26 px height, so form text sits on one baseline.
+- **Tabs**: single box per tab with the `×` inside it and a 168 px minimum;
+  middle-click also closes.
+- **New Session**: connection fields, auth options, the **Save as profile**
+  checkbox (which enables the name field) and Connect now live in one card.
+  Connect saves the profile first and aborts on validation failure. The saved
+  list is a compact **Saved profiles (n)** table with **Name / Target**,
+  **Load** and a per-row **×**. The page is narrower and scrolls at small
+  window sizes.
+- **Dialogs**: shared `theme::modal_frame` with custom title bars
+  (`.title_bar(false)` for the SFTP dialogs) and `.default_size(vec2(width,
+  1.0))` so they fit their content. `.auto_sized()` was tried and reverted
+  because egui expands it to the whole area. The host-key prompt was restyled to
+  match (framed fingerprint, right-aligned Reject / Accept & save).
+- **Theme menu**: just the two themes; it closes on selection and the developer
+  hint is gone.
+- **Terminal**: the Disconnect button moved to a bottom panel declared before
+  the terminal so it cannot be clipped.
+
+## Verified
+
+- `cargo fmt --check` ✅
+- `cargo clippy --all-targets -- -D warnings` ✅ (default and
+  `--no-default-features`)
+- `cargo test` ✅ **48 passed** in both feature sets
+- `cargo build --release` ✅
+- On-screen, against a local sshd on `127.0.0.1:2222`: panel cap/default/minimum,
+  hide/show keeping width/path/selection, header-divider resize, full
+  timestamps, new icons, in-tab close `×`, terminal reflow when the panel is
+  hidden, bottom Disconnect bar, New Session at 900×700 and 700×400,
+  Midnight ↔ Graphite switching and persistence across restart.
+- Dialogs: Rename, New folder, Delete and **Open with…**; host-key prompt with
+  Reject (connection refused) and Accept & save (key written to `known_hosts`,
+  connection succeeds).
+
+## Known limits
+
+- Headers are not clickable; the table keeps the directories-first name sort.
+- Very narrow windows (< 900 px) with the panel open were not exercised.
+- Theme switching still only affects the chrome, not terminal ANSI colours.

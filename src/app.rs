@@ -30,12 +30,14 @@ use crate::secrets;
 use crate::sessions::{SessionProfile, SessionStore};
 use crate::settings::Settings;
 use crate::sftp::{
-    format_age, format_owner, format_size, format_timestamp, join_path, EditorChoice,
-    SftpDialogKind, SftpExplorer,
+    command_available, editor_program, format_age, format_owner, format_size, format_timestamp,
+    EditorChoice, SftpDialogKind, SftpExplorer, StatusKind,
 };
 use crate::ssh::{HostKeyPrompt, RemoteEntry, SshConfig, SshSession, Wake};
 use crate::terminal::{TermAction, TerminalView};
 use crate::theme::{self, Theme, ThemeId};
+
+use egui_extras::{Column, TableBuilder};
 
 const NEW_SESSION_TAB: usize = 0;
 const DEFAULT_COLS: usize = 80;
@@ -55,6 +57,90 @@ const KEYRING_ENABLED: bool = cfg!(feature = "keyring-secrets");
 /// Small label above a form field.
 fn field_label(ui: &mut egui::Ui, theme: &Theme, text: &str) {
     ui.label(egui::RichText::new(text).small().color(theme.palette.muted));
+}
+
+/// Muted, compact table header label.
+fn table_header(ui: &mut egui::Ui, theme: &Theme, text: &str) {
+    ui.label(
+        egui::RichText::new(text)
+            .small()
+            .strong()
+            .color(theme.palette.muted),
+    );
+}
+
+/// Latest SFTP message, operation state and message history.
+fn sftp_status_bar(ui: &mut egui::Ui, theme: &Theme, explorer: &mut SftpExplorer) {
+    let busy = explorer.busy_label().map(str::to_string);
+    let current = explorer.status.current().cloned();
+
+    ui.horizontal(|ui| {
+        if let Some(label) = busy {
+            ui.spinner();
+            ui.add(
+                egui::Label::new(egui::RichText::new(label).small().color(theme.palette.text))
+                    .truncate(),
+            );
+        } else {
+            let (color, icon, text) = match &current {
+                Some(entry) => (
+                    status_color(theme, entry.kind),
+                    status_icon(entry.kind),
+                    entry.text.as_str(),
+                ),
+                None => (theme.palette.muted, "•", "Ready"),
+            };
+            ui.label(egui::RichText::new(icon).color(color).size(9.0));
+            ui.add(egui::Label::new(egui::RichText::new(text).small().color(color)).truncate())
+                .on_hover_text(text);
+        }
+
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let response = ui.menu_button(egui::RichText::new("⋯").size(15.0), |ui| {
+                ui.label(egui::RichText::new("Session messages").strong());
+                ui.add_space(2.0);
+                for entry in explorer.status.history() {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(&entry.at)
+                                .small()
+                                .color(theme.palette.muted),
+                        );
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&entry.text)
+                                    .small()
+                                    .color(status_color(theme, entry.kind)),
+                            )
+                            .wrap(),
+                        );
+                    });
+                }
+                ui.separator();
+                if ui.button("Clear messages").clicked() {
+                    explorer.status.clear();
+                    ui.close_menu();
+                }
+            });
+            response.response.on_hover_text("Message history");
+        });
+    });
+}
+
+fn status_color(theme: &Theme, kind: StatusKind) -> egui::Color32 {
+    match kind {
+        StatusKind::Info => theme.palette.muted,
+        StatusKind::Success => theme.palette.success,
+        StatusKind::Error => theme.palette.danger,
+    }
+}
+
+fn status_icon(kind: StatusKind) -> &'static str {
+    match kind {
+        StatusKind::Info => "•",
+        StatusKind::Success => "✓",
+        StatusKind::Error => "×",
+    }
 }
 
 pub struct RustTermApp {
@@ -998,7 +1084,12 @@ impl RustTermApp {
     ///
     /// Returns `true` when the panel started a request, changed selection or was
     /// hidden, so the caller can request another frame.
+    /// Render the remote file browser for one session.
+    ///
+    /// Returns `true` when the panel started a request, changed selection or was
+    /// hidden, so the caller can request another frame.
     fn sftp_ui(&mut self, ui: &mut egui::Ui, index: usize) -> bool {
+        let theme = self.theme.theme();
         let Some(session) = self.sessions.get_mut(index) else {
             return false;
         };
@@ -1009,189 +1100,229 @@ impl RustTermApp {
         let mut hide = false;
 
         ui.horizontal(|ui| {
-            ui.heading("Remote files");
+            ui.label(
+                egui::RichText::new("Remote files")
+                    .strong()
+                    .size(15.0)
+                    .color(theme.palette.text),
+            );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .small_button("×")
-                    .on_hover_text("Hide the file panel")
-                    .clicked()
-                {
+                if theme::icon_button(ui, theme, "×", "Hide the file panel", true).clicked() {
                     hide = true;
                 }
             });
         });
+        ui.add_space(2.0);
+
+        let busy = explorer.is_busy();
+        let selected = explorer.selected_entry().cloned();
+        let can_up = !explorer.current.is_empty() && explorer.current != "/";
+        let can_copy = selected.is_some() && !busy;
+        let can_paste = explorer.clipboard.is_some() && !busy;
+
+        ui.horizontal_wrapped(|ui| {
+            if theme::icon_button(ui, theme, "⌂", "Go to the login directory", !busy).clicked() {
+                explorer.load_home(ssh);
+                activity = true;
+            }
+            if theme::icon_button(ui, theme, "↑", "Up one level", can_up && !busy).clicked() {
+                explorer.up(ssh);
+                activity = true;
+            }
+            if theme::icon_button(ui, theme, "↻", "Refresh this directory", !busy).clicked() {
+                explorer.refresh(ssh);
+                activity = true;
+            }
+            ui.separator();
+            if theme::icon_button(ui, theme, "＋", "Create a folder here", !busy).clicked() {
+                explorer.begin_new_folder();
+                activity = true;
+            }
+            if theme::icon_button(ui, theme, "⧉", "Copy the selected entry", can_copy).clicked() {
+                if let Some(entry) = &selected {
+                    explorer.copy_entry(entry);
+                }
+                activity = true;
+            }
+            if theme::icon_button(ui, theme, "📋", "Paste the copied entry here", can_paste)
+                .clicked()
+            {
+                explorer.paste(ssh);
+                activity = true;
+            }
+            ui.separator();
+            if theme::icon_toggle(
+                ui,
+                theme,
+                "◉",
+                "Show or hide dotfiles",
+                explorer.show_hidden,
+            )
+            .clicked()
+            {
+                explorer.show_hidden = !explorer.show_hidden;
+                if !explorer.show_hidden
+                    && explorer
+                        .selected_entry()
+                        .is_some_and(|entry| entry.name.starts_with('.'))
+                {
+                    explorer.selected = None;
+                }
+                activity = true;
+            }
+            if theme::icon_button(
+                ui,
+                theme,
+                "⟳",
+                "Reconnect SFTP without dropping the terminal",
+                !busy,
+            )
+            .clicked()
+            {
+                explorer.reconnect(ssh);
+                activity = true;
+            }
+            if explorer.loading {
+                ui.spinner();
+            }
+        });
+
+        ui.horizontal(|ui| {
+            let go_width = 28.0_f32;
+            let width = (ui.available_width() - go_width - ui.spacing().item_spacing.x).max(80.0);
+            let edit = ui.add_sized(
+                [width, theme.metrics.control_height],
+                egui::TextEdit::singleline(&mut explorer.path_edit).hint_text("Remote path"),
+            );
+            if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                let path = explorer.path_edit.clone();
+                explorer.navigate(ssh, path);
+                activity = true;
+            }
+            if theme::icon_button(ui, theme, "→", "Open this path", true).clicked() {
+                let path = explorer.path_edit.clone();
+                explorer.navigate(ssh, path);
+                activity = true;
+            }
+        });
+
+        // Fixed message bar at the bottom. Declared before the table so the
+        // table gets the remaining height.
+        egui::TopBottomPanel::bottom(egui::Id::new(("sftp_status", index)))
+            .exact_height(30.0)
+            .frame(
+                egui::Frame::none()
+                    .fill(theme.palette.panel)
+                    .stroke(egui::Stroke::new(1.0_f32, theme.palette.border))
+                    .inner_margin(egui::Margin::symmetric(8.0, 4.0)),
+            )
+            .show_inside(ui, |ui| {
+                sftp_status_bar(ui, theme, explorer);
+            });
 
         if let Some(reason) = explorer.unavailable.clone() {
-            ui.add_space(4.0);
-            ui.colored_label(ui.visuals().warn_fg_color, "SFTP is unavailable");
-            ui.label(reason);
-            ui.horizontal(|ui| {
-                if ui
-                    .button("Reconnect SFTP")
-                    .on_hover_text("Open a fresh SFTP channel; the terminal stays connected")
-                    .clicked()
-                {
-                    explorer.reconnect(ssh);
-                    activity = true;
-                }
-                if explorer.loading {
-                    ui.spinner();
-                }
-            });
-        } else {
-            ui.horizontal_wrapped(|ui| {
-                if ui
-                    .button("Home")
-                    .on_hover_text("Go to the login directory")
-                    .clicked()
-                {
-                    explorer.load_home(ssh);
-                    activity = true;
-                }
-                let can_up = !explorer.current.is_empty() && explorer.current != "/";
-                if ui.add_enabled(can_up, egui::Button::new("Up")).clicked() {
-                    explorer.up(ssh);
-                    activity = true;
-                }
-                if ui.button("Refresh").clicked() {
-                    explorer.refresh(ssh);
-                    activity = true;
-                }
-                ui.separator();
-                if ui
-                    .button("New folder")
-                    .on_hover_text("Create a folder in the current directory")
-                    .clicked()
-                {
-                    explorer.begin_new_folder();
-                    activity = true;
-                }
-
-                let selected = explorer.selected_entry().cloned();
-                let can_copy = selected.is_some() && !explorer.is_busy();
-                if ui
-                    .add_enabled(can_copy, egui::Button::new("Copy"))
-                    .on_hover_text("Copy the selected entry for Paste")
-                    .clicked()
-                {
-                    if let Some(entry) = &selected {
-                        explorer.copy_entry(entry);
-                    }
-                    activity = true;
-                }
-                let can_paste = explorer.clipboard.is_some() && !explorer.is_busy();
-                if ui
-                    .add_enabled(can_paste, egui::Button::new("Paste"))
-                    .on_hover_text("Duplicate the copied entry in this directory")
-                    .clicked()
-                {
-                    explorer.paste(ssh);
-                    activity = true;
-                }
-
-                if ui
-                    .selectable_label(explorer.show_hidden, "Hidden")
-                    .on_hover_text("Show or hide dotfiles")
-                    .clicked()
-                {
-                    explorer.show_hidden = !explorer.show_hidden;
-                    if !explorer.show_hidden
-                        && explorer
-                            .selected_entry()
-                            .is_some_and(|entry| entry.name.starts_with('.'))
-                    {
-                        explorer.selected = None;
-                    }
-                    activity = true;
-                }
-                if ui
-                    .button("Reconnect")
-                    .on_hover_text("Open a fresh SFTP channel; the terminal stays connected")
-                    .clicked()
-                {
-                    explorer.reconnect(ssh);
-                    activity = true;
-                }
-                if explorer.loading {
-                    ui.spinner();
-                }
-            });
-
-            if let Some(label) = explorer.busy_label() {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.weak(label);
-                });
-            }
-
-            ui.horizontal(|ui| {
-                ui.label("Path:");
-                let edit = ui.add(
-                    egui::TextEdit::singleline(&mut explorer.path_edit)
-                        .desired_width((ui.available_width() - 46.0).max(80.0))
-                        .hint_text("Remote path"),
+            ui.add_space(16.0);
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    egui::RichText::new("SFTP is unavailable")
+                        .strong()
+                        .color(theme.palette.warning),
                 );
-                if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    let path = explorer.path_edit.clone();
-                    explorer.navigate(ssh, path);
-                    activity = true;
-                }
-                if ui.button("Go").clicked() {
-                    let path = explorer.path_edit.clone();
-                    explorer.navigate(ssh, path);
+                ui.add_space(4.0);
+                ui.add(
+                    egui::Label::new(egui::RichText::new(reason).color(theme.palette.muted)).wrap(),
+                );
+                ui.add_space(8.0);
+                if ui.button("Reconnect SFTP").clicked() {
+                    explorer.reconnect(ssh);
                     activity = true;
                 }
             });
-
-            if let Some(notice) = &explorer.notice {
-                ui.colored_label(ui.visuals().hyperlink_color, notice);
+            if hide {
+                self.show_sftp = false;
             }
-            if let Some(err) = &explorer.error {
-                ui.colored_label(ui.visuals().error_fg_color, err);
-            }
+            return activity || hide;
+        }
 
-            ui.separator();
+        let visible_indices: Vec<usize> = explorer
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| explorer.show_hidden || !entry.name.starts_with('.'))
+            .map(|(index, _)| index)
+            .collect();
+        let has_clipboard = explorer.clipboard.is_some();
+        let empty_message = if explorer.loading {
+            "Loading…"
+        } else if explorer.entries.is_empty() {
+            "This directory is empty."
+        } else if visible_indices.is_empty() {
+            "Only hidden files here — enable Hidden to show them."
+        } else if explorer.status.is_error() {
+            "Nothing to show. See the message below."
+        } else {
+            "No entries."
+        };
 
-            // `RowAction` is applied after the row loop: the menu closures
-            // cannot borrow the explorer mutably while the list is iterated.
-            enum RowAction {
-                Navigate(String),
-                Edit(RemoteEntry, EditorChoice),
-                Rename(RemoteEntry),
-                Delete(RemoteEntry),
-                Copy(RemoteEntry),
-                Paste(String),
-                NewFolder(Option<String>),
-                Refresh,
-            }
-            let mut row_action: Option<RowAction> = None;
-            let has_clipboard = explorer.clipboard.is_some();
+        // `RowAction` is applied after the row loop: the menu closures cannot
+        // borrow the explorer mutably while the table is iterated.
+        enum RowAction {
+            Navigate(String),
+            OpenWith(RemoteEntry),
+            Rename(RemoteEntry),
+            Delete(RemoteEntry),
+            CopyPath(RemoteEntry),
+            Paste(String),
+        }
+        let mut row_action: Option<RowAction> = None;
+        let mut select_row: Option<usize> = None;
 
-            // Leave room for the footer; without this the scroll area eats the
-            // whole panel and the selected-path line is clipped.
-            let list_height = (ui.available_height() - 74.0).max(80.0);
-            egui::ScrollArea::vertical()
-                .id_salt(("sftp_entries", index))
-                .auto_shrink([false, false])
-                .max_height(list_height)
-                .show(ui, |ui| {
-                    let visible_count = explorer
-                        .entries
-                        .iter()
-                        .filter(|entry| explorer.show_hidden || !entry.name.starts_with('.'))
-                        .count();
-                    if visible_count == 0 && !explorer.loading && explorer.error.is_none() {
-                        if explorer.entries.is_empty() {
-                            ui.weak("This directory is empty.");
-                        } else {
-                            ui.weak("Only hidden files here — enable Hidden to show them.");
-                        }
-                    }
-
-                    for (i, entry) in explorer.entries.iter().enumerate() {
-                        if !explorer.show_hidden && entry.name.starts_with('.') {
-                            continue;
-                        }
+        let max_height = ui.available_height().max(80.0);
+        let row_height = theme.metrics.row_height;
+        TableBuilder::new(ui)
+            .id_salt(("sftp_table", index))
+            .striped(true)
+            .resizable(true)
+            .sense(egui::Sense::click())
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            .column(Column::remainder().at_least(120.0))
+            .column(Column::initial(80.0).at_least(52.0).resizable(true))
+            .column(Column::initial(112.0).at_least(88.0).resizable(true))
+            .column(Column::initial(64.0).at_least(48.0).resizable(true))
+            .min_scrolled_height(0.0)
+            .max_scroll_height(max_height)
+            .header(24.0, |mut header| {
+                header.col(|ui| {
+                    table_header(ui, theme, "Name");
+                });
+                header.col(|ui| {
+                    table_header(ui, theme, "Owner");
+                });
+                header.col(|ui| {
+                    table_header(ui, theme, "Modified");
+                });
+                header.col(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        table_header(ui, theme, "Size");
+                    });
+                });
+            })
+            .body(|mut body| {
+                if visible_indices.is_empty() {
+                    body.row(row_height, |mut row| {
+                        row.col(|ui| {
+                            theme::muted(ui, theme, empty_message);
+                        });
+                        row.col(|_| {});
+                        row.col(|_| {});
+                        row.col(|_| {});
+                    });
+                } else {
+                    body.rows(row_height, visible_indices.len(), |mut row| {
+                        let visible_index = row.index();
+                        let entry_index = visible_indices[visible_index];
+                        let entry = &explorer.entries[entry_index];
+                        row.set_selected(explorer.selected == Some(entry_index));
                         let icon = if entry.is_dir {
                             "📁"
                         } else if entry.is_symlink {
@@ -1199,25 +1330,68 @@ impl RustTermApp {
                         } else {
                             "📄"
                         };
-                        let path = join_path(&explorer.listed_path, &entry.name);
-                        let response = ui.selectable_label(
-                            explorer.selected == Some(i),
-                            format!(
-                                "{icon} {}\n   {} · {}",
-                                entry.name,
-                                format_owner(entry),
-                                format_timestamp(entry.modified)
-                            ),
-                        );
-                        if response.clicked() {
-                            explorer.selected = Some(i);
-                            activity = true;
-                            if entry.is_dir {
-                                row_action = Some(RowAction::Navigate(path.clone()));
-                            }
-                        }
 
-                        let mut details = path;
+                        row.col(|ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new(icon).size(13.0));
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(&entry.name).color(theme.palette.text),
+                                    )
+                                    .truncate(),
+                                )
+                                .on_hover_text(&entry.name);
+                            });
+                        });
+                        row.col(|ui| {
+                            let owner = format_owner(entry);
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(owner)
+                                        .small()
+                                        .color(theme.palette.muted),
+                                )
+                                .truncate(),
+                            )
+                            .on_hover_text(owner);
+                        });
+                        row.col(|ui| {
+                            let modified = format_timestamp(entry.modified);
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(&modified)
+                                        .small()
+                                        .color(theme.palette.muted),
+                                )
+                                .truncate(),
+                            )
+                            .on_hover_text(format!(
+                                "{modified}\n{}",
+                                entry
+                                    .modified
+                                    .map(format_age)
+                                    .unwrap_or_else(|| "unknown".to_string())
+                            ));
+                        });
+                        row.col(|ui| {
+                            let size = if entry.is_dir {
+                                "—".to_string()
+                            } else {
+                                format_size(entry.size)
+                            };
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        egui::RichText::new(size)
+                                            .small()
+                                            .color(theme.palette.muted),
+                                    );
+                                },
+                            );
+                        });
+
+                        let mut details = entry.path.clone();
                         if entry.is_dir {
                             details.push_str("\ndirectory");
                         } else {
@@ -1234,135 +1408,88 @@ impl RustTermApp {
                         if let Some(modified) = entry.modified {
                             details.push_str(&format!("\n{}", format_age(modified)));
                         }
-                        response.clone().on_hover_text(details);
 
+                        let response = row.response();
+                        response.clone().on_hover_text(details);
+                        if response.clicked() {
+                            select_row = Some(entry_index);
+                        }
+                        if response.double_clicked() {
+                            if entry.is_dir {
+                                row_action = Some(RowAction::Navigate(entry.path.clone()));
+                            } else {
+                                row_action = Some(RowAction::OpenWith(entry.clone()));
+                            }
+                        }
+                        if response.secondary_clicked() {
+                            select_row = Some(entry_index);
+                        }
                         response.context_menu(|ui| {
                             ui.label(egui::RichText::new(&entry.name).strong());
+                            ui.separator();
                             if entry.is_dir {
                                 if ui.button("Open").clicked() {
                                     row_action = Some(RowAction::Navigate(entry.path.clone()));
                                     ui.close_menu();
                                 }
-                            } else {
-                                if ui.button("Open in default editor").clicked() {
-                                    row_action =
-                                        Some(RowAction::Edit(entry.clone(), EditorChoice::Default));
+                                if has_clipboard && ui.button("Paste into this folder").clicked() {
+                                    row_action = Some(RowAction::Paste(entry.path.clone()));
                                     ui.close_menu();
                                 }
+                            } else if ui.button("Open with…").clicked() {
+                                row_action = Some(RowAction::OpenWith(entry.clone()));
+                                ui.close_menu();
                             }
-                            ui.menu_button("Open in editor", |ui| {
-                                for choice in EditorChoice::ALL {
-                                    if ui.button(choice.label()).clicked() {
-                                        row_action = Some(RowAction::Edit(entry.clone(), choice));
-                                        ui.close_menu();
-                                    }
-                                }
-                            });
-                            ui.separator();
                             if ui.button("Rename…").clicked() {
                                 row_action = Some(RowAction::Rename(entry.clone()));
                                 ui.close_menu();
                             }
-                            if ui.button("Copy").clicked() {
-                                row_action = Some(RowAction::Copy(entry.clone()));
-                                ui.close_menu();
-                            }
                             if ui.button("Copy path").clicked() {
-                                ui.ctx().copy_text(entry.path.clone());
-                                ui.close_menu();
-                            }
-                            if entry.is_dir
-                                && has_clipboard
-                                && ui.button("Paste into this folder").clicked()
-                            {
-                                row_action = Some(RowAction::Paste(entry.path.clone()));
-                                ui.close_menu();
-                            }
-                            if ui.button("New folder…").clicked() {
-                                row_action = Some(RowAction::NewFolder(
-                                    entry.is_dir.then(|| entry.path.clone()),
-                                ));
+                                row_action = Some(RowAction::CopyPath(entry.clone()));
                                 ui.close_menu();
                             }
                             ui.separator();
-                            if ui.button("Delete…").clicked() {
+                            if ui
+                                .add(egui::Button::new(
+                                    egui::RichText::new("Delete…").color(theme.palette.danger),
+                                ))
+                                .clicked()
+                            {
                                 row_action = Some(RowAction::Delete(entry.clone()));
                                 ui.close_menu();
                             }
-                            if ui.button("Refresh").clicked() {
-                                row_action = Some(RowAction::Refresh);
-                                ui.close_menu();
-                            }
                         });
-                    }
-                });
-
-            if let Some(action) = row_action {
-                match action {
-                    RowAction::Navigate(path) => explorer.navigate(ssh, path),
-                    RowAction::Edit(entry, editor) => {
-                        explorer.open_in_editor(ssh, &entry, editor);
-                    }
-                    RowAction::Rename(entry) => {
-                        explorer.begin_rename(&entry);
-                    }
-                    RowAction::Delete(entry) => {
-                        explorer.begin_delete(&entry);
-                    }
-                    RowAction::Copy(entry) => {
-                        explorer.copy_entry(&entry);
-                    }
-                    RowAction::Paste(path) => {
-                        explorer.paste_into(ssh, path);
-                    }
-                    RowAction::NewFolder(parent) => match parent {
-                        Some(parent) => {
-                            explorer.begin_new_folder_in(parent);
-                        }
-                        None => {
-                            explorer.begin_new_folder();
-                        }
-                    },
-                    RowAction::Refresh => explorer.refresh(ssh),
-                }
-                activity = true;
-            }
-
-            ui.separator();
-            match explorer.selected_entry().cloned() {
-                Some(entry) => {
-                    ui.add(
-                        egui::Label::new(egui::RichText::new(&entry.path).monospace()).truncate(),
-                    );
-                    let mut details = if entry.is_dir {
-                        "directory".to_string()
-                    } else {
-                        format_size(entry.size)
-                    };
-                    if entry.is_symlink {
-                        details.push_str(" · symlink");
-                    }
-                    details.push_str(&format!(
-                        " · {} · {}",
-                        format_owner(&entry),
-                        format_timestamp(entry.modified)
-                    ));
-                    ui.weak(details);
-                    ui.horizontal(|ui| {
-                        if ui.small_button("Rename").clicked() {
-                            explorer.begin_rename(&entry);
-                            activity = true;
-                        }
-                        if ui.small_button("Delete").clicked() {
-                            explorer.begin_delete(&entry);
-                            activity = true;
-                        }
                     });
                 }
-                None => {
-                    ui.weak(format!("{} entries", explorer.entries.len()));
+            });
+
+        if let Some(index) = select_row {
+            explorer.selected = Some(index);
+            activity = true;
+        }
+        if let Some(action) = row_action {
+            match action {
+                RowAction::Navigate(path) => explorer.navigate(ssh, path),
+                RowAction::OpenWith(entry) => {
+                    explorer.begin_open_with(&entry);
+                }
+                RowAction::Rename(entry) => {
+                    explorer.begin_rename(&entry);
+                }
+                RowAction::Delete(entry) => {
+                    explorer.begin_delete(&entry);
+                }
+                RowAction::CopyPath(entry) => {
+                    ui.ctx().copy_text(entry.path.clone());
+                    explorer
+                        .status
+                        .info(format!("Copied path for {}", entry.name));
+                }
+                RowAction::Paste(path) => {
+                    explorer.paste_into(ssh, path);
                 }
             }
+            activity = true;
         }
 
         if hide {
@@ -1373,6 +1500,7 @@ impl RustTermApp {
 
     /// Render rename / new-folder / delete dialogs for the active session.
     fn sftp_dialogs_ui(&mut self, ctx: &egui::Context, index: usize) -> bool {
+        let theme = self.theme.theme();
         let Some(session) = self.sessions.get_mut(index) else {
             return false;
         };
@@ -1383,95 +1511,283 @@ impl RustTermApp {
 
         let mut submit = false;
         let mut cancel = false;
-        let mut open = true;
         let kind = dialog.kind.clone();
 
-        let title = match &kind {
-            SftpDialogKind::Rename { .. } => "Rename",
-            SftpDialogKind::NewFolder { .. } => "New folder",
-            SftpDialogKind::Delete { .. } => "Delete",
+        let (title, subtitle) = match &kind {
+            SftpDialogKind::Rename { .. } => ("Rename", "Give the entry a new name."),
+            SftpDialogKind::NewFolder { .. } => {
+                ("New folder", "Create a folder in this directory.")
+            }
+            SftpDialogKind::Delete { .. } => ("Delete", "Please confirm this action."),
         };
+
         egui::Window::new(title)
             .id(egui::Id::new(("sftp_dialog", index)))
+            .title_bar(false)
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .open(&mut open)
-            .show(ctx, |ui| match &kind {
-                SftpDialogKind::Rename { .. } => {
-                    ui.label("New name:");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut dialog.name)
-                            .desired_width(260.0)
-                            .hint_text("File or folder name"),
+            .frame(theme::modal_frame(theme))
+            .show(ctx, |ui| {
+                ui.set_width(400.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(title)
+                            .size(18.0)
+                            .strong()
+                            .color(theme.palette.text),
                     );
-                    if let Some(err) = &dialog.error {
-                        ui.colored_label(ui.visuals().error_fg_color, err);
-                    }
-                    ui.horizontal(|ui| {
-                        if ui.button("Rename").clicked() {
-                            submit = true;
-                        }
-                        if ui.button("Cancel").clicked() {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("×").on_hover_text("Cancel").clicked() {
                             cancel = true;
                         }
                     });
-                }
-                SftpDialogKind::NewFolder { parent } => {
-                    ui.label("Folder name:");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut dialog.name)
-                            .desired_width(260.0)
-                            .hint_text("New folder"),
-                    );
-                    ui.weak(format!("In {parent}"));
-                    if let Some(err) = &dialog.error {
-                        ui.colored_label(ui.visuals().error_fg_color, err);
-                    }
-                    ui.horizontal(|ui| {
-                        if ui.button("Create").clicked() {
-                            submit = true;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            cancel = true;
-                        }
-                    });
-                }
-                SftpDialogKind::Delete { path, name, is_dir } => {
-                    if *is_dir {
-                        ui.label(format!("Delete folder '{name}'?"));
-                        ui.colored_label(
-                            ui.visuals().warn_fg_color,
-                            "Everything inside it will be deleted too.",
+                });
+                theme::muted(ui, theme, subtitle);
+                ui.add_space(14.0);
+
+                match &kind {
+                    SftpDialogKind::Rename { .. } => {
+                        field_label(ui, theme, "New name");
+                        let edit = ui.add_sized(
+                            [ui.available_width(), theme.metrics.control_height],
+                            egui::TextEdit::singleline(&mut dialog.name)
+                                .hint_text("File or folder name"),
                         );
-                    } else {
-                        ui.label(format!("Delete file '{name}'?"));
-                    }
-                    ui.add(egui::Label::new(egui::RichText::new(path).monospace()).truncate());
-                    if let Some(err) = &dialog.error {
-                        ui.colored_label(ui.visuals().error_fg_color, err);
-                    }
-                    ui.horizontal(|ui| {
-                        if ui
-                            .button(
-                                egui::RichText::new("Delete").color(ui.visuals().error_fg_color),
-                            )
-                            .clicked()
-                        {
+                        if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                             submit = true;
                         }
-                        if ui.button("Cancel").clicked() {
-                            cancel = true;
+                        if let Some(err) = &dialog.error {
+                            ui.add_space(4.0);
+                            ui.colored_label(theme.palette.danger, err);
                         }
-                    });
+                    }
+                    SftpDialogKind::NewFolder { parent } => {
+                        field_label(ui, theme, "Folder name");
+                        let edit = ui.add_sized(
+                            [ui.available_width(), theme.metrics.control_height],
+                            egui::TextEdit::singleline(&mut dialog.name).hint_text("New folder"),
+                        );
+                        if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            submit = true;
+                        }
+                        ui.add_space(4.0);
+                        theme::muted(ui, theme, format!("Will be created in {parent}"));
+                        if let Some(err) = &dialog.error {
+                            ui.add_space(4.0);
+                            ui.colored_label(theme.palette.danger, err);
+                        }
+                    }
+                    SftpDialogKind::Delete { path, name, is_dir } => {
+                        ui.label(
+                            egui::RichText::new(format!("Delete “{name}”?"))
+                                .size(16.0)
+                                .strong()
+                                .color(theme.palette.text),
+                        );
+                        ui.add_space(8.0);
+                        theme::callout_frame(theme, theme.palette.danger_soft).show(ui, |ui| {
+                            let warning = if *is_dir {
+                                "This folder and everything inside it will be permanently deleted. This cannot be undone."
+                            } else {
+                                "This file will be permanently deleted. This cannot be undone."
+                            };
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(warning)
+                                        .color(theme.palette.danger),
+                                )
+                                .wrap(),
+                            );
+                        });
+                        ui.add_space(8.0);
+                        theme::muted(ui, theme, "Remote path");
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(path)
+                                    .monospace()
+                                    .color(theme.palette.muted),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(path);
+                        if let Some(err) = &dialog.error {
+                            ui.add_space(4.0);
+                            ui.colored_label(theme.palette.danger, err);
+                        }
+                    }
                 }
+
+                ui.add_space(18.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let primary = match &kind {
+                        SftpDialogKind::Rename { .. } => "Rename",
+                        SftpDialogKind::NewFolder { .. } => "Create",
+                        SftpDialogKind::Delete { .. } => "Delete",
+                    };
+                    let primary_button = if matches!(kind, SftpDialogKind::Delete { .. }) {
+                        egui::Button::new(
+                            egui::RichText::new(primary)
+                                .strong()
+                                .color(egui::Color32::WHITE),
+                        )
+                        .fill(theme.palette.danger)
+                        .stroke(egui::Stroke::NONE)
+                    } else {
+                        egui::Button::new(
+                            egui::RichText::new(primary)
+                                .strong()
+                                .color(egui::Color32::WHITE),
+                        )
+                        .fill(theme.palette.accent)
+                        .stroke(egui::Stroke::NONE)
+                    };
+                    if ui
+                        .add_sized(
+                            [92.0, theme.metrics.control_height],
+                            primary_button,
+                        )
+                        .clicked()
+                    {
+                        submit = true;
+                    }
+                    if ui
+                        .add_sized(
+                            [92.0, theme.metrics.control_height],
+                            egui::Button::new("Cancel"),
+                        )
+                        .clicked()
+                    {
+                        cancel = true;
+                    }
+                });
             });
 
-        if cancel || !open {
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            cancel = true;
+        }
+        if cancel {
             return explorer.cancel_dialog();
         }
         if submit {
             return explorer.submit_dialog(ssh);
+        }
+        false
+    }
+
+    /// Render the "Open with…" editor picker for the active session.
+    fn editor_picker_ui(&mut self, ctx: &egui::Context, index: usize) -> bool {
+        let theme = self.theme.theme();
+        let Some(session) = self.sessions.get_mut(index) else {
+            return false;
+        };
+        let (ssh, explorer) = (&session.ssh, &mut session.sftp);
+        let Some(picker) = explorer.editor_picker.as_mut() else {
+            return false;
+        };
+
+        let mut submit = false;
+        let mut cancel = false;
+
+        egui::Window::new("Open with")
+            .id(egui::Id::new(("sftp_editor_picker", index)))
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .frame(theme::modal_frame(theme))
+            .show(ctx, |ui| {
+                ui.set_width(420.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Open with…")
+                            .size(18.0)
+                            .strong()
+                            .color(theme.palette.text),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("×").on_hover_text("Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(&picker.entry.name)
+                            .strong()
+                            .color(theme.palette.text),
+                    )
+                    .truncate(),
+                )
+                .on_hover_text(&picker.entry.path);
+                theme::muted(
+                    ui,
+                    theme,
+                    format!("Download and open {}", picker.entry.path),
+                );
+                ui.add_space(10.0);
+
+                for choice in EditorChoice::ALL {
+                    let program = editor_program(choice);
+                    let available = command_available(&program);
+                    let label = if available {
+                        format!("{}  ·  {program}", choice.label())
+                    } else {
+                        format!("{}  ·  not found", choice.label())
+                    };
+                    ui.add_enabled_ui(available, |ui| {
+                        ui.radio_value(&mut picker.choice, choice, label);
+                    });
+                }
+
+                ui.radio_value(&mut picker.choice, EditorChoice::Custom, "Custom command…");
+                ui.add_enabled(
+                    picker.choice == EditorChoice::Custom,
+                    egui::TextEdit::singleline(&mut picker.custom)
+                        .hint_text("e.g. kate, nvim, /usr/local/bin/editor")
+                        .desired_width(ui.available_width()),
+                );
+                if let Some(err) = &picker.error {
+                    ui.add_space(4.0);
+                    ui.colored_label(theme.palette.danger, err);
+                }
+
+                ui.add_space(18.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let open = egui::Button::new(
+                        egui::RichText::new("Open")
+                            .strong()
+                            .color(egui::Color32::WHITE),
+                    )
+                    .fill(theme.palette.accent)
+                    .stroke(egui::Stroke::NONE);
+                    if ui
+                        .add_sized([92.0, theme.metrics.control_height], open)
+                        .clicked()
+                    {
+                        submit = true;
+                    }
+                    if ui
+                        .add_sized(
+                            [92.0, theme.metrics.control_height],
+                            egui::Button::new("Cancel"),
+                        )
+                        .clicked()
+                    {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            cancel = true;
+        }
+        if cancel {
+            return explorer.cancel_open_with();
+        }
+        if submit {
+            return explorer.submit_open_with(ssh);
         }
         false
     }
@@ -1616,30 +1932,34 @@ impl eframe::App for RustTermApp {
                 if idx < self.sessions.len() {
                     egui::SidePanel::left("sftp_panel")
                         .resizable(true)
-                        .default_width(300.0)
-                        .min_width(220.0)
+                        .default_width(420.0)
+                        .min_width(340.0)
                         .show(ctx, |ui| {
                             activity |= self.sftp_ui(ui, idx);
                         });
                     activity |= self.sftp_dialogs_ui(ctx, idx);
+                    activity |= self.editor_picker_ui(ctx, idx);
                 }
             }
         }
 
         let mut disconnect_requested = false;
-        egui::CentralPanel::default().show(ctx, |ui| {
-            if self.active == NEW_SESSION_TAB {
-                self.new_session_ui(ui);
-            } else if let Some(idx) = self.active.checked_sub(1) {
-                if idx < self.sessions.len() {
-                    let (disc, act) = self.terminal_ui(ui, ctx, idx);
-                    disconnect_requested = disc;
-                    activity |= act;
-                } else {
-                    self.active = NEW_SESSION_TAB;
+        let theme = self.theme.theme();
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none().fill(theme.palette.bg))
+            .show(ctx, |ui| {
+                if self.active == NEW_SESSION_TAB {
+                    self.new_session_ui(ui);
+                } else if let Some(idx) = self.active.checked_sub(1) {
+                    if idx < self.sessions.len() {
+                        let (disc, act) = self.terminal_ui(ui, ctx, idx);
+                        disconnect_requested = disc;
+                        activity |= act;
+                    } else {
+                        self.active = NEW_SESSION_TAB;
+                    }
                 }
-            }
-        });
+            });
 
         self.host_key_prompt_ui(ctx);
 

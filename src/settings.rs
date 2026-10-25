@@ -15,17 +15,9 @@ use crate::theme::ThemeId;
 
 pub const FILE_NAME: &str = "settings.toml";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Settings {
     pub theme: ThemeId,
-}
-
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            theme: ThemeId::default(),
-        }
-    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]

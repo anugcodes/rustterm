@@ -10,8 +10,9 @@ use eframe::egui::{
 
 /// Identifiers for the built-in themes. Add a variant and a palette below to
 /// introduce a new theme.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ThemeId {
+    #[default]
     Midnight,
     Graphite,
 }
@@ -49,12 +50,6 @@ impl ThemeId {
     }
 }
 
-impl Default for ThemeId {
-    fn default() -> Self {
-        ThemeId::Midnight
-    }
-}
-
 /// Colour tokens used by the application.
 #[derive(Debug, Clone, Copy)]
 pub struct Palette {
@@ -67,13 +62,11 @@ pub struct Palette {
     pub muted: Color32,
     pub accent: Color32,
     pub accent_hover: Color32,
-    pub accent_soft: Color32,
     pub success: Color32,
     pub warning: Color32,
     pub danger: Color32,
     pub danger_soft: Color32,
     pub selection: Color32,
-    pub table_header: Color32,
     pub stripe: Color32,
     pub input_bg: Color32,
 }
@@ -96,8 +89,6 @@ pub struct Metrics {
 }
 
 pub struct Theme {
-    pub id: ThemeId,
-    pub name: &'static str,
     pub dark: bool,
     pub palette: Palette,
     pub metrics: Metrics,
@@ -119,8 +110,6 @@ const MIDNIGHT_METRICS: Metrics = Metrics {
 };
 
 pub static MIDNIGHT: Theme = Theme {
-    id: ThemeId::Midnight,
-    name: "Midnight",
     dark: true,
     palette: Palette {
         bg: Color32::from_rgb(15, 17, 21),
@@ -132,13 +121,11 @@ pub static MIDNIGHT: Theme = Theme {
         muted: Color32::from_rgb(152, 161, 173),
         accent: Color32::from_rgb(91, 157, 255),
         accent_hover: Color32::from_rgb(124, 178, 255),
-        accent_soft: Color32::from_rgba_premultiplied(23, 39, 64, 255),
         success: Color32::from_rgb(70, 177, 123),
         warning: Color32::from_rgb(217, 164, 65),
         danger: Color32::from_rgb(229, 83, 75),
         danger_soft: Color32::from_rgba_premultiplied(57, 21, 19, 255),
         selection: Color32::from_rgb(36, 59, 92),
-        table_header: Color32::from_rgb(23, 27, 33),
         stripe: Color32::from_rgb(22, 26, 32),
         input_bg: Color32::from_rgb(13, 16, 20),
     },
@@ -146,8 +133,6 @@ pub static MIDNIGHT: Theme = Theme {
 };
 
 pub static GRAPHITE: Theme = Theme {
-    id: ThemeId::Graphite,
-    name: "Graphite",
     dark: true,
     palette: Palette {
         bg: Color32::from_rgb(23, 24, 26),
@@ -159,13 +144,11 @@ pub static GRAPHITE: Theme = Theme {
         muted: Color32::from_rgb(163, 168, 174),
         accent: Color32::from_rgb(122, 162, 247),
         accent_hover: Color32::from_rgb(148, 183, 255),
-        accent_soft: Color32::from_rgba_premultiplied(31, 42, 66, 255),
         success: Color32::from_rgb(115, 201, 145),
         warning: Color32::from_rgb(226, 192, 141),
         danger: Color32::from_rgb(240, 113, 120),
         danger_soft: Color32::from_rgba_premultiplied(60, 28, 30, 255),
         selection: Color32::from_rgb(53, 64, 82),
-        table_header: Color32::from_rgb(27, 29, 32),
         stripe: Color32::from_rgb(30, 33, 37),
         input_bg: Color32::from_rgb(20, 22, 25),
     },
@@ -237,7 +220,7 @@ pub fn apply(ctx: &egui::Context, theme: &Theme) {
     visuals.widgets.hovered = egui::style::WidgetVisuals {
         bg_fill: p.surface_hover,
         weak_bg_fill: p.surface_hover,
-        bg_stroke: Stroke::new(1.0_f32, p.accent),
+        bg_stroke: Stroke::new(1.0_f32, p.accent_hover),
         rounding,
         fg_stroke: Stroke::new(1.0_f32, p.text),
         expansion: 0.0,
@@ -245,7 +228,7 @@ pub fn apply(ctx: &egui::Context, theme: &Theme) {
     visuals.widgets.active = egui::style::WidgetVisuals {
         bg_fill: p.surface_hover,
         weak_bg_fill: p.surface_hover,
-        bg_stroke: Stroke::new(1.0_f32, p.accent),
+        bg_stroke: Stroke::new(1.0_f32, p.accent_hover),
         rounding,
         fg_stroke: Stroke::new(1.0_f32, p.text),
         expansion: 0.0,

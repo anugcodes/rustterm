@@ -5,6 +5,7 @@
 //! `ssh.rs`; this module tracks the current path, the last listing, clipboard
 //! contents, dialogs and the in-flight request or file operation.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc as std_mpsc;
@@ -13,15 +14,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::ssh::{RemoteEntry, SshSession};
 
 /// Where a remote file should be opened locally.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EditorChoice {
     /// `$VISUAL`, then `$EDITOR`, then the desktop default.
+    #[default]
     Default,
     Zed,
     Gvim,
     VsCode,
     /// `xdg-open` / the desktop default application.
     System,
+    /// A command typed by the user in the "Open with…" dialog.
+    Custom,
 }
 
 impl EditorChoice {
@@ -40,7 +44,89 @@ impl EditorChoice {
             EditorChoice::Gvim => "gvim",
             EditorChoice::VsCode => "VS Code",
             EditorChoice::System => "Desktop default",
+            EditorChoice::Custom => "Custom command",
         }
+    }
+}
+
+/// State for the "Open with…" dialog.
+#[derive(Debug, Clone)]
+pub struct EditorPicker {
+    pub entry: RemoteEntry,
+    pub choice: EditorChoice,
+    pub custom: String,
+    pub error: Option<String>,
+}
+
+/// Severity of a status-bar message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusKind {
+    Info,
+    Success,
+    Error,
+}
+
+/// One entry in the SFTP message log.
+#[derive(Debug, Clone)]
+pub struct StatusEntry {
+    pub kind: StatusKind,
+    pub text: String,
+    pub at: String,
+}
+
+/// Latest message plus a bounded history for the status-bar popover.
+#[derive(Debug, Default)]
+pub struct StatusLog {
+    current: Option<StatusEntry>,
+    history: VecDeque<StatusEntry>,
+}
+
+impl StatusLog {
+    const MAX_HISTORY: usize = 50;
+
+    fn push(&mut self, kind: StatusKind, text: impl Into<String>) {
+        let entry = StatusEntry {
+            kind,
+            text: text.into(),
+            at: chrono::Local::now().format("%H:%M:%S").to_string(),
+        };
+        self.current = Some(entry.clone());
+        self.history.push_back(entry);
+        while self.history.len() > Self::MAX_HISTORY {
+            self.history.pop_front();
+        }
+    }
+
+    pub fn info(&mut self, text: impl Into<String>) {
+        self.push(StatusKind::Info, text);
+    }
+
+    pub fn success(&mut self, text: impl Into<String>) {
+        self.push(StatusKind::Success, text);
+    }
+
+    pub fn error(&mut self, text: impl Into<String>) {
+        self.push(StatusKind::Error, text);
+    }
+
+    pub fn current(&self) -> Option<&StatusEntry> {
+        self.current.as_ref()
+    }
+
+    /// Newest message first.
+    pub fn history(&self) -> impl DoubleEndedIterator<Item = &StatusEntry> {
+        self.history.iter().rev()
+    }
+
+    pub fn clear(&mut self) {
+        self.current = None;
+        self.history.clear();
+    }
+
+    pub fn is_error(&self) -> bool {
+        self.current
+            .as_ref()
+            .is_some_and(|entry| entry.kind == StatusKind::Error)
     }
 }
 
@@ -90,7 +176,6 @@ pub struct SftpExplorer {
     pub entries: Vec<RemoteEntry>,
     pub selected: Option<usize>,
     pub loading: bool,
-    pub error: Option<String>,
     /// Set when the server has no SFTP subsystem; disables the controls until a
     /// reconnect succeeds.
     pub unavailable: Option<String>,
@@ -99,8 +184,12 @@ pub struct SftpExplorer {
     /// Last "Copy" action, waiting for "Paste".
     pub clipboard: Option<ClipboardEntry>,
     pub dialog: Option<SftpDialog>,
-    /// Last successful operation, shown under the toolbar.
-    pub notice: Option<String>,
+    /// State for the "Open with…" modal.
+    pub editor_picker: Option<EditorPicker>,
+    /// Last editor chosen for this session; preselected next time.
+    last_editor: EditorChoice,
+    /// Latest message and recent history, shown at the bottom of the panel.
+    pub status: StatusLog,
     pending: Option<Job>,
     operation: Option<Operation>,
 }
@@ -129,6 +218,7 @@ enum OnSuccess {
     Refresh { verb: &'static str },
     LaunchEditor {
         editor: EditorChoice,
+        custom: Option<String>,
         local: PathBuf,
         name: String,
     },
@@ -140,6 +230,7 @@ impl SftpExplorer {
         let mut explorer = Self::default();
         if let Some(reason) = ssh.sftp_unavailable() {
             explorer.unavailable = Some(reason.to_string());
+            explorer.status.error(reason);
             return explorer;
         }
         explorer.load_home(ssh);
@@ -178,11 +269,12 @@ impl SftpExplorer {
             Job::List { path, rx } => match rx.try_recv() {
                 Ok(Ok(mut entries)) => {
                     sort_entries(&mut entries);
+                    let count = entries.len();
                     self.entries = entries;
                     self.listed_path = path;
                     self.selected = None;
                     self.loading = false;
-                    self.error = None;
+                    self.status.info(format!("{count} entries"));
                     true
                 }
                 Ok(Err(err)) => {
@@ -201,15 +293,14 @@ impl SftpExplorer {
             Job::Reconnect(rx) => match rx.try_recv() {
                 Ok(Ok(())) => {
                     self.unavailable = None;
-                    self.error = None;
-                    self.notice = Some("SFTP reconnected".to_string());
+                    self.status.success("SFTP reconnected");
                     self.load_home(ssh);
                     true
                 }
                 Ok(Err(err)) => {
                     self.loading = false;
                     self.unavailable = Some(err.clone());
-                    self.error = Some(err);
+                    self.status.error(err);
                     true
                 }
                 Err(std_mpsc::TryRecvError::Empty) => {
@@ -220,7 +311,7 @@ impl SftpExplorer {
                     self.loading = false;
                     let message = "the SSH session closed while reconnecting SFTP";
                     self.unavailable = Some(message.to_string());
-                    self.error = Some(message.to_string());
+                    self.status.error(message);
                     true
                 }
             },
@@ -238,7 +329,7 @@ impl SftpExplorer {
                 true
             }
             Ok(Err(err)) => {
-                self.error = Some(err);
+                self.status.error(err);
                 true
             }
             Err(std_mpsc::TryRecvError::Empty) => {
@@ -246,17 +337,17 @@ impl SftpExplorer {
                 false
             }
             Err(std_mpsc::TryRecvError::Disconnected) => {
-                self.error = Some("the SFTP session closed during the file operation".to_string());
+                self.status
+                    .error("the SFTP session closed during the file operation");
                 true
             }
         }
     }
 
     fn finish_operation(&mut self, on_success: OnSuccess, detail: String, ssh: &SshSession) {
-        self.error = None;
         match on_success {
             OnSuccess::Refresh { verb } => {
-                self.notice = Some(if detail.is_empty() {
+                self.status.success(if detail.is_empty() {
                     verb.to_string()
                 } else {
                     format!("{verb} {detail}")
@@ -265,18 +356,20 @@ impl SftpExplorer {
             }
             OnSuccess::LaunchEditor {
                 editor,
+                custom,
                 local,
                 name,
-            } => match launch_editor(editor, &local) {
+            } => match launch_editor(editor, custom.as_deref(), &local) {
                 Ok(()) => {
-                    self.notice = Some(format!(
+                    self.status.success(format!(
                         "Opened {name} in {} (downloaded to {})",
-                        editor.label(),
+                        editor_label(editor, custom.as_deref()),
                         local.display()
                     ));
                 }
                 Err(err) => {
-                    self.error = Some(format!("{err} (the download is at {})", local.display()));
+                    self.status
+                        .error(format!("{err} (the download is at {})", local.display()));
                 }
             },
         }
@@ -284,7 +377,7 @@ impl SftpExplorer {
 
     /// Resolve `.` again (usually the login home directory).
     pub fn load_home(&mut self, ssh: &SshSession) {
-        self.error = None;
+        self.status.info("Loading remote files…");
         if let Some(rx) = ssh.sftp_home() {
             self.loading = true;
             self.pending = Some(Job::Home(rx));
@@ -298,7 +391,7 @@ impl SftpExplorer {
         let path = path.into();
         let path = path.trim();
         if path.is_empty() {
-            self.error = Some("Enter a remote path".to_string());
+            self.status.error("Enter a remote path");
             return;
         }
         self.start_list(ssh, path.to_string());
@@ -325,8 +418,7 @@ impl SftpExplorer {
 
     /// Reopen the SFTP channel without touching the terminal.
     pub fn reconnect(&mut self, ssh: &SshSession) {
-        self.error = None;
-        self.notice = None;
+        self.status.info("Reconnecting SFTP…");
         self.loading = true;
         // A stale reply from the old channel must not overwrite the result.
         self.pending = ssh.sftp_reconnect().map(Job::Reconnect);
@@ -354,8 +446,8 @@ impl SftpExplorer {
             name: entry.name.clone(),
             is_dir: entry.is_dir,
         });
-        self.error = None;
-        self.notice = Some(format!("Copied {} — use Paste to duplicate it", entry.name));
+        self.status
+            .info(format!("Copied {} — use Paste to duplicate it", entry.name));
         true
     }
 
@@ -376,11 +468,11 @@ impl SftpExplorer {
             return true;
         }
         let Some(clipboard) = self.clipboard.clone() else {
-            self.error = Some("Copy a file or folder first".to_string());
+            self.status.error("Copy a file or folder first");
             return true;
         };
         if let Err(message) = copy_target_allowed(&clipboard, &dest_dir) {
-            self.error = Some(message);
+            self.status.error(message);
             return true;
         }
         let Some(rx) = ssh.sftp_copy(&clipboard.path, &dest_dir) else {
@@ -525,15 +617,56 @@ impl SftpExplorer {
         true
     }
 
+    /// Open the "Open with…" dialog for a file.
+    pub fn begin_open_with(&mut self, entry: &RemoteEntry) -> bool {
+        if entry.is_dir {
+            self.status
+                .error("Folders cannot be opened in a local editor");
+            return true;
+        }
+        if !self.can_start_operation() {
+            return true;
+        }
+        self.editor_picker = Some(EditorPicker {
+            entry: entry.clone(),
+            choice: self.last_editor,
+            custom: String::new(),
+            error: None,
+        });
+        true
+    }
+
+    pub fn cancel_open_with(&mut self) -> bool {
+        self.editor_picker.take().is_some()
+    }
+
+    /// Validate the "Open with…" dialog and start the download/launch.
+    pub fn submit_open_with(&mut self, ssh: &SshSession) -> bool {
+        let Some(mut picker) = self.editor_picker.take() else {
+            return false;
+        };
+        if picker.choice == EditorChoice::Custom && picker.custom.trim().is_empty() {
+            picker.error = Some("Enter a command, for example: kate".to_string());
+            self.editor_picker = Some(picker);
+            return true;
+        }
+        self.last_editor = picker.choice;
+        let custom = (picker.choice == EditorChoice::Custom).then(|| picker.custom.clone());
+        self.open_in_editor(ssh, &picker.entry, picker.choice, custom);
+        true
+    }
+
     /// Download `entry` to a private temp directory and launch `editor`.
     pub fn open_in_editor(
         &mut self,
         ssh: &SshSession,
         entry: &RemoteEntry,
         editor: EditorChoice,
+        custom: Option<String>,
     ) -> bool {
         if entry.is_dir {
-            self.error = Some("Folders cannot be opened in a local editor".to_string());
+            self.status
+                .error("Folders cannot be opened in a local editor");
             return true;
         }
         if !self.can_start_operation() {
@@ -542,7 +675,7 @@ impl SftpExplorer {
         let local = match temp_download_path(&entry.name) {
             Ok(path) => path,
             Err(err) => {
-                self.error = Some(err);
+                self.status.error(err);
                 return true;
             }
         };
@@ -554,6 +687,7 @@ impl SftpExplorer {
             format!("Downloading {}…", entry.name),
             OnSuccess::LaunchEditor {
                 editor,
+                custom,
                 local,
                 name: entry.name.clone(),
             },
@@ -564,7 +698,7 @@ impl SftpExplorer {
 
     fn can_start_operation(&mut self) -> bool {
         if let Some(label) = self.busy_label() {
-            self.error = Some(format!(
+            self.status.error(format!(
                 "Wait for the current operation ({label}) to finish"
             ));
             return false;
@@ -578,8 +712,6 @@ impl SftpExplorer {
         on_success: OnSuccess,
         rx: std_mpsc::Receiver<Result<String, String>>,
     ) {
-        self.error = None;
-        self.notice = None;
         self.dialog = None;
         self.operation = Some(Operation {
             label,
@@ -591,7 +723,7 @@ impl SftpExplorer {
     fn start_list(&mut self, ssh: &SshSession, path: String) {
         self.current = path.clone();
         self.path_edit = path.clone();
-        self.error = None;
+        self.status.info(format!("Opening {path}…"));
 
         if let Some(rx) = ssh.sftp_list(&path) {
             self.loading = true;
@@ -603,15 +735,17 @@ impl SftpExplorer {
 
     fn mark_unavailable(&mut self, ssh: &SshSession) {
         self.loading = false;
-        self.unavailable = ssh
+        let message = ssh
             .sftp_unavailable()
             .map(str::to_string)
-            .or_else(|| Some("the SFTP session is no longer available".to_string()));
+            .unwrap_or_else(|| "the SFTP session is no longer available".to_string());
+        self.unavailable = Some(message.clone());
+        self.status.error(message);
     }
 
     fn fail(&mut self, message: impl Into<String>) {
         self.loading = false;
-        self.error = Some(message.into());
+        self.status.error(message);
         // Keep the panel consistent with the listing that is still on screen.
         if !self.listed_path.is_empty() {
             self.current = self.listed_path.clone();
@@ -768,8 +902,8 @@ fn temp_download_path(name: &str) -> Result<PathBuf, String> {
     Ok(directory.join(safe))
 }
 
-fn launch_editor(choice: EditorChoice, path: &Path) -> Result<(), String> {
-    let (program, args) = editor_command(choice);
+fn launch_editor(choice: EditorChoice, custom: Option<&str>, path: &Path) -> Result<(), String> {
+    let (program, args) = editor_command(choice, custom);
     let mut child = Command::new(&program)
         .args(args)
         .arg(path)
@@ -788,29 +922,63 @@ fn launch_editor(choice: EditorChoice, path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn editor_command(choice: EditorChoice) -> (String, Vec<String>) {
+pub fn editor_label(choice: EditorChoice, custom: Option<&str>) -> String {
+    match choice {
+        EditorChoice::Custom => custom.unwrap_or("Custom command").trim().to_string(),
+        _ => choice.label().to_string(),
+    }
+}
+
+/// Program name used for an editor choice. Useful for availability checks and
+/// for showing the resolved default editor in the picker.
+pub fn editor_program(choice: EditorChoice) -> String {
+    editor_command(choice, None).0
+}
+
+pub fn editor_command(choice: EditorChoice, custom: Option<&str>) -> (String, Vec<String>) {
     match choice {
         EditorChoice::Default => default_editor(),
         EditorChoice::Zed => ("zed".to_string(), Vec::new()),
         EditorChoice::Gvim => ("gvim".to_string(), Vec::new()),
         EditorChoice::VsCode => ("code".to_string(), Vec::new()),
         EditorChoice::System => ("xdg-open".to_string(), Vec::new()),
+        EditorChoice::Custom => parse_command(custom.unwrap_or_default()),
     }
+}
+
+fn parse_command(value: &str) -> (String, Vec<String>) {
+    let mut parts = value.split_whitespace();
+    let program = parts.next().unwrap_or_default().to_string();
+    let args = parts.map(str::to_string).collect();
+    (program, args)
 }
 
 fn default_editor() -> (String, Vec<String>) {
     for variable in ["VISUAL", "EDITOR"] {
         if let Ok(value) = std::env::var(variable) {
-            let mut parts = value.split_whitespace();
-            if let Some(program) = parts.next() {
-                return (
-                    program.to_string(),
-                    parts.map(str::to_string).collect::<Vec<_>>(),
-                );
+            let (program, args) = parse_command(&value);
+            if !program.is_empty() {
+                return (program, args);
             }
         }
     }
     ("xdg-open".to_string(), Vec::new())
+}
+
+/// Whether `program` can be found on this machine.
+pub fn command_available(program: &str) -> bool {
+    if program.is_empty() {
+        return false;
+    }
+    let path = Path::new(program);
+    if path.components().count() > 1 {
+        return path.is_file();
+    }
+    std::env::var_os("PATH")
+        .map(|paths| {
+            std::env::split_paths(&paths).any(|directory| directory.join(program).is_file())
+        })
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -937,11 +1105,39 @@ mod tests {
 
     #[test]
     fn resolves_explicit_editors_and_default_fallback() {
-        assert_eq!(editor_command(EditorChoice::Zed).0, "zed");
-        assert_eq!(editor_command(EditorChoice::Gvim).0, "gvim");
-        assert_eq!(editor_command(EditorChoice::VsCode).0, "code");
-        assert_eq!(editor_command(EditorChoice::System).0, "xdg-open");
+        assert_eq!(editor_command(EditorChoice::Zed, None).0, "zed");
+        assert_eq!(editor_command(EditorChoice::Gvim, None).0, "gvim");
+        assert_eq!(editor_command(EditorChoice::VsCode, None).0, "code");
+        assert_eq!(editor_command(EditorChoice::System, None).0, "xdg-open");
         // The default always resolves to something spawnable.
-        assert!(!editor_command(EditorChoice::Default).0.is_empty());
+        assert!(!editor_command(EditorChoice::Default, None).0.is_empty());
+    }
+
+    #[test]
+    fn parses_custom_editor_commands() {
+        assert_eq!(
+            editor_command(EditorChoice::Custom, Some("kate --new")),
+            ("kate".to_string(), vec!["--new".to_string()])
+        );
+        assert_eq!(
+            editor_command(EditorChoice::Custom, Some("  ")),
+            (String::new(), Vec::new())
+        );
+        assert!(!command_available("rustterm-editor-that-does-not-exist"));
+    }
+
+    #[test]
+    fn status_log_keeps_only_the_latest_entries() {
+        let mut status = StatusLog::default();
+        for index in 0..(StatusLog::MAX_HISTORY + 5) {
+            status.info(format!("message {index}"));
+        }
+        assert_eq!(status.history().count(), StatusLog::MAX_HISTORY);
+        assert_eq!(status.current().unwrap().text, "message 54");
+        status.error("broken");
+        assert!(status.is_error());
+        status.clear();
+        assert!(status.current().is_none());
+        assert_eq!(status.history().count(), 0);
     }
 }

@@ -274,7 +274,15 @@ impl SftpExplorer {
                     self.listed_path = path;
                     self.selected = None;
                     self.loading = false;
-                    self.status.info(format!("{count} entries"));
+                    // Keep an operation result visible; otherwise report the
+                    // number of entries for this navigation.
+                    let keep_success = self
+                        .status
+                        .current()
+                        .is_some_and(|entry| entry.kind == StatusKind::Success);
+                    if !keep_success {
+                        self.status.info(format!("{count} entries"));
+                    }
                     true
                 }
                 Ok(Err(err)) => {
@@ -293,8 +301,8 @@ impl SftpExplorer {
             Job::Reconnect(rx) => match rx.try_recv() {
                 Ok(Ok(())) => {
                     self.unavailable = None;
-                    self.status.success("SFTP reconnected");
                     self.load_home(ssh);
+                    self.status.success("SFTP reconnected");
                     true
                 }
                 Ok(Err(err)) => {

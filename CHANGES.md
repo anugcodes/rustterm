@@ -444,3 +444,92 @@ dlopen of crates.
 - No upload/download yet; symlinks are displayed but not followed.
 - A server that permits only one session channel makes SFTP unavailable while
   the terminal continues to work.
+
+---
+
+# Step: SFTP panel follow-ups
+
+## What changed
+
+**`Cargo.toml` / `Cargo.lock`**
+- Added `chrono = "0.4"` for local-time formatting. It was already in the lock
+  file as a transitive dependency; this makes the use explicit.
+
+**`src/ssh.rs`**
+- `RemoteEntry` gained `owner`.
+- Introduced `SftpClient { session, owners }`, where `owners` is a
+  `tokio::sync::OnceCell<HashMap<u32, String>>` filled from `/etc/passwd` on the
+  first listing. Owner precedence: cached name → `Metadata.user` → numeric UID.
+- Replaced the optional `Arc<SftpSession>` with `SharedSftp`
+  (`Arc<Mutex<Option<Arc<SftpClient>>>>`) and wrapped the russh
+  `Handle<ClientHandler>` in an `Arc` (the handle is not `Clone`).
+- Added `SftpAction::{Reconnect,Rename,Delete,CreateDir,Copy,Fetch}` and
+  `SshSession::{sftp_reconnect,sftp_rename,sftp_delete,sftp_create_dir,
+  sftp_copy,sftp_fetch}`. All replies are `std::sync::mpsc::Receiver`s and wake
+  egui.
+- Reconnect is dispatched specially in `run_session`: it opens a second channel,
+  requests `sftp`, builds a new client, swaps the shared slot and closes the old
+  channel. The terminal channel is untouched. Every other action clones the
+  current client and runs in a spawned task.
+- File operations: recursive lstat-based delete, unique `name (copy N)`
+  destinations, recursive copy with `tokio::io::copy` for files, symlink
+  recreation, partial-destination cleanup, and single-file download to a local
+  path for the editor.
+- Added `parse_passwd`/owner tests and remote-path-join tests.
+
+**`src/sftp.rs`**
+- `SftpExplorer` gained `show_hidden`, `clipboard`, `dialog`, `notice`, an
+  operation receiver and reconnect jobs.
+- Added `reconnect`, `copy_entry`, `paste`, `paste_into`, `begin_rename`,
+  `begin_delete`, `begin_new_folder{,_in}`, `submit_dialog`, `cancel_dialog` and
+  `open_in_editor`.
+- Added `SftpDialog`, `SftpDialogKind`, `ClipboardEntry`, `EditorChoice`,
+  `format_timestamp`, `format_owner`, `validate_name`, copy-target guards,
+  unique temp download paths and editor command resolution.
+- Editor launch tries `$VISUAL`, then `$EDITOR`, then `xdg-open`; explicit
+  choices are Zed, gvim, VS Code and the desktop default. The child is reaped on
+  a background thread so the UI never blocks.
+- Added six unit tests (timestamps, names, copy guard, editor commands).
+
+**`src/app.rs`**
+- SFTP toolbar now has **New folder**, **Copy**, **Paste**, **Hidden**,
+  **Reconnect** and an operation spinner/label.
+- Rows show `icon name` plus a second line with owner and local modified time;
+  the footer repeats owner/time and adds size, with **Rename**/**Delete**
+  shortcuts.
+- Right-click row menu: Open, Open in default editor, Open in editor submenu,
+  Rename…, Copy, Copy path, Paste into this folder, New folder…, Delete…,
+  Refresh.
+- Rename / new-folder / delete dialogs are rendered as anchored egui windows;
+  delete confirms recursively for directories.
+- Unavailable state offers **Reconnect SFTP** without touching the terminal.
+
+**`handoff.md` / `USAGE.md` / `README.md`**
+- Roadmap step 7 marked done; transfers are now next. README status and feature
+  checklist refreshed.
+- API notes updated (`Arc<Handle>` not `Clone`, `/etc/passwd` cache, symlink
+  argument order, `File` streaming/close).
+- §14 checklist expanded for columns, hidden files, dialogs, copy/paste,
+  symlinks, editor launch, reconnect and responsive large operations.
+
+## Verified
+
+- `cargo fmt --check` ✅
+- `cargo clippy --all-targets -- -D warnings` ✅ (default and
+  `--no-default-features`)
+- `cargo test` ✅ **42 passed** in both feature sets
+- `cargo build --release` ✅
+- GUI checklist for the new operations still needs a manual live-server pass
+  (`USAGE.md` §14).
+
+## Known limits
+
+- No general upload/download, progress bars, transfer queue or drag & drop yet;
+  **Download…/Upload here…** stay with the transfers step.
+- Remote copy/paste has no server-side primitive, so it streams bytes through
+  the client. Very large trees are slow by nature but do not block the UI.
+- Panel keyboard `Ctrl+C`/`Ctrl+V` is intentionally unbound to avoid stealing
+  terminal shortcuts; use the toolbar or context menu.
+- Symlinks are shown and copied but not navigated. The panel still does not
+  follow shell `cd`.
+- Editor changes are not watched or uploaded; close/reopen after editing.

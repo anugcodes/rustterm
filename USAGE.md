@@ -485,55 +485,110 @@ the panel's **×** hides it too. Each tab keeps its own directory.
 
 - Entries are sorted **directories first**, then case-insensitive name. `📁` is a
   directory, `📄` a regular file, `🔗` a symlink (displayed but not followed yet).
+  Each row has a second line with **owner · local last-modified time**
+  (`YYYY-MM-DD HH:MM`); the footer adds the full path and size.
 - Click a **directory** to enter it. Click a **file** to select it; the footer
-  shows its full path, size and age. Hovering any row shows the same details.
+  shows its full path, size, owner and exact timestamp. Hovering any row shows
+  the same details plus a relative age.
 - **Home** returns to the login directory, **Up** goes to the parent (stops at
-  `/`), **Refresh** re-lists the current directory.
+  `/`), **Refresh** re-lists the current directory, and **Reconnect** reopens only
+  the SFTP channel. The terminal stays connected.
 - Type a remote path in the **Path** box and press **Enter** (or click **Go**).
   Relative paths are resolved by the server against the login directory.
+- **Hidden** shows or hides dotfiles (default hidden). The setting is per tab and
+  survives refresh/navigation. If the selected row becomes hidden, the selection
+  is cleared.
+- **New folder** creates a folder in the current directory. Right-click a row for
+  **Open**, **Open in editor**, **Rename…**, **Copy**, **Copy path**,
+  **Paste into this folder**, **New folder…**, **Delete…** and **Refresh**.
+- **Copy/Paste**: **Copy** remembers a remote file or folder (no data is moved
+  yet). **Paste** duplicates it into the current directory, choosing
+  `name (copy)`, `name (copy 2)`, … if needed. Files are streamed; directories
+  recurse; symlinks are recreated with their original target. A folder cannot be
+  pasted into itself.
+- **Open in editor** downloads the file to a unique
+  `rustterm-edit-<pid>-<nanos>` directory under the system temp dir, then launches
+  the default (`$VISUAL`, then `$EDITOR`), **Zed**, **gvim**, **VS Code**, or the
+  desktop default (`xdg-open`). The editor runs asynchronously. This version does
+  not upload changes on save; edit the remote copy separately.
+- **Rename/Delete** open a dialog. Rename accepts a single path component (no
+  `/`). Delete asks for confirmation; deleting a non-empty folder warns that the
+  whole tree is removed recursively.
 - If the SSH server has no SFTP subsystem, the panel says **SFTP is unavailable**
-  and shows the reason. The terminal is unaffected.
-- **Limitation:** the panel does **not** follow `cd` in the shell yet (handoff
-  F26). Use **Refresh**/the path box to change directory. Transfers are not
-  implemented yet.
+  and shows the reason. **Reconnect SFTP** retries only the SFTP channel; the
+  terminal is unaffected.
+- **Limitations:** the panel does **not** follow `cd` in the shell yet (handoff
+  F26). Use **Refresh**/the path box to change directory. General upload/download,
+  drag & drop and progress bars are still on the transfers step. Symlinks are
+  shown/copied but clicking one does not navigate.
 
 **Verify**
 
 Setup: any server with `Subsystem sftp ...` enabled (the normal OpenSSH default),
-and a shell you can type into.
+and a shell you can type into. Use a scratch directory such as `/tmp/rt-sftp`
+so delete/copy tests cannot touch real data.
 
 - [ ] **Appears**: connect → the left panel lists the login directory; compare
       with `pwd` / `ls -la` in the terminal.
 - [ ] **Sorting**: directories come first; names are case-insensitive
       alphabetical within each group.
+- [ ] **Rows**: each row shows owner and a local `YYYY-MM-DD HH:MM` timestamp;
+      the footer repeats path/owner/time and adds size. Compare a file's owner
+      with `stat -c '%U %y' file`.
 - [ ] **Navigate**: click a directory → path and listing update. **Up** returns to
       the parent. **Home** returns to the login directory.
 - [ ] **Path box**: type `/tmp` + **Enter** → `/tmp` is listed; repeat with **Go**.
       Type a bogus path → red error, previous listing stays usable.
 - [ ] **Refresh**: `touch /tmp/rt-new-file` in the terminal, press **Refresh** in
       `/tmp` → the new file appears.
-- [ ] **Select**: click a file → footer shows its path, human-readable size and
-      relative age; hover a row shows the same details.
+- [ ] **Select**: click a file → footer shows its path, human-readable size, owner
+      and timestamp; hover a row shows the same details.
+- [ ] **Hidden files**: `touch /tmp/.rt-hidden` → by default it is absent; click
+      **Hidden** → it appears; click again → it disappears. Navigate away/back;
+      the toggle state is preserved per tab.
+- [ ] **New folder**: use **New folder** (or the row menu) → enter a name →
+      folder appears after the automatic refresh. Try a name containing `/`,
+      empty, `.` and `..` → the dialog keeps an inline error.
+- [ ] **Rename**: right-click a file → **Rename…** → new name appears; the old
+      name is gone. Check in the terminal. Renaming to the same name is rejected.
+- [ ] **Copy/paste file**: right-click a file → **Copy** → **Paste** in the same
+      folder → `file (copy)` appears with the same contents (`cmp`). Paste again
+      → `file (copy 2)`.
+- [ ] **Copy/paste folder**: create `/tmp/rt-sftp/a` with files/subfolders and a
+      symlink, copy it, paste into `/tmp/rt-sftp/b` → tree and contents match;
+      the symlink still points at the original target (not a duplicate file).
+- [ ] **Paste guard**: copy `/tmp/rt-sftp/a`, right-click it → **Paste into this
+      folder** → inline error; no runaway copy.
+- [ ] **Copy path**: right-click a row → **Copy path** → paste into a local text
+      field/terminal → the remote path appears (uses the system clipboard).
+- [ ] **Delete**: right-click a file → **Delete…** → confirm → file is gone.
+      Create a non-empty folder, delete it → warning names the folder and the
+      whole tree disappears. Cancel leaves everything intact.
+- [ ] **Open in editor**: right-click a small text file → **Open in default
+      editor** (or choose Zed/gvim/VS Code/Desktop) → an editor window opens with
+      the file contents. The notice shows the temp download path. Close the
+      editor; the app remains responsive. (Missing editor binary → inline launch
+      error that still names the downloaded file.)
+- [ ] **Reconnect**: click **Reconnect** → the SFTP listing reopens at the login
+      directory; the terminal scrollback and running shell are untouched.
+      Repeat while a command is streaming output in the terminal.
+- [ ] **Unavailable / retry**: connect to a server without the SFTP subsystem (or
+      one that refuses a second channel) → **SFTP is unavailable** with a reason;
+      the terminal still works. If the channel can be opened later, **Reconnect
+      SFTP** recovers without reconnecting SSH.
+- [ ] **Symlink**: create `ln -s /etc /tmp/rt-link` and list `/tmp` → the link is
+      shown with `🔗`; clicking it selects it (it does not navigate). Copy/paste it
+      → the duplicate is still a symlink to `/etc`.
 - [ ] **Toggle**: **Files** hides the panel; click again to show it. The panel
-      **×** also hides it. Switching tabs shows the other tab's directory, and
-      switching back restores the first tab's directory.
+      **×** also hides it. Switching tabs shows the other tab's directory,
+      clipboard and hidden-file state, and switching back restores the first.
 - [ ] **Background tab**: navigate tab A to `/tmp`, switch to tab B and run some
       output, switch back → tab A is still in `/tmp` and its listing is intact.
-- [ ] **Responsiveness**: navigate to a very large directory (e.g. `/usr/bin`) and
-      keep typing in the terminal → keystrokes echo while the listing loads; the
-      terminal never freezes.
-- [ ] **Unavailable**: connect to a server without the SFTP subsystem (or one that
-      refuses a second channel) → **SFTP is unavailable** with a reason; the
-      terminal still works and `cargo run` does not panic.
-- [ ] **Symlink**: create `ln -s /etc /tmp/rt-link` and list `/tmp` → the link is
-      shown with `🔗`; clicking it selects it (it does not navigate).
+- [ ] **Responsiveness**: navigate to a very large directory (e.g. `/usr/bin`),
+      start a large folder copy, and keep typing in the terminal → keystrokes echo
+      and output flows while the listing/copy runs. The operation spinner and
+      label stay visible.
 - [ ] **No auto-follow (expected)**: `cd /var/log` in the terminal → the panel
       stays where it was until you navigate/refresh manually.
 - [ ] **Teardown**: close the tab with the panel open, and disconnect via
       **Disconnect** → no crash, no stuck thread.
-
-**Planned (not implemented yet):** SFTP reconnect; right-click row menu for
-delete/rename/new folder/download/upload/copy/paste/copy path; **Open in local
-editor** (Zed, gvim, `$VISUAL`/`$EDITOR`, `xdg-open`); show/hide hidden files;
-and owner + last-modified columns on each row. The checklist for these will be
-added here as they land; the design notes live in `handoff.md` §11.

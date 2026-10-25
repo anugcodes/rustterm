@@ -18,7 +18,8 @@
 //! a *changed* key is refused outright, with no way to click through it.
 
 use std::borrow::Cow;
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
@@ -34,8 +35,9 @@ use russh::keys::key::PublicKey;
 use russh::keys::{check_known_hosts, known_host_keys, learn_known_hosts, load_secret_key};
 use russh::{compression, Channel, ChannelMsg};
 use russh_sftp::client::{Config as SftpConfig, SftpSession};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, OnceCell};
 
 /// Wakes the egui thread when asynchronous SSH data arrives.
 pub type Wake = Arc<dyn Fn() + Send + Sync>;
@@ -115,6 +117,9 @@ pub struct RemoteEntry {
     pub is_dir: bool,
     pub is_symlink: bool,
     pub size: u64,
+    /// Best-effort owner name: `/etc/passwd` lookup, then the name supplied by
+    /// the server, then the numeric UID.
+    pub owner: String,
     pub modified: Option<SystemTime>,
 }
 
@@ -140,6 +145,9 @@ impl SshSession {
             .with_context(|| {
                 format!("connect to {}@{}:{}", config.user, config.host, config.port)
             })?;
+        // The handle is shared so the SFTP reconnect task can open a channel
+        // while the session loop keeps ownership for terminal I/O.
+        let session = Arc::new(session);
 
         let (input_tx, input_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let (resize_tx, resize_rx) = mpsc::unbounded_channel::<(u16, u16)>();
@@ -185,9 +193,6 @@ impl SshSession {
 
     /// Ask the SFTP subsystem for the session's home directory (`.`).
     pub fn sftp_home(&self) -> Option<std_mpsc::Receiver<Result<String, String>>> {
-        if self.sftp_unavailable.is_some() {
-            return None;
-        }
         let (reply, rx) = std_mpsc::channel();
         self.sftp_tx
             .send(SftpRequest {
@@ -204,14 +209,125 @@ impl SshSession {
         &self,
         path: &str,
     ) -> Option<std_mpsc::Receiver<Result<Vec<RemoteEntry>, String>>> {
-        if self.sftp_unavailable.is_some() {
-            return None;
-        }
         let (reply, rx) = std_mpsc::channel();
         self.sftp_tx
             .send(SftpRequest {
                 action: SftpAction::List {
                     path: path.to_string(),
+                    reply,
+                },
+                wake: self.wake.clone(),
+            })
+            .ok()?;
+        Some(rx)
+    }
+
+    /// Open a fresh SFTP channel on the existing SSH connection.
+    ///
+    /// The terminal session is never touched: only the SFTP subsystem is
+    /// reopened, which is enough to recover from a dropped channel or from a
+    /// server that had no SFTP support at login time.
+    pub fn sftp_reconnect(&self) -> Option<std_mpsc::Receiver<Result<(), String>>> {
+        let (reply, rx) = std_mpsc::channel();
+        self.sftp_tx
+            .send(SftpRequest {
+                action: SftpAction::Reconnect { reply },
+                wake: self.wake.clone(),
+            })
+            .ok()?;
+        Some(rx)
+    }
+
+    pub fn sftp_rename(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> Option<std_mpsc::Receiver<Result<String, String>>> {
+        let (reply, rx) = std_mpsc::channel();
+        self.sftp_tx
+            .send(SftpRequest {
+                action: SftpAction::Rename {
+                    from: from.to_string(),
+                    to: to.to_string(),
+                    reply,
+                },
+                wake: self.wake.clone(),
+            })
+            .ok()?;
+        Some(rx)
+    }
+
+    pub fn sftp_delete(
+        &self,
+        path: &str,
+        is_dir: bool,
+    ) -> Option<std_mpsc::Receiver<Result<String, String>>> {
+        let (reply, rx) = std_mpsc::channel();
+        self.sftp_tx
+            .send(SftpRequest {
+                action: SftpAction::Delete {
+                    path: path.to_string(),
+                    is_dir,
+                    reply,
+                },
+                wake: self.wake.clone(),
+            })
+            .ok()?;
+        Some(rx)
+    }
+
+    pub fn sftp_create_dir(
+        &self,
+        path: &str,
+    ) -> Option<std_mpsc::Receiver<Result<String, String>>> {
+        let (reply, rx) = std_mpsc::channel();
+        self.sftp_tx
+            .send(SftpRequest {
+                action: SftpAction::CreateDir {
+                    path: path.to_string(),
+                    reply,
+                },
+                wake: self.wake.clone(),
+            })
+            .ok()?;
+        Some(rx)
+    }
+
+    /// Copy `from` into `dest_dir`, choosing a unique name if needed.
+    ///
+    /// SFTP has no server-side copy operation, so the copy is streamed. The
+    /// reply contains the final destination path.
+    pub fn sftp_copy(
+        &self,
+        from: &str,
+        dest_dir: &str,
+    ) -> Option<std_mpsc::Receiver<Result<String, String>>> {
+        let (reply, rx) = std_mpsc::channel();
+        self.sftp_tx
+            .send(SftpRequest {
+                action: SftpAction::Copy {
+                    from: from.to_string(),
+                    dest_dir: dest_dir.to_string(),
+                    reply,
+                },
+                wake: self.wake.clone(),
+            })
+            .ok()?;
+        Some(rx)
+    }
+
+    /// Download a remote file to a local path (used by "open in editor").
+    pub fn sftp_fetch(
+        &self,
+        remote: &str,
+        local: PathBuf,
+    ) -> Option<std_mpsc::Receiver<Result<String, String>>> {
+        let (reply, rx) = std_mpsc::channel();
+        self.sftp_tx
+            .send(SftpRequest {
+                action: SftpAction::Fetch {
+                    remote: remote.to_string(),
+                    local,
                     reply,
                 },
                 wake: self.wake.clone(),
@@ -547,7 +663,7 @@ struct SessionIo {
 }
 
 async fn run_session(
-    session: Handle<ClientHandler>,
+    session: Arc<Handle<ClientHandler>>,
     mut channel: Channel<ClientMsg>,
     sftp: Option<SftpSession>,
     io: SessionIo,
@@ -560,7 +676,10 @@ async fn run_session(
         mut sftp_rx,
         output_tx,
     } = io;
-    let sftp = sftp.map(Arc::new);
+    // The client is behind a lock so a reconnect can swap in a fresh SFTP
+    // channel while the terminal loop keeps running. Locks are only held long
+    // enough to clone the `Arc`; all I/O happens without one.
+    let sftp: SharedSftp = Arc::new(Mutex::new(sftp.map(|sftp| Arc::new(SftpClient::new(sftp)))));
 
     loop {
         tokio::select! {
@@ -590,22 +709,34 @@ async fn run_session(
             maybe_request = sftp_rx.recv() => {
                 let Some(request) = maybe_request else { break };
                 let SftpRequest { action, wake: request_wake } = request;
-                match sftp.as_ref().map(Arc::clone) {
-                    Some(sftp) => {
-                        // Run the round-trip off the terminal loop: a slow
-                        // listing must not freeze keystrokes or output.
+                match action {
+                    SftpAction::Reconnect { reply } => {
+                        let session = session.clone();
+                        let shared = Arc::clone(&sftp);
+                        // Open the new channel off the terminal loop: the SFTP
+                        // handshake must not freeze keystrokes or output.
                         tokio::spawn(async move {
-                            action.run(&sftp).await;
+                            let result = reconnect_sftp(&session, &shared).await;
+                            let _ = reply.send(result);
                             if let Some(wake) = request_wake {
                                 wake();
                             }
                         });
                     }
-                    None => {
-                        action.fail("SFTP support is not available on this server");
-                        if let Some(wake) = request_wake {
-                            wake();
-                        }
+                    action => {
+                        let shared = Arc::clone(&sftp);
+                        tokio::spawn(async move {
+                            let client = shared.lock().ok().and_then(|slot| slot.clone());
+                            match client {
+                                Some(client) => action.run(&client).await,
+                                None => {
+                                    action.fail("SFTP support is not available on this server")
+                                }
+                            }
+                            if let Some(wake) = request_wake {
+                                wake();
+                            }
+                        });
                     }
                 }
             }
@@ -652,6 +783,42 @@ struct SftpRequest {
     wake: Option<Wake>,
 }
 
+/// The live SFTP channel, swappable by a reconnect.
+type SharedSftp = Arc<Mutex<Option<Arc<SftpClient>>>>;
+
+/// An open SFTP channel plus the owner-name cache shared by all listings on
+/// that connection.
+struct SftpClient {
+    session: SftpSession,
+    /// Loaded on the first listing rather than during connection setup, so a
+    /// slow `/etc/passwd` read can never delay terminal output.
+    owners: OnceCell<HashMap<u32, String>>,
+}
+
+impl SftpClient {
+    fn new(session: SftpSession) -> Self {
+        Self {
+            session,
+            owners: OnceCell::new(),
+        }
+    }
+}
+
+fn owner_name(owners: &HashMap<u32, String>, uid: Option<u32>, user: Option<&str>) -> String {
+    if let Some(uid) = uid {
+        if let Some(name) = owners.get(&uid) {
+            return name.clone();
+        }
+    }
+    if let Some(user) = user {
+        let user = user.trim();
+        if !user.is_empty() {
+            return user.to_string();
+        }
+    }
+    uid.map(|uid| uid.to_string()).unwrap_or_default()
+}
+
 enum SftpAction {
     Home {
         reply: std_mpsc::Sender<Result<String, String>>,
@@ -660,22 +827,107 @@ enum SftpAction {
         path: String,
         reply: std_mpsc::Sender<Result<Vec<RemoteEntry>, String>>,
     },
+    Reconnect {
+        reply: std_mpsc::Sender<Result<(), String>>,
+    },
+    Rename {
+        from: String,
+        to: String,
+        reply: std_mpsc::Sender<Result<String, String>>,
+    },
+    Delete {
+        path: String,
+        is_dir: bool,
+        reply: std_mpsc::Sender<Result<String, String>>,
+    },
+    CreateDir {
+        path: String,
+        reply: std_mpsc::Sender<Result<String, String>>,
+    },
+    Copy {
+        from: String,
+        dest_dir: String,
+        reply: std_mpsc::Sender<Result<String, String>>,
+    },
+    Fetch {
+        remote: String,
+        local: PathBuf,
+        reply: std_mpsc::Sender<Result<String, String>>,
+    },
 }
 
 impl SftpAction {
-    async fn run(self, sftp: &SftpSession) {
+    async fn run(self, client: &SftpClient) {
         match self {
             SftpAction::Home { reply } => {
-                let _ = reply.send(remote_home(sftp).await);
+                let _ = reply.send(remote_home(&client.session).await);
             }
             SftpAction::List { path, reply } => {
-                let _ = reply.send(remote_list(sftp, &path).await);
+                let _ = reply.send(remote_list(client, &path).await);
+            }
+            SftpAction::Reconnect { reply } => {
+                // Reconnect needs the SSH handle, so `run_session` handles it
+                // before dispatching an action here.
+                let _ = reply.send(Err("SFTP reconnect was not dispatched correctly".into()));
+            }
+            SftpAction::Rename { from, to, reply } => {
+                let result = client
+                    .session
+                    .rename(&from, &to)
+                    .await
+                    .map(|()| to.clone())
+                    .map_err(|err| format!("could not rename '{from}' to '{to}': {err}"));
+                let _ = reply.send(result);
+            }
+            SftpAction::Delete {
+                path,
+                is_dir,
+                reply,
+            } => {
+                // Re-check the type: the listing may be stale, and the hint
+                // could be wrong for a symlink or a replaced file.
+                let is_dir = match client.session.symlink_metadata(&path).await {
+                    Ok(metadata) => metadata.file_type().is_dir(),
+                    Err(_) => is_dir,
+                };
+                let result = remove_tree(client, &path, is_dir)
+                    .await
+                    .map(|()| path.clone());
+                let _ = reply.send(result);
+            }
+            SftpAction::CreateDir { path, reply } => {
+                let result = client
+                    .session
+                    .create_dir(&path)
+                    .await
+                    .map(|()| path.clone())
+                    .map_err(|err| format!("could not create folder '{path}': {err}"));
+                let _ = reply.send(result);
+            }
+            SftpAction::Copy {
+                from,
+                dest_dir,
+                reply,
+            } => {
+                let result = copy_into(client, &from, &dest_dir).await;
+                let _ = reply.send(result);
+            }
+            SftpAction::Fetch {
+                remote,
+                local,
+                reply,
+            } => {
+                let result = fetch_file(client, &remote, &local).await;
+                let _ = reply.send(result);
             }
         }
     }
 
     /// Reply with an error without touching the SFTP session.
     fn fail(self, message: &str) {
+        let send = |reply: std_mpsc::Sender<Result<String, String>>| {
+            let _ = reply.send(Err(message.to_string()));
+        };
         match self {
             SftpAction::Home { reply } => {
                 let _ = reply.send(Err(message.to_string()));
@@ -683,8 +935,69 @@ impl SftpAction {
             SftpAction::List { reply, .. } => {
                 let _ = reply.send(Err(message.to_string()));
             }
+            SftpAction::Reconnect { reply } => {
+                let _ = reply.send(Err(message.to_string()));
+            }
+            SftpAction::Rename { reply, .. }
+            | SftpAction::Delete { reply, .. }
+            | SftpAction::CreateDir { reply, .. }
+            | SftpAction::Copy { reply, .. }
+            | SftpAction::Fetch { reply, .. } => send(reply),
         }
     }
+}
+
+/// Replace the shared SFTP channel with a freshly opened one.
+async fn reconnect_sftp(
+    session: &Handle<ClientHandler>,
+    shared: &SharedSftp,
+) -> Result<(), String> {
+    let session = open_sftp(session).await?;
+    let client = Arc::new(SftpClient::new(session));
+    let old = match shared.lock() {
+        Ok(mut slot) => slot.replace(client),
+        Err(_) => return Err("the SFTP state lock is poisoned".to_string()),
+    };
+    if let Some(old) = old {
+        // In-flight requests still hold a clone; closing the channel is still
+        // the right signal that this generation of the connection is done.
+        let _ = old.session.close().await;
+    }
+    Ok(())
+}
+
+async fn load_owner_names(sftp: &SftpSession) -> HashMap<u32, String> {
+    let mut file = match sftp.open("/etc/passwd").await {
+        Ok(file) => file,
+        Err(_) => return HashMap::new(),
+    };
+    let mut contents = Vec::new();
+    let result = file.read_to_end(&mut contents).await;
+    let _ = file.close().await;
+    if result.is_err() {
+        return HashMap::new();
+    }
+    parse_passwd(&String::from_utf8_lossy(&contents))
+}
+
+fn parse_passwd(contents: &str) -> HashMap<u32, String> {
+    contents
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                return None;
+            }
+            let mut fields = line.split(':');
+            let name = fields.next()?.trim();
+            let _password = fields.next()?;
+            let uid = fields.next()?.trim().parse().ok()?;
+            if name.is_empty() {
+                return None;
+            }
+            Some((uid, name.to_string()))
+        })
+        .collect()
 }
 
 async fn remote_home(sftp: &SftpSession) -> Result<String, String> {
@@ -693,11 +1006,19 @@ async fn remote_home(sftp: &SftpSession) -> Result<String, String> {
         .map_err(|err| format!("could not resolve the remote home directory: {err}"))
 }
 
-async fn remote_list(sftp: &SftpSession, path: &str) -> Result<Vec<RemoteEntry>, String> {
-    let dir = sftp
+async fn remote_list(client: &SftpClient, path: &str) -> Result<Vec<RemoteEntry>, String> {
+    let dir = client
+        .session
         .read_dir(path)
         .await
         .map_err(|err| format!("could not list '{path}': {err}"))?;
+
+    // Load `/etc/passwd` once per SFTP connection. Servers that hide the file
+    // produce an empty map and the UI falls back to the UID.
+    let owners = client
+        .owners
+        .get_or_init(|| load_owner_names(&client.session))
+        .await;
 
     let mut entries = Vec::new();
     for entry in dir {
@@ -709,10 +1030,212 @@ async fn remote_list(sftp: &SftpSession, path: &str) -> Result<Vec<RemoteEntry>,
             is_dir: file_type.is_dir(),
             is_symlink: file_type.is_symlink(),
             size: metadata.len(),
+            owner: owner_name(owners, metadata.uid, metadata.user.as_deref()),
             modified: metadata.modified().ok(),
         });
     }
     Ok(entries)
+}
+
+/// Copy `from` into `dest_dir`, giving the copy a unique name.
+async fn copy_into(client: &SftpClient, from: &str, dest_dir: &str) -> Result<String, String> {
+    let metadata = client
+        .session
+        .symlink_metadata(from)
+        .await
+        .map_err(|err| format!("could not inspect '{from}': {err}"))?;
+    let is_dir = metadata.file_type().is_dir();
+
+    // Copying a directory into itself would recurse forever while the tree
+    // grows underneath the walk.
+    let from_trimmed = from.trim_end_matches('/');
+    let dest_trimmed = dest_dir.trim_end_matches('/');
+    if is_dir
+        && (dest_trimmed == from_trimmed || dest_trimmed.starts_with(&format!("{from_trimmed}/")))
+    {
+        return Err(format!(
+            "cannot copy folder '{from}' into itself; choose a different destination"
+        ));
+    }
+
+    let source_name = from_trimmed
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty() && *name != "." && *name != "..")
+        .unwrap_or("copy");
+    let destination = unique_copy_path(client, dest_dir, source_name).await?;
+    if let Err(err) = copy_tree(client, from, &destination).await {
+        // Do not leave a half-copied tree behind.
+        let _ = remove_tree(client, &destination, is_dir).await;
+        return Err(err);
+    }
+    Ok(destination)
+}
+
+async fn unique_copy_path(
+    client: &SftpClient,
+    dest_dir: &str,
+    source_name: &str,
+) -> Result<String, String> {
+    for attempt in 1..1000 {
+        let name = if attempt == 1 {
+            format!("{source_name} (copy)")
+        } else {
+            format!("{source_name} (copy {attempt})")
+        };
+        let candidate = join_remote_path(dest_dir, &name);
+        match client.session.try_exists(&candidate).await {
+            Ok(false) => return Ok(candidate),
+            Ok(true) => {}
+            Err(err) => return Err(format!("could not check '{candidate}': {err}")),
+        }
+    }
+    Err(format!(
+        "could not find a free copy name for '{source_name}' in '{dest_dir}'"
+    ))
+}
+
+/// Recursively copy a file, directory tree or symlink.
+///
+/// Files stream through `tokio::io::copy`; SFTP has no server-side copy
+/// primitive. Symlinks are recreated with their original target.
+async fn copy_tree(client: &SftpClient, from: &str, to: &str) -> Result<(), String> {
+    let metadata = client
+        .session
+        .symlink_metadata(from)
+        .await
+        .map_err(|err| format!("could not inspect '{from}': {err}"))?;
+    let file_type = metadata.file_type();
+
+    if file_type.is_symlink() {
+        let target = client
+            .session
+            .read_link(from)
+            .await
+            .map_err(|err| format!("could not read symlink '{from}': {err}"))?;
+        // russh-sftp follows OpenSSH's argument order: target first, link path
+        // second.
+        return client
+            .session
+            .symlink(&target, to)
+            .await
+            .map_err(|err| format!("could not create symlink '{to}': {err}"));
+    }
+
+    if file_type.is_dir() {
+        client
+            .session
+            .create_dir(to)
+            .await
+            .map_err(|err| format!("could not create folder '{to}': {err}"))?;
+        let entries = client
+            .session
+            .read_dir(from)
+            .await
+            .map_err(|err| format!("could not read folder '{from}': {err}"))?;
+        for entry in entries {
+            let child_from = entry.path();
+            let child_to = join_remote_path(to, &entry.file_name());
+            Box::pin(copy_tree(client, &child_from, &child_to)).await?;
+        }
+        return Ok(());
+    }
+
+    copy_file(client, from, to).await
+}
+
+async fn copy_file(client: &SftpClient, from: &str, to: &str) -> Result<(), String> {
+    let mut source = client
+        .session
+        .open(from)
+        .await
+        .map_err(|err| format!("could not open '{from}' for reading: {err}"))?;
+    let mut destination = client
+        .session
+        .create(to)
+        .await
+        .map_err(|err| format!("could not create '{to}': {err}"))?;
+
+    let copied = tokio::io::copy(&mut source, &mut destination).await;
+    let flushed = destination.flush().await;
+    let closed_source = source.close().await;
+    let closed_destination = destination.close().await;
+
+    if let Err(err) = copied {
+        let _ = client.session.remove_file(to).await;
+        return Err(format!("could not copy '{from}' to '{to}': {err}"));
+    }
+    flushed.map_err(|err| format!("could not finish writing '{to}': {err}"))?;
+    closed_source.map_err(|err| format!("could not close '{from}': {err}"))?;
+    closed_destination.map_err(|err| format!("could not close '{to}': {err}"))?;
+    Ok(())
+}
+
+async fn fetch_file(client: &SftpClient, remote: &str, local: &Path) -> Result<String, String> {
+    let mut source = client
+        .session
+        .open(remote)
+        .await
+        .map_err(|err| format!("could not open '{remote}' for reading: {err}"))?;
+    let mut destination = tokio::fs::File::create(local)
+        .await
+        .map_err(|err| format!("could not create '{}': {err}", local.display()))?;
+
+    let copied = tokio::io::copy(&mut source, &mut destination).await;
+    let flushed = destination.flush().await;
+    let closed_source = source.close().await;
+    drop(destination);
+
+    if let Err(err) = copied {
+        let _ = tokio::fs::remove_file(local).await;
+        return Err(format!("could not download '{remote}': {err}"));
+    }
+    flushed.map_err(|err| format!("could not finish writing '{}': {err}", local.display()))?;
+    closed_source.map_err(|err| format!("could not close '{remote}': {err}"))?;
+    Ok(local.display().to_string())
+}
+
+async fn remove_tree(client: &SftpClient, path: &str, is_dir: bool) -> Result<(), String> {
+    if !is_dir {
+        return client
+            .session
+            .remove_file(path)
+            .await
+            .map_err(|err| format!("could not delete '{path}': {err}"));
+    }
+
+    let entries = client
+        .session
+        .read_dir(path)
+        .await
+        .map_err(|err| format!("could not read folder '{path}': {err}"))?;
+    for entry in entries {
+        let child = entry.path();
+        // Use lstat: a readdir listing may follow symlinks, and recursively
+        // deleting through a symlink would remove the target's contents.
+        let child_is_dir = match client.session.symlink_metadata(&child).await {
+            Ok(metadata) => metadata.file_type().is_dir(),
+            Err(_) => false,
+        };
+        Box::pin(remove_tree(client, &child, child_is_dir)).await?;
+    }
+    client
+        .session
+        .remove_dir(path)
+        .await
+        .map_err(|err| format!("could not delete folder '{path}': {err}"))
+}
+
+/// POSIX path join for remote paths. Mirrors `sftp::join_path` without making
+/// the transport module depend on the UI state module.
+fn join_remote_path(dir: &str, name: &str) -> String {
+    if dir.is_empty() || dir == "/" {
+        format!("/{name}")
+    } else if dir.ends_with('/') {
+        format!("{dir}{name}")
+    } else {
+        format!("{dir}/{name}")
+    }
 }
 
 struct ClientHandler {
@@ -874,4 +1397,34 @@ fn record_host_key(host: &str, port: u16, key: &PublicKey) -> std::result::Resul
     }
     learn_known_hosts(host, port, key)
         .map_err(|err| format!("could not record the host key in known_hosts: {err}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_owner_names_from_passwd() {
+        let passwd = "\
+root:x:0:0:root:/root:/bin/bash
+# comment lines are ignored
+alice:x:1000:1000:Alice:/home/alice:/bin/bash
+invalid line
+bad:x:not-a-number:0::/:/bin/sh
+bob:x:1001:1001::/home/bob:/bin/sh
+";
+        let owners = parse_passwd(passwd);
+        assert_eq!(owners.get(&0).map(String::as_str), Some("root"));
+        assert_eq!(owners.get(&1000).map(String::as_str), Some("alice"));
+        assert_eq!(owners.get(&1001).map(String::as_str), Some("bob"));
+        assert!(!owners.contains_key(&999));
+    }
+
+    #[test]
+    fn joins_remote_paths() {
+        assert_eq!(join_remote_path("/home/user", "file"), "/home/user/file");
+        assert_eq!(join_remote_path("/home/user/", "file"), "/home/user/file");
+        assert_eq!(join_remote_path("/", "etc"), "/etc");
+        assert_eq!(join_remote_path("", "etc"), "/etc");
+    }
 }

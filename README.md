@@ -7,8 +7,10 @@
 A fast, lightweight, native Linux alternative to MobaXterm. SSH terminal tabs with an SFTP side panel that follows your session. Written in Rust.
 
 > **Status:** working terminal with tabs. Colours, scrollback, copy/paste, mouse
-> reporting and TOFU host-key verification are done. Saved sessions + keyring and
-> the SFTP side panel are next.
+> reporting, TOFU host-key verification, saved sessions, keyring passwords,
+> public-key/agent auth and the SFTP side panel (browse, reconnect, rename,
+> delete, copy/paste, hidden files, open in local editor) are done. General
+> upload/download transfers are next; the panel does not yet follow shell `cd`.
 
 ## Screenshots
 
@@ -23,8 +25,13 @@ _(coming soon)_
 - [x] Mouse reporting for full-screen apps (htop, vim, tmux, mc)
 - [x] Application cursor keys (DECCKM) so ncurses programs get real arrow keys
 - [x] Host-key verification (TOFU) against `~/.ssh/known_hosts`
-- [ ] Saved sessions + system keyring
-- [ ] SFTP side panel following the active session
+- [x] Saved sessions + optional system-keyring passwords
+- [x] Public-key and ssh-agent authentication
+- [x] SFTP side panel per session (owner/modified columns, hidden-file toggle)
+- [x] SFTP reconnect without dropping the terminal
+- [x] SFTP rename, delete, new folder, copy/paste and file operations
+- [x] Open remote files in a local editor (`$VISUAL`/`$EDITOR`, Zed, gvim, VS Code)
+- [ ] SFTP panel follows the shell's working directory
 - [ ] Upload/download with drag and drop
 - [ ] Edit-and-auto-upload remote files
 - [ ] X11 forwarding / VNC tunnel for GUI tools (Verdi, DVE)
@@ -35,8 +42,10 @@ _(coming soon)_
 |---|---|
 | UI | `egui` + `eframe` |
 | SSH | `russh` (pure Rust) |
+| SFTP | `russh-sftp` |
 | Terminal | `alacritty_terminal` |
 | Async | `tokio` |
+| Timestamps | `chrono` |
 
 ## Build
 

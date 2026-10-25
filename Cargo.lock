@@ -3383,6 +3383,7 @@ dependencies = [
  "alacritty_terminal",
  "anyhow",
  "async-trait",
+ "chrono",
  "eframe",
  "egui",
  "env_logger",

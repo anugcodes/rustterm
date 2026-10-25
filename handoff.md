@@ -4,8 +4,9 @@
 > finished, copy/paste (F14) is done, saved session profiles persist to
 > `~/.config/rustterm/sessions.toml`, profiles can optionally store their
 > password in the OS keyring, public-key / ssh-agent authentication works, and
-> the SFTP side panel is implemented. File transfers are next. Read section 12
-> before writing any code.
+> the SFTP side panel is implemented with reconnect, file operations, hidden-file
+> filtering, copy/paste, open-in-local-editor and owner/modified rows. File
+> transfers are next. Read section 12 before writing any code.
 
 Last updated: 2026-10-25
 Repo: `~/Desktop/VsTerm` (local) — remote may be `rustterm` on GitHub
@@ -33,9 +34,9 @@ open protocols.
 | 1 | SSH terminal with colors, resize, copy/paste | **Done** — colors, resize, scrollback, bg colors, copy/paste. |
 | 2 | Multiple SSH sessions in tabs | **Done** |
 | 3 | Saved sessions, key auth, keyring passwords | **Done** — profiles, optional keyring passwords, key file + ssh-agent auth. |
-| 4 | SFTP side panel following the active session's path | **Mostly done** — per-tab browsing, Home/Up/Refresh and manual paths. Planned follow-ups: reconnect, right-click file operations, hidden-file toggle, copy/paste, owner + modified columns. The panel does not yet follow shell `cd` (no OSC 7). |
-| 5 | Upload/download, drag & drop, progress | Not started — small single-file read/write primitives will arrive with the SFTP context menu first. |
-| 6 | Open remote file in local editor, auto-upload on save | **Planned** — right-click **Open in local editor** (Zed/gvim/`$VISUAL`/`$EDITOR`/`xdg-open`) will download to a temp file; automatic upload-on-save is V2. |
+| 4 | SFTP side panel following the active session's path | **Done except shell-cd following** — per-tab browsing, reconnect, row context menu, hidden toggle, copy/paste, owner/modified rows. The panel does not follow shell `cd` (no OSC 7), and symlinks are not navigated. |
+| 5 | Upload/download, drag & drop, progress | **Next** — copy/editor downloads already stream file contents; general transfers, progress and drag & drop are not implemented. |
+| 6 | Open remote file in local editor, auto-upload on save | **Partial** — **Open in local editor** downloads to a temp file and launches `$VISUAL`/`$EDITOR`, Zed, gvim, VS Code or the desktop default. Automatic upload-on-save is V2. |
 | 7 | GUI tools via X11 forwarding (`ssh -X`) or VNC-over-tunnel | Not started |
 
 ---
@@ -54,6 +55,7 @@ open protocols.
 | Logging | `log` + `env_logger` | 0.11 | `RUST_LOG=info cargo run` |
 | Profiles | `serde` + `toml` | 1 / 0.8 | `~/.config/rustterm/sessions.toml` |
 | Secrets | `keyring` | 4.2 | OS keyring (Secret Service on Linux); opt-in per profile |
+| Timestamps | `chrono` | 0.4 | Local-time formatting for SFTP rows |
 
 `eframe` uses `default-features = false, features = ["glow", "default_fonts"]`.
 
@@ -66,7 +68,7 @@ open protocols.
 
 ```
 
-Cargo.toml                  # eframe/egui 0.29, russh 0.45, russh-sftp 3.0, alacritty_terminal 0.24
+Cargo.toml                  # eframe/egui 0.29, russh 0.45, russh-sftp 3.0, alacritty_terminal 0.24, chrono 0.4
 Cargo.lock                  # COMMITTED (binary crate — reproducible builds)
 README.md                   # badges use YOUR_USERNAME placeholder — fix before push
 LICENSE                     # MIT
@@ -81,7 +83,7 @@ src/
 main.rs                   # font loading, eframe::run_native
 app.rs                    # RustTermApp: tabs, connect form, terminal UI, input dispatch
 ssh.rs                    # SshSession: russh client, host-key prompt, thread + tokio
-sftp.rs                   # SftpExplorer: SFTP panel state, navigation, formatting
+sftp.rs                   # SftpExplorer: panel state, operations, dialogs, editor launch, formatting
 sessions.rs               # SessionStore: saved profiles in sessions.toml (metadata only)
 secrets.rs                # optional OS-keyring password storage (service "rustterm")
 terminal.rs               # TerminalView: Term<EventProxy> + egui rendering + layout
@@ -222,29 +224,43 @@ and `ColorRequest`.
 ### SFTP data flow
 
 ```
-SftpExplorer::poll  ── sftp_home()/sftp_list() ──► tokio mpsc SftpRequest
-                                                       │
-                                       run_session select! branch
-                                                       │
-                                              tokio::spawn(...)
-                                                       ▼
-                                    SftpSession::canonicalize / read_dir
-                                                       │
-                                    std::sync::mpsc::Sender<Result<…>>
-                                                       │  + Wake
-                                                       ▼
-                                   SftpExplorer::poll (drained in pump_sessions)
+SftpExplorer::poll ── sftp_home/list/rename/delete/create_dir/copy/fetch() ──►
+                              tokio mpsc SftpRequest
+                                       │
+                       run_session select! branch
+                          │                       │
+             Reconnect ───┘                       └── tokio::spawn(...)
+                 │                                          ▼
+        open_sftp(&Handle)                    Arc<SftpClient> clone + action
+        swap SharedSftp                                 │
+                                          canonicalize / read_dir / open+copy /
+                                          create_dir / rename / remove / symlink
+                                                        │
+                                   std::sync::mpsc::Sender<Result<…>>
+                                                        │  + Wake
+                                                        ▼
+                                  SftpExplorer::poll (drained in pump_sessions)
 ```
 
 - SFTP is a **second channel on the same SSH connection**, opened after the shell
   (and PTY) requests. If the subsystem is missing or its handshake fails, the
   connection still succeeds and the panel shows why SFTP is unavailable.
-- The select loop never awaits SFTP: each request is moved into a spawned task, so
-  a slow listing cannot delay keystrokes or terminal output. Replies use
-  `std::sync::mpsc` and call the egui `Wake` callback.
+- The live client is `Arc<Mutex<Option<Arc<SftpClient>>>>`. Reconnect opens a new
+  channel/subsystem through the shared `Arc<Handle<ClientHandler>>`, swaps the
+  client and closes the old channel; the terminal session is untouched.
+- The select loop never awaits SFTP: listings and file operations clone the
+  current client and run in a spawned task, so a slow listing or a large copy
+  cannot delay keystrokes or terminal output. Replies use `std::sync::mpsc` and
+  call the egui `Wake` callback.
+- `SftpClient` caches `/etc/passwd` in a `tokio::sync::OnceCell`, loaded on the
+  first listing. Rows use the cached name, then `Metadata.user`, then the UID.
+- Remote copy/paste stores a path and is implemented as a recursive streamed
+  copy (`tokio::io::copy`) with unique `name (copy N)` destinations. Symlinks are
+  recreated, not followed.
 - `SftpExplorer` is per `ActiveSession`, so each tab keeps its own remote
-  directory. It starts at `canonicalize(".")` and is hidden/shown with the
-  **Files** toggle in the tab bar.
+  directory, clipboard, hidden-file toggle and open dialog. It starts at
+  `canonicalize(".")` and is hidden/shown with the **Files** toggle in the tab
+  bar.
 
 ---
 
@@ -276,13 +292,31 @@ and not closable. Closing a tab disconnects its SSH cleanly.
   agent unavailable, wrong password) instead of a bare "rejected".
 - **SFTP side panel**: a second channel per session opens the `sftp` subsystem at
   connect time. The left panel starts in the remote login directory
-  (`canonicalize(".")`) and lists the entries with directories first. **Home**,
-  **Up**, **Refresh** and an editable path + **Enter**/**Go** navigate; clicking a
-  directory opens it and clicking a file selects it (path, size and age in the
-  footer). The **Files** toggle in the tab bar, or the panel's **×**, hides it.
-  Each tab keeps its own directory. Servers without SFTP show a clear unavailable
+  (`canonicalize(".")`) and lists entries with directories first. Every row shows
+  an icon, name, owner and local last-modified timestamp (the footer adds path,
+  size and exact details). **Home**, **Up**, **Refresh**, **Reconnect** and an
+  editable path + **Enter**/**Go** navigate; clicking a directory opens it and
+  clicking a file selects it.
+- **SFTP operations**: right-click a row for **Open**, **Open in editor**
+  (default/Zed/gvim/VS Code/desktop), **Rename…**, **Copy**, **Copy path**,
+  **Paste** (into a folder or the current directory), **New folder…**, **Delete…**
+  and **Refresh**. Delete confirms first and removes non-empty directories
+  recursively. **Copy path** uses the system clipboard; remote **Copy**/**Paste**
+  streams a recursive duplicate with a unique `(copy)` name. The **Hidden**
+  toggle filters dotfiles client-side (default hidden, per session). Operations
+  confirm in a dialog, run off the UI thread, report progress and refresh the
+  listing on completion.
+- **SFTP reconnect** reopens only the SFTP channel/subsystem on the existing SSH
+  connection and then resolves the home directory again. It is available both in
+  the toolbar and in the unavailable state; the terminal is never disconnected.
+  If the server had no SFTP subsystem at login, this is the way to retry.
+- **Open in local editor** downloads the selected file to a unique
+  `rustterm-edit-<pid>-<nanos>` temp directory and launches the chosen editor
+  asynchronously. Save-watching/auto-upload is still V2.
+- The **Files** toggle in the tab bar, or the panel's **×**, hides the panel. Each
+  tab keeps its own directory. Servers without SFTP show a clear unavailable
   message; terminal I/O is never blocked by a slow listing. Symlinks are shown but
-  not followed, and the panel does not yet follow shell `cd` (see F26).
+  not followed, and the panel does not follow shell `cd` (see F26).
 - **Host key verification (F3)**: `known_hosts` checking via `russh-keys`. TOFU
 prompt for unknown hosts; *hard failure* (no bypass) for changed keys. Handles
 hashed `known_hosts` and missing `~/.ssh`.
@@ -365,7 +399,7 @@ Hardcoded `80x24` until the first `ui()` frame. Produces a small reflow on conne
 Read once per frame rather than per event.
 
 **F18 — Tests (B)**
-`terminal.rs` has unit tests for `bg_runs`, the colour mapping and the mouse encoding; `input.rs` has tests for the key encoding incl. DECCKM; `sessions.rs` covers persistence, validation and profile defaults; `sftp.rs` covers path join/parent, sorting and human-readable size/age formatting. **36 tests**, run with `cargo test`. Still missing: automated tests for `ssh.rs` (public-key auth and the SFTP transport were verified with temporary russh-server probes, not committed tests).
+`terminal.rs` has unit tests for `bg_runs`, the colour mapping and the mouse encoding; `input.rs` has tests for the key encoding incl. DECCKM; `sessions.rs` covers persistence, validation and profile defaults; `sftp.rs` covers path join/parent, sorting, formatting, name validation, copy guard and editor resolution; `ssh.rs` covers `/etc/passwd` parsing and remote path joining. **42 tests**, run with `cargo test`. Still missing: automated network tests for public-key auth and the SFTP transport (both were verified with temporary russh-server probes, not committed tests).
 
 **F19 — Password storage / memory hygiene (B, mostly resolved)**
 Passwords are never written to `sessions.toml`. Opt-in keyring storage is
@@ -402,9 +436,11 @@ OSC 7 parsing (`Term::current_directory` is not exposed by alacritty_terminal
 0.24), so `cd` in the terminal does not move the panel. Automatic following will
 need either an OSC 7 hook in the VTE event stream or a periodic remote `pwd`
 query, plus a "follow / manual" mode so user navigation is not overridden.
-Other limits: no transfers yet, symlinks are displayed but not navigated, and a
-server that allows only one session channel will make SFTP unavailable while the
-terminal still works.
+Other limits: no general upload/download/drag & drop yet (copy and editor
+downloads use streaming helpers that transfers can reuse), symlinks are displayed
+but not navigated, and a server that allows only one session channel will make
+SFTP unavailable while the terminal still works. **Reconnect** can retry the SFTP
+channel in that case.
 
 ---
 
@@ -504,8 +540,21 @@ through a `pty` so the byte sequences can be injected.
   bundled russh 0.45 `examples/sftp_server.rs` predates 3.0 and still uses
   `#[async_trait]`; do not copy it verbatim.
 - `SftpSession` is not `Clone`; wrap it in `Arc` for spawned request tasks.
+  `russh::client::Handle` is also **not** `Clone`; the session thread keeps it in
+  an `Arc` so reconnect tasks can open channels.
 - No SFTP request may be awaited in `run_session`'s `select!` directly: spawn it,
   or a slow listing stalls terminal I/O.
+- `Metadata` is `FileAttributes`: `size`, `uid`, `user`, `gid`, `group`,
+  `permissions`, `atime`, `mtime` are all `Option`. `modified()` builds a
+  `SystemTime` from `mtime`.
+- `SftpSession::open`/`create` return a `File` that implements
+  `AsyncRead`/`AsyncWrite`; `close(self)` is async and consumes it. Use
+  `tokio::io::copy` then flush/close for streamed remote copies and downloads.
+- `SftpSession::symlink(target, link_path)` follows OpenSSH's reversed wire order
+  (the crate's parameter names are `path, target` but the first value is the
+  target). Verify against a real server before changing this.
+- `SftpSession::symlink_metadata` is the safe way to distinguish a symlink from
+  its target when walking a tree for recursive copy/delete.
 
 ---
 
@@ -525,35 +574,30 @@ through a `pty` so the byte sequences can be injected.
 6. **SFTP panel** ✅ done — `russh-sftp` on a second channel, per-tab directory
    listing, Home/Up/Refresh + editable path. Shell-cwd following is tracked as
    F26.
-7. **SFTP panel follow-ups** ← next
-   - **Reconnect** — a button (and an offer when a request fails) that reopens
-     only the SFTP channel/subsystem on the existing SSH connection, then restores
-     the current path. It must never tear down the terminal. If the SSH
-     connection itself is gone, use the session-level reconnect flow instead.
-   - **Right-click row menu** (also Menu key / Shift+F10): Open, Download…,
-     Upload here…, Rename…, Delete…, New folder, Copy, Paste, Copy path, Refresh.
-     Destructive actions confirm first; deleting a non-empty directory needs an
-     explicit recursive confirmation.
-   - **Open in local editor** — download the selected file to a temp path and
-     launch `$VISUAL` / `$EDITOR`, with presets for **Zed** and **gvim** and the
-     desktop default via `xdg-open`. Launch asynchronously; never block the UI.
-     Full save-watching/auto-upload stays in V2.
-   - **Show/hide hidden files** — a panel toggle (persisted per session, default
-     hidden) that filters dotfiles client-side and survives Refresh/navigation.
-   - **Copy / paste** — in-panel clipboard for remote paths and files. Bind
-     `Ctrl+C`/`Ctrl+V` only while the panel has focus so terminal keys are not
-     stolen; always offer the actions in the context menu. SFTP has no
-     server-side copy operation, so duplicating a file/directory requires a
-     read+write stream helper (or `cp -r` over an exec channel if allowed);
-     **Copy path** needs no I/O.
-   - **Owner + modified columns** — each row shows the owner and last-modified
-     date/time (plus size). `Metadata` exposes `uid`, `user`, `gid`, `group` and
-     `mtime`; OpenSSH usually omits `user`, so show the server-provided name when
-     present, otherwise the numeric UID or a cached `/etc/passwd` lookup fetched
-     once per session. Use a monospace, right-aligned timestamp column and keep
-     the name column flexible.
-8. **Transfers** — upload/download with progress bars; reuse the single-file
-   read/write primitives introduced by the context menu.
+7. **SFTP panel follow-ups** ✅ done.
+   - **Reconnect** — toolbar and unavailable-state buttons reopen only the
+     SFTP channel/subsystem on the existing SSH connection. The terminal is never
+     torn down; the home directory is resolved again after the swap.
+   - **Right-click row menu** — Open, Open in editor (default, Zed, gvim,
+     VS Code, desktop), Rename…, Copy, Copy path, Paste into this folder,
+     New folder…, Delete…, Refresh. Delete confirms first and removes non-empty
+     directories recursively. **Download…/Upload here…** remain in transfers.
+   - **Open in local editor** — unique temp download, then `$VISUAL`/`$EDITOR`,
+     Zed, gvim, VS Code or `xdg-open`, spawned asynchronously. No save watching.
+   - **Show/hide hidden files** — per-session toggle, default hidden; filters
+     dotfiles client-side and survives Refresh/navigation. The selection is
+     cleared if it becomes hidden.
+   - **Copy / paste** — toolbar + context menu. SFTP has no server-side copy, so
+     files stream through `tokio::io::copy`; directories recurse; symlinks are
+     recreated with their original target; conflicts get `name (copy N)`.
+   - **Owner + modified columns** — each row shows owner and local
+     `YYYY-MM-DD HH:MM`. Owner precedence is cached `/etc/passwd`, then
+     `Metadata.user`, then UID. The footer carries path and size.
+   - Keyboard `Ctrl+C`/`Ctrl+V` were deliberately **not** bound in the panel;
+     terminal copy/paste must not be stolen. The toolbar/context menu are always
+     available.
+8. **Transfers** ← next — upload/download with progress bars, queue and drag &
+   drop; reuse the streaming read/write helpers from copy/editor download.
 
 ### V2
 
@@ -629,18 +673,32 @@ Limits (F26): the panel does not follow shell `cd` (no OSC 7), symlinks are not
 navigated, and transfers are not implemented. Manual GUI checklist in
 `USAGE.md` §14.
 
-**Step 6 — SFTP panel follow-ups.** ← next
-Reconnect (SFTP channel only), right-click row menu (delete, rename, new folder,
-download/upload, copy/paste, copy path, open in local editor), hidden-file
-toggle, and owner + modified columns. Details and acceptance notes are in §11;
-this step also introduces the single-file read/write primitives reused by
-transfers. Keep every operation off the terminal select loop and confirm
-destructive actions.
+**Step 6 — SFTP panel follow-ups.** ✅ done.
+`ssh.rs` now exposes `sftp_reconnect`, `sftp_rename`, `sftp_delete`,
+`sftp_create_dir`, `sftp_copy` and `sftp_fetch`, all returning
+`std::sync::mpsc::Receiver`s and waking egui. `SftpClient` owns the channel plus
+a lazy `/etc/passwd` owner cache; `SharedSftp` (`Arc<Mutex<Option<Arc<_>>>>`)
+allows reconnect to swap the channel while the terminal loop keeps running.
+`run_session` handles reconnect specially (it needs the shared `Arc<Handle>`) and
+spawns every other action. Copy/deletes use lstat-based recursion, stream files,
+recreate symlinks and clean up partial destinations.
 
-**Step 7 — Transfers.**
+`SftpExplorer` gained hidden-file filtering, a remote clipboard, dialogs
+(rename/new folder/delete), an operation receiver with progress labels,
+editor launch, exact timestamp formatting, and testable name/copy guards.
+`app.rs` draws two-line rows (name + owner/timestamp), the extra toolbar, row
+context menus and the modal dialogs. `chrono` was added for local timestamps.
+
+Verified with **42 tests** (both feature sets), clippy `-D warnings`, fmt and a
+release build. GUI file-operation probing against a live server is still in the
+manual checklist (`USAGE.md` §14), including recursive delete, copy of files and
+folders, symlink copy, hidden filtering, editor launch and reconnect.
+
+**Step 7 — Transfers.** ← next
 Upload/download over the existing `SftpSession`, with progress reporting, a
-transfer queue, and drag & drop. Runs off the terminal select loop like the
-existing SFTP requests.
+transfer queue, and drag & drop. Reuse the streaming read/write helpers from
+copy/editor download. Runs off the terminal select loop like the existing SFTP
+requests.
 
 ### Working agreement — direct repo access
 
@@ -707,10 +765,11 @@ sudo update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
 ## 15. Git status
 
 Tabs + F1 + F2 + F3 + F4 + F5 + F7 + F8 + F9, saved profiles, keyring
-passwords, public-key/agent auth and the SFTP panel have landed on the `feat-tabs`
-branch. The SFTP step (`src/sftp.rs` + `ssh.rs`/`app.rs` wiring, `russh-sftp`
-dependency) is implemented and verified but may still be uncommitted — check
-`git status`.
+passwords, public-key/agent auth, the SFTP panel and its follow-up operations
+have landed on `main`. Reconnect, file operations, hidden filtering, copy/paste,
+open-in-editor and owner/modified rows are implemented and verified with tests;
+GUI file-operation testing against a live server is still pending. Check
+`git status` before starting the transfers step.
 
 Before pushing:
 
@@ -745,8 +804,8 @@ Maintained by the assistant. Update after each successful `cargo build`.
 | Keyring passwords (F19) | `secrets.rs` (new), `sessions.rs`, `app.rs`, `main.rs`, `Cargo.toml` | `secrets::{save,load,delete}`, `SessionProfile::save_password`, `save_profile_ui`, keyring 4.2 behind `keyring-secrets` | ✅ done (default + lean builds; 29 tests each; keyring flow verified on GNOME Keyring) |
 | Public-key / agent auth | `ssh.rs`, `app.rs`, `sessions.rs` | `SshConfig::{use_key,key_path,use_agent}`, `authenticate()`, `authenticate_with_agent()`, `key_candidates()`, `expand_tilde()`, `SessionProfile::{use_key,key_path,use_agent}` | ✅ done (31 tests; file key + agent + password verified against a temporary russh server; GUI-unverified) |
 | SFTP panel | `sftp.rs` (new), `ssh.rs`, `app.rs`, `main.rs`, `Cargo.toml` | `SshSession::{sftp_unavailable,sftp_home,sftp_list}`, `RemoteEntry`, `SftpExplorer::{start,poll,load_home,navigate,refresh,up,selected_entry}`, `join_path`, `parent_path`, `sort_entries`, `format_size`, `format_age`, `RustTermApp::sftp_ui`, `show_sftp` | ✅ done (36 tests; transport verified against a temporary in-process russh SFTP server; GUI-unverified) |
-| Next: SFTP follow-ups | `sftp.rs`, `ssh.rs`, `app.rs`, `Cargo.toml` | TBD — reconnect, right-click menu, open-in-editor, hidden toggle, copy/paste, owner + mtime columns | ⏳ pending |
-| Then: transfers | `ssh.rs`, `sftp.rs`, `app.rs` | TBD — upload/download, progress, queue, drag & drop | ⏳ pending |
+| SFTP follow-ups | `sftp.rs`, `ssh.rs`, `app.rs`, `Cargo.toml` | `SshSession::{sftp_reconnect,sftp_rename,sftp_delete,sftp_create_dir,sftp_copy,sftp_fetch}`, `SftpClient`, `SharedSftp`, `RemoteEntry::owner`, `SftpExplorer::{reconnect,copy_entry,paste,paste_into,begin_rename,begin_delete,begin_new_folder,begin_new_folder_in,submit_dialog,open_in_editor}`, `SftpDialog`, `EditorChoice`, `format_timestamp`, `RustTermApp::{sftp_ui,sftp_dialogs_ui}`, `chrono` | ✅ done (42 tests both feature sets; clippy/fmt/release clean; GUI-unverified) |
+| Next: transfers | `ssh.rs`, `sftp.rs`, `app.rs` | TBD — upload/download, progress, queue, drag & drop | ⏳ pending |
 ⚙
 
 ---

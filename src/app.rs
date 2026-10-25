@@ -28,8 +28,11 @@ use eframe::egui;
 use crate::input;
 use crate::secrets;
 use crate::sessions::{SessionProfile, SessionStore};
-use crate::sftp::{format_age, format_size, join_path, SftpExplorer};
-use crate::ssh::{HostKeyPrompt, SshConfig, SshSession, Wake};
+use crate::sftp::{
+    format_age, format_owner, format_size, format_timestamp, join_path, EditorChoice,
+    SftpDialogKind, SftpExplorer,
+};
+use crate::ssh::{HostKeyPrompt, RemoteEntry, SshConfig, SshSession, Wake};
 use crate::terminal::{TermAction, TerminalView};
 
 const NEW_SESSION_TAB: usize = 0;
@@ -862,8 +865,21 @@ impl RustTermApp {
             ui.add_space(4.0);
             ui.colored_label(ui.visuals().warn_fg_color, "SFTP is unavailable");
             ui.label(reason);
-        } else {
             ui.horizontal(|ui| {
+                if ui
+                    .button("Reconnect SFTP")
+                    .on_hover_text("Open a fresh SFTP channel; the terminal stays connected")
+                    .clicked()
+                {
+                    explorer.reconnect(ssh);
+                    activity = true;
+                }
+                if explorer.loading {
+                    ui.spinner();
+                }
+            });
+        } else {
+            ui.horizontal_wrapped(|ui| {
                 if ui
                     .button("Home")
                     .on_hover_text("Go to the login directory")
@@ -881,16 +897,78 @@ impl RustTermApp {
                     explorer.refresh(ssh);
                     activity = true;
                 }
+                ui.separator();
+                if ui
+                    .button("New folder")
+                    .on_hover_text("Create a folder in the current directory")
+                    .clicked()
+                {
+                    explorer.begin_new_folder();
+                    activity = true;
+                }
+
+                let selected = explorer.selected_entry().cloned();
+                let can_copy = selected.is_some() && !explorer.is_busy();
+                if ui
+                    .add_enabled(can_copy, egui::Button::new("Copy"))
+                    .on_hover_text("Copy the selected entry for Paste")
+                    .clicked()
+                {
+                    if let Some(entry) = &selected {
+                        explorer.copy_entry(entry);
+                    }
+                    activity = true;
+                }
+                let can_paste = explorer.clipboard.is_some() && !explorer.is_busy();
+                if ui
+                    .add_enabled(can_paste, egui::Button::new("Paste"))
+                    .on_hover_text("Duplicate the copied entry in this directory")
+                    .clicked()
+                {
+                    explorer.paste(ssh);
+                    activity = true;
+                }
+
+                if ui
+                    .selectable_label(explorer.show_hidden, "Hidden")
+                    .on_hover_text("Show or hide dotfiles")
+                    .clicked()
+                {
+                    explorer.show_hidden = !explorer.show_hidden;
+                    if !explorer.show_hidden
+                        && explorer
+                            .selected_entry()
+                            .is_some_and(|entry| entry.name.starts_with('.'))
+                    {
+                        explorer.selected = None;
+                    }
+                    activity = true;
+                }
+                if ui
+                    .button("Reconnect")
+                    .on_hover_text("Open a fresh SFTP channel; the terminal stays connected")
+                    .clicked()
+                {
+                    explorer.reconnect(ssh);
+                    activity = true;
+                }
                 if explorer.loading {
                     ui.spinner();
                 }
             });
 
+            if let Some(label) = explorer.busy_label() {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.weak(label);
+                });
+            }
+
             ui.horizontal(|ui| {
                 ui.label("Path:");
                 let edit = ui.add(
                     egui::TextEdit::singleline(&mut explorer.path_edit)
-                        .desired_width(ui.available_width())
+                        .desired_width((ui.available_width() - 46.0).max(80.0))
                         .hint_text("Remote path"),
                 );
                 if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
@@ -898,40 +976,62 @@ impl RustTermApp {
                     explorer.navigate(ssh, path);
                     activity = true;
                 }
-            });
-
-            ui.horizontal(|ui| {
                 if ui.button("Go").clicked() {
                     let path = explorer.path_edit.clone();
                     explorer.navigate(ssh, path);
                     activity = true;
                 }
-                if explorer.loading {
-                    ui.weak("Loading…");
-                }
             });
 
+            if let Some(notice) = &explorer.notice {
+                ui.colored_label(ui.visuals().hyperlink_color, notice);
+            }
             if let Some(err) = &explorer.error {
                 ui.colored_label(ui.visuals().error_fg_color, err);
             }
 
             ui.separator();
 
-            let mut open: Option<String> = None;
+            // `RowAction` is applied after the row loop: the menu closures
+            // cannot borrow the explorer mutably while the list is iterated.
+            enum RowAction {
+                Navigate(String),
+                Edit(RemoteEntry, EditorChoice),
+                Rename(RemoteEntry),
+                Delete(RemoteEntry),
+                Copy(RemoteEntry),
+                Paste(String),
+                NewFolder(Option<String>),
+                Refresh,
+            }
+            let mut row_action: Option<RowAction> = None;
+            let has_clipboard = explorer.clipboard.is_some();
+
             // Leave room for the footer; without this the scroll area eats the
             // whole panel and the selected-path line is clipped.
-            let list_height = (ui.available_height() - 46.0).max(80.0);
+            let list_height = (ui.available_height() - 74.0).max(80.0);
             egui::ScrollArea::vertical()
                 .id_salt(("sftp_entries", index))
                 .auto_shrink([false, false])
                 .max_height(list_height)
                 .show(ui, |ui| {
-                    if explorer.entries.is_empty() && !explorer.loading && explorer.error.is_none()
-                    {
-                        ui.weak("This directory is empty.");
+                    let visible_count = explorer
+                        .entries
+                        .iter()
+                        .filter(|entry| explorer.show_hidden || !entry.name.starts_with('.'))
+                        .count();
+                    if visible_count == 0 && !explorer.loading && explorer.error.is_none() {
+                        if explorer.entries.is_empty() {
+                            ui.weak("This directory is empty.");
+                        } else {
+                            ui.weak("Only hidden files here — enable Hidden to show them.");
+                        }
                     }
 
                     for (i, entry) in explorer.entries.iter().enumerate() {
+                        if !explorer.show_hidden && entry.name.starts_with('.') {
+                            continue;
+                        }
                         let icon = if entry.is_dir {
                             "📁"
                         } else if entry.is_symlink {
@@ -942,13 +1042,18 @@ impl RustTermApp {
                         let path = join_path(&explorer.listed_path, &entry.name);
                         let response = ui.selectable_label(
                             explorer.selected == Some(i),
-                            format!("{icon} {}", entry.name),
+                            format!(
+                                "{icon} {}\n   {} · {}",
+                                entry.name,
+                                format_owner(entry),
+                                format_timestamp(entry.modified)
+                            ),
                         );
                         if response.clicked() {
                             explorer.selected = Some(i);
                             activity = true;
                             if entry.is_dir {
-                                open = Some(path.clone());
+                                row_action = Some(RowAction::Navigate(path.clone()));
                             }
                         }
 
@@ -961,20 +1066,110 @@ impl RustTermApp {
                         if entry.is_symlink {
                             details.push_str(" · symlink");
                         }
+                        details.push_str(&format!(
+                            "\nowner {} · modified {}",
+                            format_owner(entry),
+                            format_timestamp(entry.modified)
+                        ));
                         if let Some(modified) = entry.modified {
-                            details.push_str(&format!("\nmodified {}", format_age(modified)));
+                            details.push_str(&format!("\n{}", format_age(modified)));
                         }
-                        response.on_hover_text(details);
+                        response.clone().on_hover_text(details);
+
+                        response.context_menu(|ui| {
+                            ui.label(egui::RichText::new(&entry.name).strong());
+                            if entry.is_dir {
+                                if ui.button("Open").clicked() {
+                                    row_action = Some(RowAction::Navigate(entry.path.clone()));
+                                    ui.close_menu();
+                                }
+                            } else {
+                                if ui.button("Open in default editor").clicked() {
+                                    row_action =
+                                        Some(RowAction::Edit(entry.clone(), EditorChoice::Default));
+                                    ui.close_menu();
+                                }
+                            }
+                            ui.menu_button("Open in editor", |ui| {
+                                for choice in EditorChoice::ALL {
+                                    if ui.button(choice.label()).clicked() {
+                                        row_action = Some(RowAction::Edit(entry.clone(), choice));
+                                        ui.close_menu();
+                                    }
+                                }
+                            });
+                            ui.separator();
+                            if ui.button("Rename…").clicked() {
+                                row_action = Some(RowAction::Rename(entry.clone()));
+                                ui.close_menu();
+                            }
+                            if ui.button("Copy").clicked() {
+                                row_action = Some(RowAction::Copy(entry.clone()));
+                                ui.close_menu();
+                            }
+                            if ui.button("Copy path").clicked() {
+                                ui.ctx().copy_text(entry.path.clone());
+                                ui.close_menu();
+                            }
+                            if entry.is_dir
+                                && has_clipboard
+                                && ui.button("Paste into this folder").clicked()
+                            {
+                                row_action = Some(RowAction::Paste(entry.path.clone()));
+                                ui.close_menu();
+                            }
+                            if ui.button("New folder…").clicked() {
+                                row_action = Some(RowAction::NewFolder(
+                                    entry.is_dir.then(|| entry.path.clone()),
+                                ));
+                                ui.close_menu();
+                            }
+                            ui.separator();
+                            if ui.button("Delete…").clicked() {
+                                row_action = Some(RowAction::Delete(entry.clone()));
+                                ui.close_menu();
+                            }
+                            if ui.button("Refresh").clicked() {
+                                row_action = Some(RowAction::Refresh);
+                                ui.close_menu();
+                            }
+                        });
                     }
                 });
 
-            // Navigate after the row loop: `navigate` needs the explorer mutably.
-            if let Some(path) = open {
-                explorer.navigate(ssh, path);
+            if let Some(action) = row_action {
+                match action {
+                    RowAction::Navigate(path) => explorer.navigate(ssh, path),
+                    RowAction::Edit(entry, editor) => {
+                        explorer.open_in_editor(ssh, &entry, editor);
+                    }
+                    RowAction::Rename(entry) => {
+                        explorer.begin_rename(&entry);
+                    }
+                    RowAction::Delete(entry) => {
+                        explorer.begin_delete(&entry);
+                    }
+                    RowAction::Copy(entry) => {
+                        explorer.copy_entry(&entry);
+                    }
+                    RowAction::Paste(path) => {
+                        explorer.paste_into(ssh, path);
+                    }
+                    RowAction::NewFolder(parent) => match parent {
+                        Some(parent) => {
+                            explorer.begin_new_folder_in(parent);
+                        }
+                        None => {
+                            explorer.begin_new_folder();
+                        }
+                    },
+                    RowAction::Refresh => explorer.refresh(ssh),
+                }
+                activity = true;
             }
 
             ui.separator();
-            match explorer.selected_entry() {
+            match explorer.selected_entry().cloned() {
                 Some(entry) => {
                     ui.add(
                         egui::Label::new(egui::RichText::new(&entry.path).monospace()).truncate(),
@@ -987,10 +1182,22 @@ impl RustTermApp {
                     if entry.is_symlink {
                         details.push_str(" · symlink");
                     }
-                    if let Some(modified) = entry.modified {
-                        details.push_str(&format!(" · {}", format_age(modified)));
-                    }
+                    details.push_str(&format!(
+                        " · {} · {}",
+                        format_owner(&entry),
+                        format_timestamp(entry.modified)
+                    ));
                     ui.weak(details);
+                    ui.horizontal(|ui| {
+                        if ui.small_button("Rename").clicked() {
+                            explorer.begin_rename(&entry);
+                            activity = true;
+                        }
+                        if ui.small_button("Delete").clicked() {
+                            explorer.begin_delete(&entry);
+                            activity = true;
+                        }
+                    });
                 }
                 None => {
                     ui.weak(format!("{} entries", explorer.entries.len()));
@@ -1002,6 +1209,111 @@ impl RustTermApp {
             self.show_sftp = false;
         }
         activity || hide
+    }
+
+    /// Render rename / new-folder / delete dialogs for the active session.
+    fn sftp_dialogs_ui(&mut self, ctx: &egui::Context, index: usize) -> bool {
+        let Some(session) = self.sessions.get_mut(index) else {
+            return false;
+        };
+        let (ssh, explorer) = (&session.ssh, &mut session.sftp);
+        let Some(dialog) = explorer.dialog.as_mut() else {
+            return false;
+        };
+
+        let mut submit = false;
+        let mut cancel = false;
+        let mut open = true;
+        let kind = dialog.kind.clone();
+
+        let title = match &kind {
+            SftpDialogKind::Rename { .. } => "Rename",
+            SftpDialogKind::NewFolder { .. } => "New folder",
+            SftpDialogKind::Delete { .. } => "Delete",
+        };
+        egui::Window::new(title)
+            .id(egui::Id::new(("sftp_dialog", index)))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .open(&mut open)
+            .show(ctx, |ui| match &kind {
+                SftpDialogKind::Rename { .. } => {
+                    ui.label("New name:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut dialog.name)
+                            .desired_width(260.0)
+                            .hint_text("File or folder name"),
+                    );
+                    if let Some(err) = &dialog.error {
+                        ui.colored_label(ui.visuals().error_fg_color, err);
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Rename").clicked() {
+                            submit = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                }
+                SftpDialogKind::NewFolder { parent } => {
+                    ui.label("Folder name:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut dialog.name)
+                            .desired_width(260.0)
+                            .hint_text("New folder"),
+                    );
+                    ui.weak(format!("In {parent}"));
+                    if let Some(err) = &dialog.error {
+                        ui.colored_label(ui.visuals().error_fg_color, err);
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Create").clicked() {
+                            submit = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                }
+                SftpDialogKind::Delete { path, name, is_dir } => {
+                    if *is_dir {
+                        ui.label(format!("Delete folder '{name}'?"));
+                        ui.colored_label(
+                            ui.visuals().warn_fg_color,
+                            "Everything inside it will be deleted too.",
+                        );
+                    } else {
+                        ui.label(format!("Delete file '{name}'?"));
+                    }
+                    ui.add(egui::Label::new(egui::RichText::new(path).monospace()).truncate());
+                    if let Some(err) = &dialog.error {
+                        ui.colored_label(ui.visuals().error_fg_color, err);
+                    }
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button(
+                                egui::RichText::new("Delete").color(ui.visuals().error_fg_color),
+                            )
+                            .clicked()
+                        {
+                            submit = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                }
+            });
+
+        if cancel || !open {
+            return explorer.cancel_dialog();
+        }
+        if submit {
+            return explorer.submit_dialog(ssh);
+        }
+        false
     }
 
     /// Render one session.
@@ -1149,6 +1461,7 @@ impl eframe::App for RustTermApp {
                         .show(ctx, |ui| {
                             activity |= self.sftp_ui(ui, idx);
                         });
+                    activity |= self.sftp_dialogs_ui(ctx, idx);
                 }
             }
         }

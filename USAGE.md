@@ -531,3 +531,9 @@ and a shell you can type into.
       stays where it was until you navigate/refresh manually.
 - [ ] **Teardown**: close the tab with the panel open, and disconnect via
       **Disconnect** → no crash, no stuck thread.
+
+**Planned (not implemented yet):** SFTP reconnect; right-click row menu for
+delete/rename/new folder/download/upload/copy/paste/copy path; **Open in local
+editor** (Zed, gvim, `$VISUAL`/`$EDITOR`, `xdg-open`); show/hide hidden files;
+and owner + last-modified columns on each row. The checklist for these will be
+added here as they land; the design notes live in `handoff.md` §11.

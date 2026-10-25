@@ -473,3 +473,61 @@ Setup: a local sshd with `PubkeyAuthentication yes`, plus
       `use_agent` and still **no key contents or passphrase**.
 - [ ] **Legacy profile**: a profile file without the new fields loads with both
       options off and connects with a password.
+
+---
+
+## 14. SFTP side panel — [U]
+
+**How:** after a successful connection, a **Remote files** panel appears on the
+left. It opens at the remote login directory (`canonicalize(".")`, usually `$HOME`).
+The **Files** toggle in the tab bar (next to the session tabs) shows/hides it, and
+the panel's **×** hides it too. Each tab keeps its own directory.
+
+- Entries are sorted **directories first**, then case-insensitive name. `📁` is a
+  directory, `📄` a regular file, `🔗` a symlink (displayed but not followed yet).
+- Click a **directory** to enter it. Click a **file** to select it; the footer
+  shows its full path, size and age. Hovering any row shows the same details.
+- **Home** returns to the login directory, **Up** goes to the parent (stops at
+  `/`), **Refresh** re-lists the current directory.
+- Type a remote path in the **Path** box and press **Enter** (or click **Go**).
+  Relative paths are resolved by the server against the login directory.
+- If the SSH server has no SFTP subsystem, the panel says **SFTP is unavailable**
+  and shows the reason. The terminal is unaffected.
+- **Limitation:** the panel does **not** follow `cd` in the shell yet (handoff
+  F26). Use **Refresh**/the path box to change directory. Transfers are not
+  implemented yet.
+
+**Verify**
+
+Setup: any server with `Subsystem sftp ...` enabled (the normal OpenSSH default),
+and a shell you can type into.
+
+- [ ] **Appears**: connect → the left panel lists the login directory; compare
+      with `pwd` / `ls -la` in the terminal.
+- [ ] **Sorting**: directories come first; names are case-insensitive
+      alphabetical within each group.
+- [ ] **Navigate**: click a directory → path and listing update. **Up** returns to
+      the parent. **Home** returns to the login directory.
+- [ ] **Path box**: type `/tmp` + **Enter** → `/tmp` is listed; repeat with **Go**.
+      Type a bogus path → red error, previous listing stays usable.
+- [ ] **Refresh**: `touch /tmp/rt-new-file` in the terminal, press **Refresh** in
+      `/tmp` → the new file appears.
+- [ ] **Select**: click a file → footer shows its path, human-readable size and
+      relative age; hover a row shows the same details.
+- [ ] **Toggle**: **Files** hides the panel; click again to show it. The panel
+      **×** also hides it. Switching tabs shows the other tab's directory, and
+      switching back restores the first tab's directory.
+- [ ] **Background tab**: navigate tab A to `/tmp`, switch to tab B and run some
+      output, switch back → tab A is still in `/tmp` and its listing is intact.
+- [ ] **Responsiveness**: navigate to a very large directory (e.g. `/usr/bin`) and
+      keep typing in the terminal → keystrokes echo while the listing loads; the
+      terminal never freezes.
+- [ ] **Unavailable**: connect to a server without the SFTP subsystem (or one that
+      refuses a second channel) → **SFTP is unavailable** with a reason; the
+      terminal still works and `cargo run` does not panic.
+- [ ] **Symlink**: create `ln -s /etc /tmp/rt-link` and list `/tmp` → the link is
+      shown with `🔗`; clicking it selects it (it does not navigate).
+- [ ] **No auto-follow (expected)**: `cd /var/log` in the terminal → the panel
+      stays where it was until you navigate/refresh manually.
+- [ ] **Teardown**: close the tab with the panel open, and disconnect via
+      **Disconnect** → no crash, no stuck thread.

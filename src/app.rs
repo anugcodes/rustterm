@@ -1,4 +1,4 @@
-//! Application shell: tab bar, connect form, terminal views.
+//! Application shell: tab bar, connect form, terminal views and SFTP panel.
 //!
 //! Tabs: index 0 is *always* the "New Session" form; connected sessions live
 //! at indices 1..N. Only one connect attempt may be in flight at a time.
@@ -28,6 +28,7 @@ use eframe::egui;
 use crate::input;
 use crate::secrets;
 use crate::sessions::{SessionProfile, SessionStore};
+use crate::sftp::{format_age, format_size, join_path, SftpExplorer};
 use crate::ssh::{HostKeyPrompt, SshConfig, SshSession, Wake};
 use crate::terminal::{TermAction, TerminalView};
 
@@ -59,6 +60,8 @@ pub struct RustTermApp {
     /// Highlighted entry in the saved-session list.
     selected_profile: Option<usize>,
     status: StatusMessage,
+    /// Whether the SFTP side panel is shown for connected sessions.
+    show_sftp: bool,
 }
 
 /// One line of user feedback below the connect form.
@@ -72,6 +75,8 @@ struct ActiveSession {
     title: String,
     ssh: SshSession,
     terminal: TerminalView,
+    /// Per-session remote file browser. Each tab keeps its own directory.
+    sftp: SftpExplorer,
     /// Set once so the terminal takes focus on first appearance.
     focus_requested: bool,
 }
@@ -134,6 +139,7 @@ impl Default for RustTermApp {
             profile_name: String::new(),
             selected_profile: None,
             status,
+            show_sftp: true,
         }
     }
 }
@@ -261,10 +267,13 @@ impl RustTermApp {
             Polled::Ready(Ok(ssh)) => {
                 let state = self.connecting.take().expect("checked above");
                 let input_tx = ssh.input_sender();
+                // Resolve the remote home before `ssh` is moved into the session.
+                let sftp = SftpExplorer::start(&ssh);
                 self.sessions.push(ActiveSession {
                     title: state.label,
                     ssh,
                     terminal: TerminalView::new(DEFAULT_COLS, DEFAULT_ROWS, input_tx),
+                    sftp,
                     focus_requested: false,
                 });
                 // New session is the last tab; make it active.
@@ -372,6 +381,11 @@ impl RustTermApp {
         let mut budget = MAX_OUTPUT_PER_FRAME;
 
         for session in &mut self.sessions {
+            // SFTP replies arrive asynchronously; polling them for every tab
+            // keeps a listing ready even if the sidebar is currently hidden.
+            if session.sftp.poll(&session.ssh) {
+                activity = true;
+            }
             while budget > 0 {
                 let Some(chunk) = session.ssh.try_read() else {
                     break;
@@ -401,36 +415,51 @@ impl RustTermApp {
         let mut switch_to: Option<usize> = None;
         let mut close: Option<usize> = None;
 
-        egui::ScrollArea::horizontal()
-            .id_salt("tab_bar_scroll")
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    // New Session — always first, never closable.
-                    if ui
-                        .selectable_label(self.active == NEW_SESSION_TAB, "＋ New Session")
-                        .clicked()
-                    {
-                        switch_to = Some(NEW_SESSION_TAB);
-                    }
+        ui.horizontal(|ui| {
+            // Keep the Files toggle outside the scroll area so a long tab list
+            // cannot hide it.
+            if self.active != NEW_SESSION_TAB {
+                if ui
+                    .selectable_label(self.show_sftp, "Files")
+                    .on_hover_text("Show or hide the remote file panel")
+                    .clicked()
+                {
+                    self.show_sftp = !self.show_sftp;
+                }
+                ui.separator();
+            }
 
-                    for (i, s) in self.sessions.iter().enumerate() {
-                        let tab_index = i + 1;
-                        let selected = self.active == tab_index;
-                        ui.horizontal(|ui| {
-                            if ui.selectable_label(selected, &s.title).clicked() {
-                                switch_to = Some(tab_index);
-                            }
-                            if ui
-                                .small_button("×")
-                                .on_hover_text("Close session")
-                                .clicked()
-                            {
-                                close = Some(i);
-                            }
-                        });
-                    }
+            egui::ScrollArea::horizontal()
+                .id_salt("tab_bar_scroll")
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        // New Session — always first, never closable.
+                        if ui
+                            .selectable_label(self.active == NEW_SESSION_TAB, "＋ New Session")
+                            .clicked()
+                        {
+                            switch_to = Some(NEW_SESSION_TAB);
+                        }
+
+                        for (i, s) in self.sessions.iter().enumerate() {
+                            let tab_index = i + 1;
+                            let selected = self.active == tab_index;
+                            ui.horizontal(|ui| {
+                                if ui.selectable_label(selected, &s.title).clicked() {
+                                    switch_to = Some(tab_index);
+                                }
+                                if ui
+                                    .small_button("×")
+                                    .on_hover_text("Close session")
+                                    .clicked()
+                                {
+                                    close = Some(i);
+                                }
+                            });
+                        }
+                    });
                 });
-            });
+        });
 
         if let Some(tab) = switch_to {
             if tab != self.active {
@@ -802,6 +831,179 @@ impl RustTermApp {
         self.saved_sessions_ui(ui);
     }
 
+    /// Render the remote file browser for one session.
+    ///
+    /// Returns `true` when the panel started a request, changed selection or was
+    /// hidden, so the caller can request another frame.
+    fn sftp_ui(&mut self, ui: &mut egui::Ui, index: usize) -> bool {
+        let Some(session) = self.sessions.get_mut(index) else {
+            return false;
+        };
+        // Split the borrow: the explorer mutates while the session only answers
+        // requests.
+        let (ssh, explorer) = (&session.ssh, &mut session.sftp);
+        let mut activity = false;
+        let mut hide = false;
+
+        ui.horizontal(|ui| {
+            ui.heading("Remote files");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .small_button("×")
+                    .on_hover_text("Hide the file panel")
+                    .clicked()
+                {
+                    hide = true;
+                }
+            });
+        });
+
+        if let Some(reason) = explorer.unavailable.clone() {
+            ui.add_space(4.0);
+            ui.colored_label(ui.visuals().warn_fg_color, "SFTP is unavailable");
+            ui.label(reason);
+        } else {
+            ui.horizontal(|ui| {
+                if ui
+                    .button("Home")
+                    .on_hover_text("Go to the login directory")
+                    .clicked()
+                {
+                    explorer.load_home(ssh);
+                    activity = true;
+                }
+                let can_up = !explorer.current.is_empty() && explorer.current != "/";
+                if ui.add_enabled(can_up, egui::Button::new("Up")).clicked() {
+                    explorer.up(ssh);
+                    activity = true;
+                }
+                if ui.button("Refresh").clicked() {
+                    explorer.refresh(ssh);
+                    activity = true;
+                }
+                if explorer.loading {
+                    ui.spinner();
+                }
+            });
+
+            ui.horizontal(|ui| {
+                ui.label("Path:");
+                let edit = ui.add(
+                    egui::TextEdit::singleline(&mut explorer.path_edit)
+                        .desired_width(ui.available_width())
+                        .hint_text("Remote path"),
+                );
+                if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    let path = explorer.path_edit.clone();
+                    explorer.navigate(ssh, path);
+                    activity = true;
+                }
+            });
+
+            ui.horizontal(|ui| {
+                if ui.button("Go").clicked() {
+                    let path = explorer.path_edit.clone();
+                    explorer.navigate(ssh, path);
+                    activity = true;
+                }
+                if explorer.loading {
+                    ui.weak("Loading…");
+                }
+            });
+
+            if let Some(err) = &explorer.error {
+                ui.colored_label(ui.visuals().error_fg_color, err);
+            }
+
+            ui.separator();
+
+            let mut open: Option<String> = None;
+            // Leave room for the footer; without this the scroll area eats the
+            // whole panel and the selected-path line is clipped.
+            let list_height = (ui.available_height() - 46.0).max(80.0);
+            egui::ScrollArea::vertical()
+                .id_salt(("sftp_entries", index))
+                .auto_shrink([false, false])
+                .max_height(list_height)
+                .show(ui, |ui| {
+                    if explorer.entries.is_empty() && !explorer.loading && explorer.error.is_none()
+                    {
+                        ui.weak("This directory is empty.");
+                    }
+
+                    for (i, entry) in explorer.entries.iter().enumerate() {
+                        let icon = if entry.is_dir {
+                            "📁"
+                        } else if entry.is_symlink {
+                            "🔗"
+                        } else {
+                            "📄"
+                        };
+                        let path = join_path(&explorer.listed_path, &entry.name);
+                        let response = ui.selectable_label(
+                            explorer.selected == Some(i),
+                            format!("{icon} {}", entry.name),
+                        );
+                        if response.clicked() {
+                            explorer.selected = Some(i);
+                            activity = true;
+                            if entry.is_dir {
+                                open = Some(path.clone());
+                            }
+                        }
+
+                        let mut details = path;
+                        if entry.is_dir {
+                            details.push_str("\ndirectory");
+                        } else {
+                            details.push_str(&format!("\n{}", format_size(entry.size)));
+                        }
+                        if entry.is_symlink {
+                            details.push_str(" · symlink");
+                        }
+                        if let Some(modified) = entry.modified {
+                            details.push_str(&format!("\nmodified {}", format_age(modified)));
+                        }
+                        response.on_hover_text(details);
+                    }
+                });
+
+            // Navigate after the row loop: `navigate` needs the explorer mutably.
+            if let Some(path) = open {
+                explorer.navigate(ssh, path);
+            }
+
+            ui.separator();
+            match explorer.selected_entry() {
+                Some(entry) => {
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(&entry.path).monospace()).truncate(),
+                    );
+                    let mut details = if entry.is_dir {
+                        "directory".to_string()
+                    } else {
+                        format_size(entry.size)
+                    };
+                    if entry.is_symlink {
+                        details.push_str(" · symlink");
+                    }
+                    if let Some(modified) = entry.modified {
+                        details.push_str(&format!(" · {}", format_age(modified)));
+                    }
+                    ui.weak(details);
+                }
+                None => {
+                    ui.weak(format!("{} entries", explorer.entries.len()));
+                }
+            }
+        }
+
+        if hide {
+            self.show_sftp = false;
+        }
+        activity || hide
+    }
+
     /// Render one session.
     ///
     /// Returns `(disconnect_clicked, had_activity)` — the caller closes the tab
@@ -933,6 +1135,23 @@ impl eframe::App for RustTermApp {
         egui::TopBottomPanel::top("tab_bar").show(ctx, |ui| {
             self.tabs_ui(ui);
         });
+
+        // The remote file panel belongs to the active session and sits left of
+        // the terminal. It must be declared before the central panel so egui can
+        // reserve its width.
+        if self.show_sftp {
+            if let Some(idx) = self.active.checked_sub(1) {
+                if idx < self.sessions.len() {
+                    egui::SidePanel::left("sftp_panel")
+                        .resizable(true)
+                        .default_width(300.0)
+                        .min_width(220.0)
+                        .show(ctx, |ui| {
+                            activity |= self.sftp_ui(ui, idx);
+                        });
+                }
+            }
+        }
 
         let mut disconnect_requested = false;
         egui::CentralPanel::default().show(ctx, |ui| {

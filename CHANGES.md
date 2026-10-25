@@ -365,3 +365,82 @@ dlopen of crates.
   only offer `ssh-rsa` will reject key auth. Password auth to those hosts still
   works (the legacy target uses a password).
 - GUI checklist still needs a manual pass (`USAGE.md` §13).
+
+---
+
+# Step: SFTP side panel
+
+## What changed
+
+**`Cargo.toml` / `Cargo.lock`**
+- Added `russh-sftp = "3.0"` (resolved to 3.0.1, same `russh` 0.45 line).
+
+**`src/ssh.rs`**
+- `connect_and_auth` now also opens a second session channel, requests the
+  `sftp` subsystem (`request_subsystem(true, "sftp")`), and builds an
+  `SftpSession` with a 10 s request timeout. SFTP failure is **non-fatal**: the
+  terminal connects, and `sftp_unavailable()` carries the reason for the panel.
+- `SshSession` gained `sftp_home()` / `sftp_list(path)`, both returning
+  `std::sync::mpsc::Receiver`s. A `Wake` callback fires when a reply is ready so
+  the panel repaints without polling.
+- `run_session` gained an SFTP request branch and `SessionIo` (a small struct for
+  the channel receivers/output sender, keeping clippy's argument limit happy).
+  Each request is `tokio::spawn`ed, so a slow `readdir` never blocks terminal
+  input/output.
+- New `RemoteEntry` (`name`, `path`, `is_dir`, `is_symlink`, `size`, `modified`)
+  filled from `DirEntry::metadata()`.
+
+**`src/sftp.rs` (new)**
+- `SftpExplorer`: current/editable path, entries, selection, loading/error/
+  unavailable state, and one in-flight `Job` (`Home` or `List`).
+- `start` resolves the home directory; `poll` drains the reply and starts the
+  first listing; `navigate`, `refresh`, `up`, `load_home` drive the panel.
+- `join_path`, `parent_path`, `sort_entries` (directories first, then
+  case-insensitive name), `format_size`, `format_age`.
+- Five unit tests for those helpers.
+
+**`src/app.rs`**
+- `ActiveSession` owns an `SftpExplorer`; `RustTermApp` owns `show_sftp`
+  (default on). `SftpExplorer::start(&ssh)` runs before `ssh` is moved into the
+  session.
+- `pump_sessions` polls SFTP for **every** tab (so a background tab's request
+  cannot stall) and feeds the result into the repaint flag.
+- A resizable `SidePanel::left("sftp_panel")` is drawn for the active session
+  when `show_sftp` is on: Home/Up/Refresh, path box + Enter/Go, spinner, error
+  text, scrollable listing, and a selected-path/size/age footer.
+- **Files** toggle in the tab bar (only when a session is active) and a **×** in
+  the panel hide it. Nothing blocks the UI thread.
+
+**`src/main.rs`**
+- Registered `mod sftp;`.
+
+## API findings
+
+- `russh-sftp` 3.0's `read_dir` loops `READDIR` until `StatusCode::Eof`. Its
+  server trait uses RPITIT (`fn … -> impl Future + Send`) unless the crate's
+  `async-trait` feature is enabled; the older russh-sftp server example that
+  still uses `#[async_trait]` does not compile against 3.0.
+- `SftpSession` is not `Clone`; requests run on `Arc<SftpSession>` inside the
+  session runtime.
+- `Metadata::modified()` returns `io::Result<SystemTime>` (not an `Option`), and
+  `FileType` exposes `is_dir()` / `is_symlink()`.
+
+## Verified
+
+- `cargo fmt --check` ✅
+- `cargo clippy --all-targets -- -D warnings` ✅
+- `cargo test` ✅ **36 passed**
+- End-to-end probe against a temporary in-process russh server with an SFTP
+  subsystem (probe deleted afterwards): `canonicalize(".")` → `/probe`;
+  `read_dir` returned `docs` (dir, 4096, mtime present) and `readme.txt` (file,
+  1234, mtime present) in the expected order.
+- GUI checklist still needs a manual pass against a real server (`USAGE.md` §14).
+
+## Known limits (F26)
+
+- The panel starts at the login home and does **not** follow shell `cd`; OSC 7
+  is not parsed and alacritty_terminal 0.24 does not expose the current
+  directory. Manual navigation only for now.
+- No upload/download yet; symlinks are displayed but not followed.
+- A server that permits only one session channel makes SFTP unavailable while
+  the terminal continues to work.

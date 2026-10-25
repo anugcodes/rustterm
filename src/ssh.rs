@@ -21,6 +21,7 @@ use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -32,6 +33,7 @@ use russh::keys::agent::client::AgentClient;
 use russh::keys::key::PublicKey;
 use russh::keys::{check_known_hosts, known_host_keys, learn_known_hosts, load_secret_key};
 use russh::{compression, Channel, ChannelMsg};
+use russh_sftp::client::{Config as SftpConfig, SftpSession};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 
@@ -96,6 +98,24 @@ pub struct SshSession {
     resize_tx: mpsc::UnboundedSender<(u16, u16)>,
     disconnect_tx: mpsc::UnboundedSender<()>,
     output_rx: std_mpsc::Receiver<Vec<u8>>,
+    /// Requests for the SFTP subsystem. Always present, even when SFTP failed
+    /// to open, so callers can still get a meaningful error.
+    sftp_tx: mpsc::UnboundedSender<SftpRequest>,
+    /// Why SFTP could not be opened, if it could not.
+    sftp_unavailable: Option<String>,
+    /// Wakes egui when an SFTP reply is ready.
+    wake: Option<Wake>,
+}
+
+/// One entry returned by the remote directory listing.
+#[derive(Debug, Clone)]
+pub struct RemoteEntry {
+    pub name: String,
+    pub path: String,
+    pub is_dir: bool,
+    pub is_symlink: bool,
+    pub size: u64,
+    pub modified: Option<SystemTime>,
 }
 
 impl SshSession {
@@ -115,7 +135,7 @@ impl SshSession {
             .build()
             .context("failed to build tokio runtime")?;
 
-        let (session, channel) = rt
+        let (session, channel, sftp, sftp_error) = rt
             .block_on(connect_and_auth(&config, prompt_tx))
             .with_context(|| {
                 format!("connect to {}@{}:{}", config.user, config.host, config.port)
@@ -125,6 +145,8 @@ impl SshSession {
         let (resize_tx, resize_rx) = mpsc::unbounded_channel::<(u16, u16)>();
         let (disconnect_tx, disconnect_rx) = mpsc::unbounded_channel::<()>();
         let (output_tx, output_rx) = std_mpsc::channel::<Vec<u8>>();
+        let (sftp_tx, sftp_rx) = mpsc::unbounded_channel::<SftpRequest>();
+        let session_wake = wake.clone();
 
         std::thread::Builder::new()
             .name(format!("ssh-{}@{}", config.user, config.host))
@@ -132,10 +154,14 @@ impl SshSession {
                 rt.block_on(run_session(
                     session,
                     channel,
-                    input_rx,
-                    resize_rx,
-                    disconnect_rx,
-                    output_tx,
+                    sftp,
+                    SessionIo {
+                        input_rx,
+                        resize_rx,
+                        disconnect_rx,
+                        sftp_rx,
+                        output_tx,
+                    },
                     wake,
                 ));
             })
@@ -146,7 +172,52 @@ impl SshSession {
             resize_tx,
             disconnect_tx,
             output_rx,
+            sftp_tx,
+            sftp_unavailable: sftp_error,
+            wake: session_wake,
         })
+    }
+
+    /// Why SFTP is unavailable for this connection, if it is.
+    pub fn sftp_unavailable(&self) -> Option<&str> {
+        self.sftp_unavailable.as_deref()
+    }
+
+    /// Ask the SFTP subsystem for the session's home directory (`.`).
+    pub fn sftp_home(&self) -> Option<std_mpsc::Receiver<Result<String, String>>> {
+        if self.sftp_unavailable.is_some() {
+            return None;
+        }
+        let (reply, rx) = std_mpsc::channel();
+        self.sftp_tx
+            .send(SftpRequest {
+                action: SftpAction::Home { reply },
+                wake: self.wake.clone(),
+            })
+            .ok()?;
+        Some(rx)
+    }
+
+    /// Ask for a directory listing. The reply arrives via std mpsc; egui is
+    /// woken when it is ready.
+    pub fn sftp_list(
+        &self,
+        path: &str,
+    ) -> Option<std_mpsc::Receiver<Result<Vec<RemoteEntry>, String>>> {
+        if self.sftp_unavailable.is_some() {
+            return None;
+        }
+        let (reply, rx) = std_mpsc::channel();
+        self.sftp_tx
+            .send(SftpRequest {
+                action: SftpAction::List {
+                    path: path.to_string(),
+                    reply,
+                },
+                wake: self.wake.clone(),
+            })
+            .ok()?;
+        Some(rx)
     }
 
     pub fn write(&self, bytes: Vec<u8>) {
@@ -213,7 +284,12 @@ fn client_config() -> client::Config {
 async fn connect_and_auth(
     config: &SshConfig,
     prompt_tx: Option<std_mpsc::Sender<HostKeyPrompt>>,
-) -> Result<(Handle<ClientHandler>, Channel<ClientMsg>)> {
+) -> Result<(
+    Handle<ClientHandler>,
+    Channel<ClientMsg>,
+    Option<SftpSession>,
+    Option<String>,
+)> {
     let ssh_config = Arc::new(client_config());
     let addr = (config.host.as_str(), config.port);
 
@@ -282,7 +358,39 @@ async fn connect_and_auth(
         .await
         .context("shell request rejected")?;
 
-    Ok((session, channel))
+    // SFTP is optional: a server may not provide the subsystem. Never fail the
+    // whole connection because of it — the terminal is the primary feature.
+    let (sftp, sftp_error) = match open_sftp(&session).await {
+        Ok(sftp) => (Some(sftp), None),
+        Err(err) => {
+            log::warn!("SFTP unavailable: {err}");
+            (None, Some(err))
+        }
+    };
+
+    Ok((session, channel, sftp, sftp_error))
+}
+
+/// Open a second channel and start the SFTP client handshake (`SSH_FXP_INIT`).
+async fn open_sftp(session: &Handle<ClientHandler>) -> Result<SftpSession, String> {
+    let channel = session
+        .channel_open_session()
+        .await
+        .map_err(|err| format!("could not open an SFTP channel: {err}"))?;
+    channel
+        .request_subsystem(true, "sftp")
+        .await
+        .map_err(|err| format!("could not request the SFTP subsystem: {err}"))?;
+
+    SftpSession::new_with_config(
+        channel.into_stream(),
+        SftpConfig {
+            request_timeout_secs: 10,
+            ..SftpConfig::default()
+        },
+    )
+    .await
+    .map_err(|err| format!("SFTP handshake failed: {err}"))
 }
 
 /// Authenticate in the same order `ssh` users expect: key file(s), then
@@ -428,15 +536,32 @@ fn expand_tilde(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+/// Channels owned by one session thread: terminal input/output plus the SFTP
+/// request queue. Bundled so `run_session` keeps a readable signature.
+struct SessionIo {
+    input_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    resize_rx: mpsc::UnboundedReceiver<(u16, u16)>,
+    disconnect_rx: mpsc::UnboundedReceiver<()>,
+    sftp_rx: mpsc::UnboundedReceiver<SftpRequest>,
+    output_tx: std_mpsc::Sender<Vec<u8>>,
+}
+
 async fn run_session(
     session: Handle<ClientHandler>,
     mut channel: Channel<ClientMsg>,
-    mut input_rx: mpsc::UnboundedReceiver<Vec<u8>>,
-    mut resize_rx: mpsc::UnboundedReceiver<(u16, u16)>,
-    mut disconnect_rx: mpsc::UnboundedReceiver<()>,
-    output_tx: std_mpsc::Sender<Vec<u8>>,
+    sftp: Option<SftpSession>,
+    io: SessionIo,
     wake: Option<Wake>,
 ) {
+    let SessionIo {
+        mut input_rx,
+        mut resize_rx,
+        mut disconnect_rx,
+        mut sftp_rx,
+        output_tx,
+    } = io;
+    let sftp = sftp.map(Arc::new);
+
     loop {
         tokio::select! {
             maybe_bytes = input_rx.recv() => {
@@ -462,6 +587,28 @@ async fn run_session(
             }
             // Fires on explicit disconnect AND on sender drop. Both mean stop.
             _ = disconnect_rx.recv() => break,
+            maybe_request = sftp_rx.recv() => {
+                let Some(request) = maybe_request else { break };
+                let SftpRequest { action, wake: request_wake } = request;
+                match sftp.as_ref().map(Arc::clone) {
+                    Some(sftp) => {
+                        // Run the round-trip off the terminal loop: a slow
+                        // listing must not freeze keystrokes or output.
+                        tokio::spawn(async move {
+                            action.run(&sftp).await;
+                            if let Some(wake) = request_wake {
+                                wake();
+                            }
+                        });
+                    }
+                    None => {
+                        action.fail("SFTP support is not available on this server");
+                        if let Some(wake) = request_wake {
+                            wake();
+                        }
+                    }
+                }
+            }
             msg = channel.wait() => {
                 match msg {
                     Some(ChannelMsg::Data { data }) => {
@@ -494,6 +641,78 @@ async fn run_session(
     if let Some(wake) = wake.as_ref() {
         wake();
     }
+}
+
+/// A request from the UI to the SFTP task.
+struct SftpRequest {
+    action: SftpAction,
+    /// Wakes egui once the reply has been sent (the UI only repaints on
+    /// demand, so without this a finished listing could sit invisible until
+    /// the next mouse/key event).
+    wake: Option<Wake>,
+}
+
+enum SftpAction {
+    Home {
+        reply: std_mpsc::Sender<Result<String, String>>,
+    },
+    List {
+        path: String,
+        reply: std_mpsc::Sender<Result<Vec<RemoteEntry>, String>>,
+    },
+}
+
+impl SftpAction {
+    async fn run(self, sftp: &SftpSession) {
+        match self {
+            SftpAction::Home { reply } => {
+                let _ = reply.send(remote_home(sftp).await);
+            }
+            SftpAction::List { path, reply } => {
+                let _ = reply.send(remote_list(sftp, &path).await);
+            }
+        }
+    }
+
+    /// Reply with an error without touching the SFTP session.
+    fn fail(self, message: &str) {
+        match self {
+            SftpAction::Home { reply } => {
+                let _ = reply.send(Err(message.to_string()));
+            }
+            SftpAction::List { reply, .. } => {
+                let _ = reply.send(Err(message.to_string()));
+            }
+        }
+    }
+}
+
+async fn remote_home(sftp: &SftpSession) -> Result<String, String> {
+    sftp.canonicalize(".")
+        .await
+        .map_err(|err| format!("could not resolve the remote home directory: {err}"))
+}
+
+async fn remote_list(sftp: &SftpSession, path: &str) -> Result<Vec<RemoteEntry>, String> {
+    let dir = sftp
+        .read_dir(path)
+        .await
+        .map_err(|err| format!("could not list '{path}': {err}"))?;
+
+    let mut entries = Vec::new();
+    for entry in dir {
+        let metadata = entry.metadata();
+        let file_type = metadata.file_type();
+        entries.push(RemoteEntry {
+            name: entry.file_name(),
+            path: entry.path(),
+            is_dir: file_type.is_dir(),
+            is_symlink: file_type.is_symlink(),
+            size: metadata.len(),
+            modified: metadata.modified().ok(),
+        });
+    }
+    Ok(entries)
 }
 
 struct ClientHandler {

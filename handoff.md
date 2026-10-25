@@ -3,8 +3,9 @@
 > **Status:** MVP Terminal & Tabs complete. Core rendering (F1-F5, F7-F9) is
 > finished, copy/paste (F14) is done, saved session profiles persist to
 > `~/.config/rustterm/sessions.toml`, profiles can optionally store their
-> password in the OS keyring, and public-key / ssh-agent authentication works.
-> SFTP is next. Read section 12 before writing any code.
+> password in the OS keyring, public-key / ssh-agent authentication works, and
+> the SFTP side panel is implemented. File transfers are next. Read section 12
+> before writing any code.
 
 Last updated: 2026-10-25
 Repo: `~/Desktop/VsTerm` (local) — remote may be `rustterm` on GitHub
@@ -32,7 +33,7 @@ open protocols.
 | 1 | SSH terminal with colors, resize, copy/paste | **Done** — colors, resize, scrollback, bg colors, copy/paste. |
 | 2 | Multiple SSH sessions in tabs | **Done** |
 | 3 | Saved sessions, key auth, keyring passwords | **Done** — profiles, optional keyring passwords, key file + ssh-agent auth. |
-| 4 | SFTP side panel following the active session's path | Not started |
+| 4 | SFTP side panel following the active session's path | **Mostly done** — per-tab browsing, Home/Up/Refresh and manual paths. The panel does not yet follow shell `cd` (no OSC 7). |
 | 5 | Upload/download, drag & drop, progress | Not started |
 | 6 | Open remote file in local editor, auto-upload on save | Not started |
 | 7 | GUI tools via X11 forwarding (`ssh -X`) or VNC-over-tunnel | Not started |
@@ -47,6 +48,7 @@ open protocols.
 | SSH | `russh` | 0.45 | Pure Rust, no libssh2 C dependency. |
 | Terminal emulation | `alacritty_terminal` | 0.24 | **Do not write a custom VT parser.** |
 | Async | `tokio` | 1.x | One runtime per SSH session thread. |
+| SFTP | `russh-sftp` | 3.0 | Client over a second `russh` channel; server role unused. |
 | Error handling | `anyhow` | 1 | |
 | Async trait | `async-trait` | 0.1 | Required for `russh::client::Handler`. |
 | Logging | `log` + `env_logger` | 0.11 | `RUST_LOG=info cargo run` |
@@ -55,9 +57,8 @@ open protocols.
 
 `eframe` uses `default-features = false, features = ["glow", "default_fonts"]`.
 
-**Not yet added but will be needed:** `russh-sftp` (SFTP), `notify` (file
-watching for auto-upload), `rfd` (native file dialogs), `dirs` or
-`directories` (config/temp paths).
+**Not yet added but will be needed:** `notify` (file watching for auto-upload),
+`rfd` (native file dialogs), `dirs` or `directories` (config/temp paths).
 
 ---
 
@@ -65,7 +66,7 @@ watching for auto-upload), `rfd` (native file dialogs), `dirs` or
 
 ```
 
-Cargo.toml                  # eframe/egui 0.29, russh 0.45, alacritty_terminal 0.24
+Cargo.toml                  # eframe/egui 0.29, russh 0.45, russh-sftp 3.0, alacritty_terminal 0.24
 Cargo.lock                  # COMMITTED (binary crate — reproducible builds)
 README.md                   # badges use YOUR_USERNAME placeholder — fix before push
 LICENSE                     # MIT
@@ -80,6 +81,7 @@ src/
 main.rs                   # font loading, eframe::run_native
 app.rs                    # RustTermApp: tabs, connect form, terminal UI, input dispatch
 ssh.rs                    # SshSession: russh client, host-key prompt, thread + tokio
+sftp.rs                   # SftpExplorer: SFTP panel state, navigation, formatting
 sessions.rs               # SessionStore: saved profiles in sessions.toml (metadata only)
 secrets.rs                # optional OS-keyring password storage (service "rustterm")
 terminal.rs               # TerminalView: Term<EventProxy> + egui rendering + layout
@@ -217,6 +219,33 @@ side), `std::sync::mpsc` for SSH→UI (drained with `try_recv`, never blocks).
 reply bytes back to the PTY. It also handles `Title`, `Bell`, `TextAreaSizeRequest`,
 and `ColorRequest`.
 
+### SFTP data flow
+
+```
+SftpExplorer::poll  ── sftp_home()/sftp_list() ──► tokio mpsc SftpRequest
+                                                       │
+                                       run_session select! branch
+                                                       │
+                                              tokio::spawn(...)
+                                                       ▼
+                                    SftpSession::canonicalize / read_dir
+                                                       │
+                                    std::sync::mpsc::Sender<Result<…>>
+                                                       │  + Wake
+                                                       ▼
+                                   SftpExplorer::poll (drained in pump_sessions)
+```
+
+- SFTP is a **second channel on the same SSH connection**, opened after the shell
+  (and PTY) requests. If the subsystem is missing or its handshake fails, the
+  connection still succeeds and the panel shows why SFTP is unavailable.
+- The select loop never awaits SFTP: each request is moved into a spawned task, so
+  a slow listing cannot delay keystrokes or terminal output. Replies use
+  `std::sync::mpsc` and call the egui `Wake` callback.
+- `SftpExplorer` is per `ActiveSession`, so each tab keeps its own remote
+  directory. It starts at `canonicalize(".")` and is hidden/shown with the
+  **Files** toggle in the tab bar.
+
 ---
 
 ## 7. What works today (verified)
@@ -245,6 +274,15 @@ and not closable. Closing a tab disconnects its SSH cleanly.
   load them into ssh-agent (`ssh-add`) and enable the agent option. Failures
   list every attempted method (missing file, encrypted key, rejected key,
   agent unavailable, wrong password) instead of a bare "rejected".
+- **SFTP side panel**: a second channel per session opens the `sftp` subsystem at
+  connect time. The left panel starts in the remote login directory
+  (`canonicalize(".")`) and lists the entries with directories first. **Home**,
+  **Up**, **Refresh** and an editable path + **Enter**/**Go** navigate; clicking a
+  directory opens it and clicking a file selects it (path, size and age in the
+  footer). The **Files** toggle in the tab bar, or the panel's **×**, hides it.
+  Each tab keeps its own directory. Servers without SFTP show a clear unavailable
+  message; terminal I/O is never blocked by a slow listing. Symlinks are shown but
+  not followed, and the panel does not yet follow shell `cd` (see F26).
 - **Host key verification (F3)**: `known_hosts` checking via `russh-keys`. TOFU
 prompt for unknown hosts; *hard failure* (no bypass) for changed keys. Handles
 hashed `known_hosts` and missing `~/.ssh`.
@@ -327,7 +365,7 @@ Hardcoded `80x24` until the first `ui()` frame. Produces a small reflow on conne
 Read once per frame rather than per event.
 
 **F18 — Tests (B)**
-`terminal.rs` has unit tests for `bg_runs`, the colour mapping and the mouse encoding; `input.rs` has tests for the key encoding incl. DECCKM; `sessions.rs` covers persistence, validation and profile defaults. **31 tests**, run with `cargo test`. Still missing: automated tests for `ssh.rs` (key auth was verified with a temporary russh-server probe, not a committed test).
+`terminal.rs` has unit tests for `bg_runs`, the colour mapping and the mouse encoding; `input.rs` has tests for the key encoding incl. DECCKM; `sessions.rs` covers persistence, validation and profile defaults; `sftp.rs` covers path join/parent, sorting and human-readable size/age formatting. **36 tests**, run with `cargo test`. Still missing: automated tests for `ssh.rs` (public-key auth and the SFTP transport were verified with temporary russh-server probes, not committed tests).
 
 **F19 — Password storage / memory hygiene (B, mostly resolved)**
 Passwords are never written to `sessions.toml`. Opt-in keyring storage is
@@ -357,6 +395,16 @@ them would need a SHA-1 signing path, which is deliberately not a priority.
 **F25 — Agent identity errors (C)**
 An agent signing error aborts the remaining identities instead of trying the
 next one. Rare in practice; revisit if it shows up with hardware tokens.
+
+**F26 — SFTP panel does not follow the shell's working directory (B)**
+The panel starts at the login home and navigates independently. There is no
+OSC 7 parsing (`Term::current_directory` is not exposed by alacritty_terminal
+0.24), so `cd` in the terminal does not move the panel. Automatic following will
+need either an OSC 7 hook in the VTE event stream or a periodic remote `pwd`
+query, plus a "follow / manual" mode so user navigation is not overridden.
+Other limits: no transfers yet, symlinks are displayed but not navigated, and a
+server that allows only one session channel will make SFTP unavailable while the
+terminal still works.
 
 ---
 
@@ -438,6 +486,27 @@ through a `pty` so the byte sequences can be injected.
 - `KeyPair::RSA` carries a `SignatureHash` limited to SHA2-256/512; there is no
   SHA-1 path, so `ssh-rsa`-only servers reject key auth (see F24).
 
+### russh-sftp 3.0
+
+- Client: open a second channel, `channel.request_subsystem(true, "sftp")`, then
+  `SftpSession::new_with_config(channel.into_stream(), Config { request_timeout_secs,
+  .. })`. The stream needs `AsyncRead + AsyncWrite + Unpin + Send + 'static`.
+  Create/handshake it **inside the session's tokio runtime**.
+- `SftpSession::canonicalize(".")` resolves the remote login directory.
+- `SftpSession::read_dir(path).await` returns a `ReadDir` iterator of
+  `DirEntry` (`file_name() -> String`, `path() -> String`, `metadata() ->
+  Metadata`). `Metadata::file_type()` is a `FileType` with `is_dir()` /
+  `is_symlink()`; `len()` is `u64`; `modified()` is `io::Result<SystemTime>`.
+  `read_dir` internally loops `READDIR` until `StatusCode::Eof`, so a server
+  handler must return `Err(StatusCode::Eof)` after the last batch.
+- `russh_sftp::server::Handler` uses RPITIT (`fn … -> impl Future + Send`), **not**
+  `#[async_trait]`, unless the crate's `async-trait` feature is enabled. The
+  bundled russh 0.45 `examples/sftp_server.rs` predates 3.0 and still uses
+  `#[async_trait]`; do not copy it verbatim.
+- `SftpSession` is not `Clone`; wrap it in `Arc` for spawned request tasks.
+- No SFTP request may be awaited in `run_session`'s `select!` directly: spawn it,
+  or a slow listing stalls terminal I/O.
+
 ---
 
 ## 11. Features left (ordered by roadmap)
@@ -453,14 +522,16 @@ through a `pty` so the byte sequences can be injected.
    `src/secrets.rs` + `keyring` 4.2. Missing/locked keyrings fall back to
    manual password entry. In-memory zeroization is still tracked under F19.
 5. **Key auth** ✅ done — key files + ssh-agent before the password.
-6. **SFTP panel** — `russh-sftp`, directory listing, follows active session. ← next
-7. **Transfers** — upload/download with progress bars.
+6. **SFTP panel** ✅ done — `russh-sftp` on a second channel, per-tab directory
+   listing, Home/Up/Refresh + editable path. Shell-cwd following is tracked as
+   F26.
+7. **Transfers** — upload/download with progress bars. ← next
 
 ### V2
 
-7. Edit-and-auto-upload. Watch the **folder**, not the file.
-8. X11 forwarding via system `ssh -X`.
-9. VNC over SSH tunnel + external viewer.
+8. Edit-and-auto-upload. Watch the **folder**, not the file.
+9. X11 forwarding via system `ssh -X`.
+10. VNC over SSH tunnel + external viewer.
 
 ---
 
@@ -506,9 +577,33 @@ unchanged). Verified end-to-end against a temporary russh server: file key,
 agent identity and password all succeed; an encrypted key produces the
 passphrase/agent guidance. GUI checklist in `USAGE.md` §13.
 
-**Step 5 — SFTP.** ← next
-`russh-sftp` on a second channel per session, left panel, follows the active
-session's `cwd`.
+**Step 5 — SFTP.** ✅ done.
+`src/ssh.rs` opens a second channel after the shell, requests the `sftp`
+subsystem and builds an `SftpSession` with a 10 s request timeout. Failures are
+non-fatal: `SshSession::sftp_unavailable()` carries the reason. The UI-facing API
+is `sftp_home()` / `sftp_list(path)`; both return `std::sync::mpsc::Receiver`s
+and wake egui on completion. `run_session` spawns each request so the terminal
+select loop never awaits the network.
+
+`src/sftp.rs` holds `SftpExplorer` (current path, editable path, entries,
+selection, loading/error/unavailable state, one in-flight `Job`). It is stored per
+`ActiveSession`. `src/app.rs` polls every tab in `pump_sessions`, draws a
+resizable left `SidePanel` when `show_sftp` is on, and adds the **Files** toggle
+to the tab bar. Navigation: **Home** (`canonicalize(".")`), **Up**, **Refresh**;
+the path box navigates on Enter; **Go** does the same; clicking a directory opens
+it and clicking a file selects it.
+
+Verified with 36 tests, clippy/fmt clean, and a temporary in-process russh SFTP
+server probe: `canonicalize(".")` → `/probe`, `read_dir` returned a directory and
+a regular file with the expected `is_dir`, `len` and `modified` values.
+
+Limits (F26): the panel does not follow shell `cd` (no OSC 7), symlinks are not
+navigated, and transfers are not implemented. Manual GUI checklist in
+`USAGE.md` §14.
+
+**Step 6 — Transfers.** ← next
+Upload/download over the existing `SftpSession`, with progress reporting and a
+transfer queue that also runs off the terminal select loop.
 
 ### Working agreement — direct repo access
 
@@ -574,9 +669,11 @@ sudo update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
 
 ## 15. Git status
 
-Tabs + F1 + F2 + F3 + F4 + F5 + F7 + F8 + F9 all landed on top of the initial
-scaffold. `TerminalView` and `app.rs` have been substantially rewritten. `input.rs`
-is unchanged.
+Tabs + F1 + F2 + F3 + F4 + F5 + F7 + F8 + F9, saved profiles, keyring
+passwords, public-key/agent auth and the SFTP panel have landed on the `feat-tabs`
+branch. The SFTP step (`src/sftp.rs` + `ssh.rs`/`app.rs` wiring, `russh-sftp`
+dependency) is implemented and verified but may still be uncommitted — check
+`git status`.
 
 Before pushing:
 
@@ -610,7 +707,8 @@ Maintained by the assistant. Update after each successful `cargo build`.
 | Session persistence | `sessions.rs` (new), `app.rs`, `main.rs`, `Cargo.toml` | `SessionStore::{load_default,load,upsert,remove,profiles,path,error}`, `SessionProfile::validate`, `save_profile_ui`, `saved_sessions_ui`, `load_profile` | ✅ done (user-verified in GUI) |
 | Keyring passwords (F19) | `secrets.rs` (new), `sessions.rs`, `app.rs`, `main.rs`, `Cargo.toml` | `secrets::{save,load,delete}`, `SessionProfile::save_password`, `save_profile_ui`, keyring 4.2 behind `keyring-secrets` | ✅ done (default + lean builds; 29 tests each; keyring flow verified on GNOME Keyring) |
 | Public-key / agent auth | `ssh.rs`, `app.rs`, `sessions.rs` | `SshConfig::{use_key,key_path,use_agent}`, `authenticate()`, `authenticate_with_agent()`, `key_candidates()`, `expand_tilde()`, `SessionProfile::{use_key,key_path,use_agent}` | ✅ done (31 tests; file key + agent + password verified against a temporary russh server; GUI-unverified) |
-| Next: SFTP | `ssh.rs`, `app.rs`, `Cargo.toml` | TBD | ⏳ pending |
+| SFTP panel | `sftp.rs` (new), `ssh.rs`, `app.rs`, `main.rs`, `Cargo.toml` | `SshSession::{sftp_unavailable,sftp_home,sftp_list}`, `RemoteEntry`, `SftpExplorer::{start,poll,load_home,navigate,refresh,up,selected_entry}`, `join_path`, `parent_path`, `sort_entries`, `format_size`, `format_age`, `RustTermApp::sftp_ui`, `show_sftp` | ✅ done (36 tests; transport verified against a temporary in-process russh SFTP server; GUI-unverified) |
+| Next: transfers | `ssh.rs`, `sftp.rs`, `app.rs` | TBD (upload/download, progress) | ⏳ pending |
 ⚙
 
 ---

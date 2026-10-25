@@ -2,6 +2,7 @@ mod app;
 mod input;
 mod secrets;
 mod sessions;
+mod sftp;
 mod ssh;
 mod terminal;
 

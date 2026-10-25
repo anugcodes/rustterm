@@ -1,12 +1,14 @@
 # rustterm
 
-[![Build](https://github.com/YOUR_USERNAME/rustterm/actions/workflows/ci.yml/badge.svg)](https://github.com/YOUR_USERNAME/rustterm/actions/workflows/ci.yml)
+[![Build](https://github.com/anugcodes/rustterm/actions/workflows/ci.yml/badge.svg)](https://github.com/anugcodes/rustterm/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-blue.svg)](https://www.rust-lang.org)
 
 A fast, lightweight, native Linux alternative to MobaXterm. SSH terminal tabs with an SFTP side panel that follows your session. Written in Rust.
 
-> **Status:** early scaffold. Terminal rendering and a single SSH connection work. Tabs and SFTP are next.
+> **Status:** working terminal with tabs. Colours, scrollback, copy/paste, mouse
+> reporting and TOFU host-key verification are done. Saved sessions + keyring and
+> the SFTP side panel are next.
 
 ## Screenshots
 
@@ -14,8 +16,13 @@ _(coming soon)_
 
 ## Features
 
-- [x] SSH terminal with colors (via `alacritty_terminal`)
-- [ ] Multiple sessions in tabs
+- [x] SSH terminal with 256-colour support, background colours and reverse video
+- [x] Multiple sessions in tabs
+- [x] Scrollback (mouse wheel + `Shift+PageUp` / `PageDown` / `Home` / `End`)
+- [x] Copy/paste: mouse selection, `Ctrl+Shift+C` / `Ctrl+Shift+V`, right-click menu
+- [x] Mouse reporting for full-screen apps (htop, vim, tmux, mc)
+- [x] Application cursor keys (DECCKM) so ncurses programs get real arrow keys
+- [x] Host-key verification (TOFU) against `~/.ssh/known_hosts`
 - [ ] Saved sessions + system keyring
 - [ ] SFTP side panel following the active session
 - [ ] Upload/download with drag and drop
@@ -46,6 +53,11 @@ cargo run --release
 
 Enter a host, port, username, and password, then click **Connect**.
 
+## Documentation
+
+- [`USAGE.md`](USAGE.md) — how each feature works, plus a manual test checklist.
+- [`handoff.md`](handoff.md) — architecture, status and the development roadmap.
+
 ## Roadmap
 
 See the project brief. MVP target: terminal + tabs + saved sessions + SFTP panel.
@@ -53,30 +65,3 @@ See the project brief. MVP target: terminal + tabs + saved sessions + SFTP panel
 ## License
 
 MIT
-
-</BDS:create_file>
-<BDS:create_file fileName="LICENSE">
-
-```text
-MIT License
-
-Copyright (c) 2026 rustterm contributors
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-

@@ -18,7 +18,7 @@ fn install_fonts(ctx: &egui::Context) {
         Ok(bytes) => {
             fonts.font_data.insert(
                 "jetbrains_mono".to_owned(),
-                egui::FontData::from_owned(bytes).into(),
+                egui::FontData::from_owned(bytes),
             );
             fonts
                 .families

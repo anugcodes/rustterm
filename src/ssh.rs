@@ -1,171 +1,394 @@
-//! SSH session wrapper around russh.
+//! SSH session management.
 //!
-//! This module owns the SSH connection and exposes a channel for the terminal
-//! to read bytes from and write bytes to.
+//! One OS thread + one current-thread tokio runtime per session.
+//!
+//! `SshSession::connect` is *synchronous through authentication*: it blocks
+//! the caller on TCP connect + host-key verification + password auth + PTY +
+//! shell request. The caller (the app) is expected to run it on a background
+//! thread and surface the `Result` to the UI. This makes connect failures real
+//! errors instead of text written into a phantom terminal (handoff flaw F1).
+//!
+//! Each session owns a `disconnect_tx`; sending on it asks the session thread
+//! to call `session.disconnect(...)` and exit, so connections are no longer
+//! leaked until the server times out (handoff flaw F2).
+//!
+//! Host keys (handoff flaw F3): `check_server_key` verifies against
+//! `~/.ssh/known_hosts`. A known host with a matching key proceeds; an unknown
+//! host asks the UI for a trust-on-first-use decision and records the answer;
+//! a *changed* key is refused outright, with no way to click through it.
 
-use anyhow::{Context, Result};
+use std::path::PathBuf;
+use std::sync::mpsc as std_mpsc;
+use std::sync::{Arc, Mutex};
+
+use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use russh::client;
+use russh::client::{self, Handle, Msg as ClientMsg};
+// `PublicKey` lives in the `key` submodule; the known-hosts helpers are at the
+// `keys` root. `HashAlg` does not exist in russh 0.45 — `fingerprint()` takes
+// no arguments and hashes with SHA-256 internally.
 use russh::keys::key::PublicKey;
-use russh::ChannelMsg;
-use std::sync::Arc;
-use tokio::sync::mpsc;
+use russh::keys::{check_known_hosts, learn_known_hosts};
+use russh::{Channel, ChannelMsg};
+use tokio::sync::{mpsc, oneshot};
 
 pub struct SshConfig {
     pub host: String,
     pub port: u16,
-    pub username: String,
+    pub user: String,
     pub password: String,
 }
 
-/// A live SSH session with an interactive shell.
-pub struct SshSession {
-    /// Handle to send input to the remote shell.
-    pub input_tx: mpsc::UnboundedSender<Vec<u8>>,
-    /// Receiver for output bytes from the remote shell.
-    pub output_rx: std::sync::mpsc::Receiver<Vec<u8>>,
-    /// Dimensions (cols, rows) — send resize events here.
-    pub resize_tx: mpsc::UnboundedSender<(u32, u32)>,
+/// A pending trust-on-first-use decision.
+///
+/// `check_server_key` runs on the session thread and pauses the handshake until
+/// the UI answers. `reply` is the only field the UI touches, through
+/// `accept`/`reject`, so `app.rs` never has to name a tokio type.
+pub struct HostKeyPrompt {
+    pub host: String,
+    pub port: u16,
+    /// `PublicKey::fingerprint()` already returns the `SHA256:...` form.
+    pub fingerprint: String,
+    reply: oneshot::Sender<bool>,
 }
 
-struct Client;
-
-#[async_trait]
-impl client::Handler for Client {
-    type Error = russh::Error;
-
-    async fn check_server_key(
-        &mut self,
-        _server_public_key: &PublicKey,
-    ) -> std::result::Result<bool, Self::Error> {
-        // TODO: verify against known_hosts for security.
-        Ok(true)
+impl HostKeyPrompt {
+    pub fn accept(self) {
+        let _ = self.reply.send(true);
     }
+
+    pub fn reject(self) {
+        let _ = self.reply.send(false);
+    }
+}
+
+/// Why a host-key check refused the connection.
+///
+/// `check_server_key` can only return a bool, so the reason is parked in a slot
+/// that `connect_and_auth` reads when `client::connect` comes back with russh's
+/// generic handshake error.
+enum HostKeyFailure {
+    /// The host was unknown and the user declined.
+    Rejected { fingerprint: String },
+    /// A different key is already recorded for this host: possible MITM.
+    Changed { fingerprint: String },
+    /// `known_hosts` unreadable/unwritable, or another verification problem.
+    Error { message: String },
+}
+
+pub struct SshSession {
+    input_tx: mpsc::UnboundedSender<Vec<u8>>,
+    resize_tx: mpsc::UnboundedSender<(u16, u16)>,
+    disconnect_tx: mpsc::UnboundedSender<()>,
+    output_rx: std_mpsc::Receiver<Vec<u8>>,
 }
 
 impl SshSession {
-    /// Connect, authenticate, open a shell, and return a handle.
+    /// Connect, verify the host key, authenticate, request a PTY + shell, then
+    /// spawn the I/O loop.
     ///
-    /// This runs on a dedicated background thread with its own tokio runtime.
-    pub fn connect(config: SshConfig) -> Result<Self> {
-        let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let (resize_tx, mut resize_rx) = mpsc::unbounded_channel::<(u32, u32)>();
-        let (output_tx, output_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    /// **Blocks** the calling thread through the whole handshake — including,
+    /// possibly, waiting for the user to answer a host-key prompt on
+    /// `prompt_tx`. Call this from a background thread.
+    pub fn connect(
+        config: SshConfig,
+        prompt_tx: Option<std_mpsc::Sender<HostKeyPrompt>>,
+    ) -> Result<Self> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to build tokio runtime")?;
 
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("tokio runtime");
+        let (session, channel) = rt
+            .block_on(connect_and_auth(&config, prompt_tx))
+            .with_context(|| {
+                format!("connect to {}@{}:{}", config.user, config.host, config.port)
+            })?;
 
-            rt.block_on(async move {
-                if let Err(e) =
-                    run_session(config, &mut input_rx, &mut resize_rx, &output_tx).await
-                {
-                    eprintln!("SSH session error: {e:#}");
-                    let _ = output_tx.send(format!("\r\n[ssh error] {e:#}\r\n").into_bytes());
-                }
-            });
-        });
+        let (input_tx, input_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (resize_tx, resize_rx) = mpsc::unbounded_channel::<(u16, u16)>();
+        let (disconnect_tx, disconnect_rx) = mpsc::unbounded_channel::<()>();
+        let (output_tx, output_rx) = std_mpsc::channel::<Vec<u8>>();
+
+        std::thread::Builder::new()
+            .name(format!("ssh-{}@{}", config.user, config.host))
+            .spawn(move || {
+                rt.block_on(run_session(
+                    session,
+                    channel,
+                    input_rx,
+                    resize_rx,
+                    disconnect_rx,
+                    output_tx,
+                ));
+            })
+            .context("failed to spawn SSH session thread")?;
 
         Ok(Self {
             input_tx,
-            output_rx,
             resize_tx,
+            disconnect_tx,
+            output_rx,
         })
     }
 
-    pub fn write(&self, data: Vec<u8>) {
-        let _ = self.input_tx.send(data);
+    pub fn write(&self, bytes: Vec<u8>) {
+        let _ = self.input_tx.send(bytes);
     }
 
-    pub fn resize(&self, cols: u32, rows: u32) {
+    pub fn resize(&self, cols: u16, rows: u16) {
         let _ = self.resize_tx.send((cols, rows));
     }
 
-    /// Drain any pending output bytes. Non-blocking.
-    pub fn drain_output(&self) -> Vec<Vec<u8>> {
-        let mut chunks = Vec::new();
-        while let Ok(chunk) = self.output_rx.try_recv() {
-            chunks.push(chunk);
-        }
-        chunks
+    /// Ask the session thread to disconnect and exit. Idempotent.
+    pub fn disconnect(&self) {
+        let _ = self.disconnect_tx.send(());
+    }
+
+    /// Drain one pending output chunk, if any.
+    pub fn try_read(&self) -> Option<Vec<u8>> {
+        self.output_rx.try_recv().ok()
+    }
+
+    /// Clone of the PTY input sender, for components that need to write bytes
+    /// back to the remote — primarily the terminal's `EventProxy`, which answers
+    /// DA1/DA2/DSR queries with `PtyWrite`.
+    pub fn input_sender(&self) -> mpsc::UnboundedSender<Vec<u8>> {
+        self.input_tx.clone()
     }
 }
 
-async fn run_session(
-    config: SshConfig,
-    input_rx: &mut mpsc::UnboundedReceiver<Vec<u8>>,
-    resize_rx: &mut mpsc::UnboundedReceiver<(u32, u32)>,
-    output_tx: &std::sync::mpsc::Sender<Vec<u8>>,
-) -> Result<()> {
+async fn connect_and_auth(
+    config: &SshConfig,
+    prompt_tx: Option<std_mpsc::Sender<HostKeyPrompt>>,
+) -> Result<(Handle<ClientHandler>, Channel<ClientMsg>)> {
     let ssh_config = Arc::new(client::Config::default());
-    let addr = format!("{}:{}", config.host, config.port);
+    let addr = (config.host.as_str(), config.port);
 
-    let mut session = client::connect(ssh_config, addr.clone(), Client)
+    // The handler is moved into `client::connect`, so the reason for a
+    // rejection has to live outside it.
+    let failure: Arc<Mutex<Option<HostKeyFailure>>> = Arc::new(Mutex::new(None));
+    let handler = ClientHandler {
+        host: config.host.clone(),
+        port: config.port,
+        prompt_tx,
+        failure: Arc::clone(&failure),
+    };
+
+    let mut session = match client::connect(ssh_config, addr, handler).await {
+        Ok(session) => session,
+        Err(err) => {
+            let reason = failure.lock().ok().and_then(|mut slot| slot.take());
+            return Err(match reason {
+                Some(HostKeyFailure::Changed { fingerprint }) => anyhow!(
+                    "HOST KEY CHANGED for {}:{} — the server presented a different \
+                     key ({fingerprint}).\n\n\
+                     This is what a man-in-the-middle attack looks like. If you know \
+                     the host was reinstalled or rekeyed, remove its old entry from \
+                     ~/.ssh/known_hosts and reconnect. Otherwise stop and investigate.",
+                    config.host,
+                    config.port,
+                ),
+                Some(HostKeyFailure::Rejected { fingerprint }) => anyhow!(
+                    "host key for {}:{} was not accepted ({fingerprint})",
+                    config.host,
+                    config.port,
+                ),
+                Some(HostKeyFailure::Error { message }) => anyhow!(
+                    "could not verify the host key for {}:{}: {message}",
+                    config.host,
+                    config.port,
+                ),
+                None => anyhow!("{err}").context("SSH handshake failed"),
+            });
+        }
+    };
+
+    let ok = session
+        .authenticate_password(&config.user, &config.password)
         .await
-        .context("TCP/SSH connect")?;
-
-    let authenticated = session
-        .authenticate_password(&config.username, &config.password)
-        .await
-        .context("authenticate_password")?;
-
-    if !authenticated {
-        anyhow::bail!(
-            "password authentication failed for user '{}'",
-            config.username
-        );
+        .context("password authentication request failed")?;
+    if !ok {
+        return Err(anyhow!("authentication rejected by server"));
     }
 
-    let mut channel = session
+    let channel = session
         .channel_open_session()
         .await
-        .context("channel_open_session")?;
+        .context("failed to open SSH channel")?;
 
     channel
         .request_pty(false, "xterm-256color", 80, 24, 0, 0, &[])
         .await
-        .context("request_pty")?;
-
+        .context("PTY request rejected")?;
     channel
         .request_shell(false)
         .await
-        .context("request_shell")?;
+        .context("shell request rejected")?;
 
+    Ok((session, channel))
+}
+
+async fn run_session(
+    session: Handle<ClientHandler>,
+    mut channel: Channel<ClientMsg>,
+    mut input_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    mut resize_rx: mpsc::UnboundedReceiver<(u16, u16)>,
+    mut disconnect_rx: mpsc::UnboundedReceiver<()>,
+    output_tx: std_mpsc::Sender<Vec<u8>>,
+) {
     loop {
         tokio::select! {
-            Some(data) = input_rx.recv() => {
-                channel.data(&data[..]).await.context("channel.data")?;
+            maybe_bytes = input_rx.recv() => {
+                match maybe_bytes {
+                    Some(bytes) => {
+                        // russh 0.45's Channel::data takes AsyncRead; a byte slice satisfies it.
+                        if channel.data(&bytes[..]).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break, // app dropped the sender
+                }
             }
-            Some((cols, rows)) = resize_rx.recv() => {
-                channel
-                    .window_change(cols, rows, 0, 0)
-                    .await
-                    .context("window_change")?;
+            maybe_size = resize_rx.recv() => {
+                match maybe_size {
+                    Some((cols, rows)) => {
+                        let _ = channel
+                            .window_change(cols as u32, rows as u32, 0, 0)
+                            .await;
+                    }
+                    None => break,
+                }
             }
+            // Fires on explicit disconnect AND on sender drop. Both mean stop.
+            _ = disconnect_rx.recv() => break,
             msg = channel.wait() => {
                 match msg {
                     Some(ChannelMsg::Data { data }) => {
-                        output_tx.send(data.to_vec()).ok();
+                        if output_tx.send(data.to_vec()).is_err() {
+                            break;
+                        }
                     }
                     Some(ChannelMsg::ExtendedData { data, .. }) => {
-                        output_tx.send(data.to_vec()).ok();
+                        if output_tx.send(data.to_vec()).is_err() {
+                            break;
+                        }
                     }
-                    Some(ChannelMsg::Eof) | None => {
-                        output_tx.send(b"\r\n[connection closed]\r\n".to_vec()).ok();
-                        break;
-                    }
+                    Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
                     _ => {}
                 }
             }
         }
     }
 
-    session
+    // Best-effort graceful disconnect on every exit path.
+    let _ = session
         .disconnect(russh::Disconnect::ByApplication, "", "en")
-        .await
-        .ok();
+        .await;
+}
 
-    Ok(())
+struct ClientHandler {
+    host: String,
+    port: u16,
+    /// `None` means no UI is listening; unknown hosts are then refused rather
+    /// than silently trusted.
+    prompt_tx: Option<std_mpsc::Sender<HostKeyPrompt>>,
+    failure: Arc<Mutex<Option<HostKeyFailure>>>,
+}
+
+impl ClientHandler {
+    fn fail(&self, reason: HostKeyFailure) {
+        if let Ok(mut slot) = self.failure.lock() {
+            *slot = Some(reason);
+        }
+    }
+}
+
+#[async_trait]
+impl client::Handler for ClientHandler {
+    type Error = russh::Error;
+
+    async fn check_server_key(
+        &mut self,
+        server_public_key: &PublicKey,
+    ) -> std::result::Result<bool, Self::Error> {
+        // 1. Already known and matching?
+        match check_known_hosts(&self.host, self.port, server_public_key) {
+            Ok(true) => return Ok(true),
+            // Unknown host: fall through to the TOFU prompt.
+            Ok(false) => {}
+            // A *different* key is recorded for this host. Refuse, and do not
+            // offer a way to accept it from the client.
+            Err(russh::keys::Error::KeyChanged { .. }) => {
+                self.fail(HostKeyFailure::Changed {
+                    fingerprint: fingerprint(server_public_key),
+                });
+                return Ok(false);
+            }
+            // Unreadable known_hosts or another verification problem: fail
+            // closed.
+            Err(err) => {
+                self.fail(HostKeyFailure::Error {
+                    message: format!("known_hosts: {err}"),
+                });
+                return Ok(false);
+            }
+        }
+
+        // 2. Unknown host. Ask the user, if anyone is listening.
+        let fp = fingerprint(server_public_key);
+        let Some(prompt_tx) = self.prompt_tx.clone() else {
+            self.fail(HostKeyFailure::Rejected { fingerprint: fp });
+            return Ok(false);
+        };
+
+        let (reply, answer) = oneshot::channel();
+        let prompt = HostKeyPrompt {
+            host: self.host.clone(),
+            port: self.port,
+            fingerprint: fp.clone(),
+            reply,
+        };
+        if prompt_tx.send(prompt).is_err() {
+            // UI went away between the check and the prompt.
+            self.fail(HostKeyFailure::Rejected { fingerprint: fp });
+            return Ok(false);
+        }
+
+        // The handshake pauses here until the UI answers.
+        match answer.await {
+            Ok(true) => match record_host_key(&self.host, self.port, server_public_key) {
+                Ok(()) => Ok(true),
+                Err(message) => {
+                    // Accepting without recording would prompt again next time
+                    // and hide the write failure; report it instead.
+                    self.fail(HostKeyFailure::Error { message });
+                    Ok(false)
+                }
+            },
+            _ => {
+                self.fail(HostKeyFailure::Rejected { fingerprint: fp });
+                Ok(false)
+            }
+        }
+    }
+}
+
+/// `russh_keys::key::PublicKey::fingerprint()` takes no arguments in 0.45 —
+/// it hashes the key with SHA-256 internally and returns the `SHA256:...` string.
+fn fingerprint(key: &PublicKey) -> String {
+    key.fingerprint()
+}
+
+/// Record a host key in `~/.ssh/known_hosts`.
+///
+/// russh appends to the file but does not create `~/.ssh`, which a brand-new
+/// account may not have. Creating the directory first is idempotent and turns a
+/// confusing failure into a working first connect.
+fn record_host_key(host: &str, port: u16, key: &PublicKey) -> std::result::Result<(), String> {
+    if let Ok(home) = std::env::var("HOME") {
+        let _ = std::fs::create_dir_all(PathBuf::from(home).join(".ssh"));
+    }
+    learn_known_hosts(host, port, key)
+        .map_err(|err| format!("could not record the host key in known_hosts: {err}"))
 }

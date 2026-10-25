@@ -28,12 +28,14 @@ use eframe::egui;
 use crate::input;
 use crate::secrets;
 use crate::sessions::{SessionProfile, SessionStore};
+use crate::settings::Settings;
 use crate::sftp::{
     format_age, format_owner, format_size, format_timestamp, join_path, EditorChoice,
     SftpDialogKind, SftpExplorer,
 };
 use crate::ssh::{HostKeyPrompt, RemoteEntry, SshConfig, SshSession, Wake};
 use crate::terminal::{TermAction, TerminalView};
+use crate::theme::{self, Theme, ThemeId};
 
 const NEW_SESSION_TAB: usize = 0;
 const DEFAULT_COLS: usize = 80;
@@ -50,6 +52,11 @@ const MAX_OUTPUT_PER_FRAME: usize = 256 * 1024;
 /// Whether this build includes the optional OS-keyring support.
 const KEYRING_ENABLED: bool = cfg!(feature = "keyring-secrets");
 
+/// Small label above a form field.
+fn field_label(ui: &mut egui::Ui, theme: &Theme, text: &str) {
+    ui.label(egui::RichText::new(text).small().color(theme.palette.muted));
+}
+
 pub struct RustTermApp {
     sessions: Vec<ActiveSession>,
     /// 0 = New Session form; `i > 0` = `sessions[i - 1]`.
@@ -65,6 +72,8 @@ pub struct RustTermApp {
     status: StatusMessage,
     /// Whether the SFTP side panel is shown for connected sessions.
     show_sftp: bool,
+    /// Selected application theme.
+    theme: ThemeId,
 }
 
 /// One line of user feedback below the connect form.
@@ -132,6 +141,7 @@ impl Default for RustTermApp {
             },
             None => StatusMessage::default(),
         };
+        let settings = Settings::load_default();
 
         Self {
             sessions: Vec::new(),
@@ -143,13 +153,16 @@ impl Default for RustTermApp {
             selected_profile: None,
             status,
             show_sftp: true,
+            theme: settings.theme,
         }
     }
 }
 
 impl RustTermApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        Self::default()
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let app = Self::default();
+        theme::apply(&cc.egui_ctx, app.theme.theme());
+        app
     }
 
     fn set_error(&mut self, text: impl Into<String>) {
@@ -418,6 +431,7 @@ impl RustTermApp {
         let mut switch_to: Option<usize> = None;
         let mut close: Option<usize> = None;
 
+        ui.add_space(2.0);
         ui.horizontal(|ui| {
             // Keep the Files toggle outside the scroll area so a long tab list
             // cannot hide it.
@@ -432,36 +446,49 @@ impl RustTermApp {
                 ui.separator();
             }
 
-            egui::ScrollArea::horizontal()
-                .id_salt("tab_bar_scroll")
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        // New Session — always first, never closable.
-                        if ui
-                            .selectable_label(self.active == NEW_SESSION_TAB, "＋ New Session")
-                            .clicked()
-                        {
-                            switch_to = Some(NEW_SESSION_TAB);
-                        }
-
-                        for (i, s) in self.sessions.iter().enumerate() {
-                            let tab_index = i + 1;
-                            let selected = self.active == tab_index;
+            let scroll_width = (ui.available_width() - 40.0).max(120.0);
+            ui.allocate_ui_with_layout(
+                egui::vec2(scroll_width, ui.available_height()),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    egui::ScrollArea::horizontal()
+                        .id_salt("tab_bar_scroll")
+                        .show(ui, |ui| {
                             ui.horizontal(|ui| {
-                                if ui.selectable_label(selected, &s.title).clicked() {
-                                    switch_to = Some(tab_index);
-                                }
+                                // New Session — always first, never closable.
                                 if ui
-                                    .small_button("×")
-                                    .on_hover_text("Close session")
+                                    .selectable_label(
+                                        self.active == NEW_SESSION_TAB,
+                                        "＋ New Session",
+                                    )
                                     .clicked()
                                 {
-                                    close = Some(i);
+                                    switch_to = Some(NEW_SESSION_TAB);
+                                }
+
+                                for (i, s) in self.sessions.iter().enumerate() {
+                                    let tab_index = i + 1;
+                                    let selected = self.active == tab_index;
+                                    ui.horizontal(|ui| {
+                                        if ui.selectable_label(selected, &s.title).clicked() {
+                                            switch_to = Some(tab_index);
+                                        }
+                                        if ui
+                                            .small_button("×")
+                                            .on_hover_text("Close session")
+                                            .clicked()
+                                        {
+                                            close = Some(i);
+                                        }
+                                    });
                                 }
                             });
-                        }
-                    });
-                });
+                        });
+                },
+            );
+
+            ui.add_space(4.0);
+            self.theme_menu_ui(ui);
         });
 
         if let Some(tab) = switch_to {
@@ -473,6 +500,37 @@ impl RustTermApp {
 
         if let Some(i) = close {
             self.close_session(i);
+        }
+    }
+
+    /// Small theme picker shown at the right edge of the tab bar.
+    fn theme_menu_ui(&mut self, ui: &mut egui::Ui) {
+        let mut chosen: Option<ThemeId> = None;
+        ui.menu_button(egui::RichText::new("◐").size(16.0), |ui| {
+            ui.label(egui::RichText::new("Theme").strong());
+            ui.add_space(2.0);
+            for id in ThemeId::ALL {
+                if ui.selectable_label(self.theme == id, id.name()).clicked() {
+                    chosen = Some(id);
+                }
+            }
+            ui.separator();
+            theme::muted(
+                ui,
+                self.theme.theme(),
+                "More themes can be added in src/theme.rs.",
+            );
+        })
+        .response
+        .on_hover_text("Choose a theme");
+
+        if let Some(id) = chosen {
+            self.theme = id;
+            theme::apply(ui.ctx(), id.theme());
+            let settings = Settings { theme: id };
+            if let Err(err) = settings.save_default() {
+                log::warn!("could not save theme choice: {err}");
+            }
         }
     }
 
@@ -634,8 +692,8 @@ impl RustTermApp {
         }
     }
 
-    /// Name field + save button, drawn right below the connect form.
-    fn save_profile_ui(&mut self, ui: &mut egui::Ui) {
+    /// Name field + save button, drawn inside the Profile card.
+    fn save_profile_ui(&mut self, ui: &mut egui::Ui, theme: &Theme) {
         let mut save_clicked = false;
         let name_hint = if self.form.save_password {
             "required to save password"
@@ -643,24 +701,26 @@ impl RustTermApp {
             "blank = user@host"
         };
 
+        field_label(ui, theme, "Profile name");
         ui.horizontal(|ui| {
-            ui.label("Profile name");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.profile_name)
-                    .hint_text(name_hint)
-                    .desired_width(220.0),
+            let button_width = 112.0_f32;
+            let name_width =
+                (ui.available_width() - button_width - ui.spacing().item_spacing.x).max(120.0);
+            ui.add_sized(
+                [name_width, theme.metrics.control_height],
+                egui::TextEdit::singleline(&mut self.profile_name).hint_text(name_hint),
             );
-            if ui
-                .button("Save profile")
-                .on_hover_text(
-                    "Saves host, port and user; if the keyring box is checked, \
-                     the password too (requires a profile name).",
-                )
-                .clicked()
-            {
+            let button = egui::Button::new("Save profile")
+                .min_size(egui::vec2(button_width, theme.metrics.control_height));
+            if ui.add(button).clicked() {
                 save_clicked = true;
             }
-        });
+        })
+        .response
+        .on_hover_text(
+            "Saves host, port and user; if the keyring box is checked, \
+             the password too (requires a profile name).",
+        );
 
         if save_clicked {
             self.save_profile();
@@ -671,28 +731,34 @@ impl RustTermApp {
     }
 
     /// Saved-profile list plus the delete control.
-    fn saved_sessions_ui(&mut self, ui: &mut egui::Ui) {
+    fn saved_sessions_ui(&mut self, ui: &mut egui::Ui, theme: &Theme) {
         let profiles = self.store.profiles().to_vec();
         let mut delete_clicked = false;
         let mut load: Option<usize> = None;
 
-        let empty_hint = "No saved sessions yet. Fill in the form above and press Save profile.";
+        theme::section_label(ui, theme, "Saved sessions");
         if profiles.is_empty() {
-            ui.label(egui::RichText::new(empty_hint).weak());
+            theme::muted(
+                ui,
+                theme,
+                "No saved sessions yet. Fill in the form above and press Save profile.",
+            );
             return;
         }
 
-        ui.label(format!("Saved sessions ({}):", profiles.len()));
+        theme::muted(ui, theme, format!("{} saved", profiles.len()));
+        ui.add_space(4.0);
         egui::ScrollArea::vertical()
             .id_salt("saved_sessions")
-            .max_height(140.0)
+            .max_height(170.0)
             .show(ui, |ui| {
                 for (index, profile) in profiles.iter().enumerate() {
+                    let selected = self.selected_profile == Some(index);
                     let text = format!(
-                        "{}  —  {}@{}:{}",
+                        "{}   ·   {}@{}:{}",
                         profile.name, profile.user, profile.host, profile.port
                     );
-                    let response = ui.selectable_label(self.selected_profile == Some(index), text);
+                    let response = ui.selectable_label(selected, text);
                     if response.clicked() {
                         load = Some(index);
                     }
@@ -702,6 +768,7 @@ impl RustTermApp {
                 }
             });
 
+        ui.add_space(4.0);
         ui.horizontal(|ui| {
             let can_delete = self.selected_profile.is_some();
             if ui
@@ -711,7 +778,14 @@ impl RustTermApp {
             {
                 delete_clicked = true;
             }
-            ui.label(egui::RichText::new(format!("File: {}", self.store.path().display())).weak());
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(format!("File: {}", self.store.path().display()))
+                        .small()
+                        .color(theme.palette.muted),
+                )
+                .truncate(),
+            );
         });
 
         if let Some(index) = load {
@@ -728,110 +802,196 @@ impl RustTermApp {
     }
 
     fn new_session_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading("New SSH session");
-        ui.add_space(8.0);
-
-        egui::Grid::new("connect_form")
-            .num_columns(2)
-            .spacing([10.0, 6.0])
+        let theme = self.theme.theme();
+        egui::ScrollArea::vertical()
+            .id_salt("new_session_scroll")
+            .auto_shrink([false, false])
             .show(ui, |ui| {
-                ui.label("Host");
-                ui.text_edit_singleline(&mut self.form.host);
-                ui.end_row();
+                ui.add_space(24.0);
+                let width = 560.0_f32.min((ui.available_width() - 24.0).max(280.0));
+                let leading = ((ui.available_width() - width) * 0.5).max(0.0);
 
-                ui.label("Port");
-                ui.text_edit_singleline(&mut self.form.port);
-                ui.end_row();
-
-                ui.label("User");
-                ui.text_edit_singleline(&mut self.form.user);
-                ui.end_row();
-
-                ui.label("Public key");
                 ui.horizontal(|ui| {
-                    ui.checkbox(&mut self.form.use_key, "Use");
-                    ui.add_enabled(
-                        self.form.use_key,
-                        egui::TextEdit::singleline(&mut self.form.key_path)
-                            .hint_text("blank = auto-detect ~/.ssh/id_*")
-                            .desired_width(240.0),
+                    ui.add_space(leading);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(width, 0.0),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            ui.set_width(width);
+                            ui.label(
+                                egui::RichText::new("New SSH session")
+                                    .size(24.0)
+                                    .strong()
+                                    .color(theme.palette.text),
+                            );
+                            theme::muted(ui, theme, "Connect to a remote machine over SSH.");
+                            ui.add_space(16.0);
+
+                            theme::card_frame(theme).show(ui, |ui| {
+                                ui.set_width(width - theme.metrics.card_padding * 2.0);
+                                theme::section_label(ui, theme, "Connection");
+                                ui.add_space(8.0);
+
+                                ui.horizontal(|ui| {
+                                    let port_width = 82.0_f32;
+                                    let host_width = (ui.available_width()
+                                        - port_width
+                                        - ui.spacing().item_spacing.x)
+                                        .max(140.0);
+                                    ui.vertical(|ui| {
+                                        field_label(ui, theme, "Host");
+                                        ui.add_sized(
+                                            [host_width, theme.metrics.control_height],
+                                            egui::TextEdit::singleline(&mut self.form.host)
+                                                .hint_text("example.com"),
+                                        );
+                                    });
+                                    ui.vertical(|ui| {
+                                        field_label(ui, theme, "Port");
+                                        ui.add_sized(
+                                            [port_width, theme.metrics.control_height],
+                                            egui::TextEdit::singleline(&mut self.form.port)
+                                                .hint_text("22"),
+                                        );
+                                    });
+                                });
+
+                                ui.add_space(8.0);
+                                field_label(ui, theme, "User");
+                                ui.add_sized(
+                                    [ui.available_width(), theme.metrics.control_height],
+                                    egui::TextEdit::singleline(&mut self.form.user)
+                                        .hint_text("username"),
+                                );
+
+                                ui.add_space(8.0);
+                                field_label(ui, theme, "Password");
+                                ui.add_sized(
+                                    [ui.available_width(), theme.metrics.control_height],
+                                    egui::TextEdit::singleline(&mut self.form.password)
+                                        .password(true)
+                                        .hint_text("Password"),
+                                )
+                                .on_hover_text(
+                                    "Used when key/agent authentication is disabled or fails.",
+                                );
+
+                                ui.add_space(8.0);
+                                egui::CollapsingHeader::new(
+                                    egui::RichText::new("Authentication").strong(),
+                                )
+                                .id_salt("auth_options")
+                                .default_open(self.form.use_key || self.form.use_agent)
+                                .show(ui, |ui| {
+                                    ui.add_space(4.0);
+                                    ui.checkbox(&mut self.form.use_key, "Use a private key")
+                                        .on_hover_text(
+                                            "Tried before the password. Leave the path blank to \
+                                             use ~/.ssh/id_ed25519, id_ecdsa, id_rsa or id_dsa.",
+                                        );
+                                    ui.add_enabled(
+                                        self.form.use_key,
+                                        egui::TextEdit::singleline(&mut self.form.key_path)
+                                            .hint_text("Key path (blank = auto-detect)")
+                                            .desired_width(ui.available_width()),
+                                    );
+                                    ui.add_space(2.0);
+                                    ui.checkbox(
+                                        &mut self.form.use_agent,
+                                        "Use SSH agent identities",
+                                    )
+                                    .on_hover_text(
+                                        "Tried after a key file and before the password. Best for \
+                                         passphrase-protected keys loaded with ssh-add.",
+                                    );
+
+                                    // Hidden entirely in lean builds
+                                    // (`--no-default-features`).
+                                    if KEYRING_ENABLED {
+                                        ui.checkbox(
+                                            &mut self.form.save_password,
+                                            "Save password in the system keyring",
+                                        )
+                                        .on_hover_text(
+                                            "Optional, per profile. Requires an explicit profile \
+                                             name. Stored by the OS keyring, never in \
+                                             sessions.toml.",
+                                        );
+                                    }
+                                });
+
+                                ui.add_space(12.0);
+                                let connecting = self.connecting.is_some();
+                                let connecting_label = self.connecting.as_ref().map(|state| {
+                                    if state.prompt.is_some() {
+                                        "Waiting for host key confirmation…".to_string()
+                                    } else {
+                                        format!("Connecting to {}…", state.label)
+                                    }
+                                });
+
+                                ui.horizontal(|ui| {
+                                    let button = egui::Button::new(
+                                        egui::RichText::new("Connect")
+                                            .strong()
+                                            .color(egui::Color32::WHITE),
+                                    )
+                                    .fill(theme.palette.accent)
+                                    .stroke(egui::Stroke::NONE)
+                                    .min_size(egui::vec2(120.0, 32.0))
+                                    .rounding(egui::Rounding::same(theme.metrics.radius));
+                                    if ui.add_enabled(!connecting, button).clicked() {
+                                        self.start_connect(ui.ctx());
+                                    }
+                                    if let Some(label) = connecting_label {
+                                        ui.spinner();
+                                        theme::muted(ui, theme, label);
+                                    }
+                                });
+
+                                if !self.status.text.is_empty() {
+                                    ui.add_space(10.0);
+                                    let color = if self.status.is_error {
+                                        theme.palette.danger
+                                    } else {
+                                        theme.palette.success
+                                    };
+                                    ui.horizontal(|ui| {
+                                        ui.label(egui::RichText::new("●").color(color).size(10.0));
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(&self.status.text).color(color),
+                                            )
+                                            .wrap(),
+                                        );
+                                    });
+                                }
+                            });
+
+                            ui.add_space(14.0);
+                            theme::card_frame(theme).show(ui, |ui| {
+                                ui.set_width(width - theme.metrics.card_padding * 2.0);
+                                theme::section_label(ui, theme, "Profile");
+                                theme::muted(
+                                    ui,
+                                    theme,
+                                    "Save this connection for one-click reuse.",
+                                );
+                                ui.add_space(6.0);
+                                self.save_profile_ui(ui, theme);
+                            });
+
+                            ui.add_space(14.0);
+                            theme::card_frame(theme).show(ui, |ui| {
+                                ui.set_width(width - theme.metrics.card_padding * 2.0);
+                                self.saved_sessions_ui(ui, theme);
+                            });
+
+                            ui.add_space(24.0);
+                        },
                     );
-                })
-                .response
-                .on_hover_text(
-                    "Tried before the password. Leave the path blank to use \
-                     ~/.ssh/id_ed25519, id_ecdsa, id_rsa or id_dsa.",
-                );
-                ui.end_row();
-
-                ui.label("SSH agent");
-                ui.checkbox(
-                    &mut self.form.use_agent,
-                    "Use identities from SSH_AUTH_SOCK",
-                )
-                .on_hover_text(
-                    "Tried after a key file and before the password. Best for \
-                     passphrase-protected keys loaded with ssh-add.",
-                );
-                ui.end_row();
-
-                ui.label("Password");
-                ui.add(egui::TextEdit::singleline(&mut self.form.password).password(true))
-                    .on_hover_text("Used when key/agent authentication is disabled or fails.");
-                ui.end_row();
-
-                // Hidden entirely in lean builds (`--no-default-features`).
-                if KEYRING_ENABLED {
-                    ui.label("");
-                    ui.checkbox(
-                        &mut self.form.save_password,
-                        "Save password in the system keyring",
-                    )
-                    .on_hover_text(
-                        "Optional, per profile. Requires an explicit profile name. \
-                         Stored by the OS keyring, never in sessions.toml.",
-                    );
-                    ui.end_row();
-                }
+                });
             });
-
-        ui.add_space(8.0);
-
-        let connecting = self.connecting.is_some();
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(!connecting, egui::Button::new("Connect"))
-                .clicked()
-            {
-                self.start_connect(ui.ctx());
-            }
-            if let Some(state) = &self.connecting {
-                ui.spinner();
-                if state.prompt.is_some() {
-                    ui.label("Waiting for host key confirmation…");
-                } else {
-                    ui.label(format!("Connecting to {}…", state.label));
-                }
-            }
-        });
-
-        ui.add_space(4.0);
-        self.save_profile_ui(ui);
-
-        if !self.status.text.is_empty() {
-            ui.add_space(8.0);
-            let color = if self.status.is_error {
-                egui::Color32::LIGHT_RED
-            } else {
-                egui::Color32::LIGHT_GREEN
-            };
-            ui.colored_label(color, &self.status.text);
-        }
-
-        ui.add_space(10.0);
-        ui.separator();
-        ui.add_space(6.0);
-        self.saved_sessions_ui(ui);
     }
 
     /// Render the remote file browser for one session.

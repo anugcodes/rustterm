@@ -2,9 +2,11 @@ mod app;
 mod input;
 mod secrets;
 mod sessions;
+mod settings;
 mod sftp;
 mod ssh;
 mod terminal;
+mod theme;
 
 use app::RustTermApp;
 

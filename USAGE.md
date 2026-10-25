@@ -249,3 +249,172 @@ appear to do nothing (or trigger random commands).
       accepts both forms, so this must keep working).
 - [ ] After quitting `htop`/`vim`, arrow keys in the shell still work — the
       mode must be cleared when the program exits (`?1l`).
+
+## 11. Connection performance and legacy servers — [U]
+
+**How:** every connection enables `TCP_NODELAY` and negotiates OpenSSH's
+delayed `zlib@openssh.com` compression (the same as `ssh -C`). The SSH thread
+wakes the UI as soon as output arrives, so remote echo is drawn immediately
+rather than on the next input event. All tabs are drained every frame, so a
+background session never accumulates a backlog.
+
+Old servers remain supported: modern KEX and host-key algorithms are still
+preferred, with `diffie-hellman-group14-sha1` and `ssh-rsa` appended as
+fallbacks. RSA `known_hosts` entries are matched by key material, so an old
+`ssh-rsa` key does not trigger a fresh trust prompt on every connect.
+
+`cargo run` itself is now optimised: local crates build at `opt-level = 1` and
+dependencies at `opt-level = 2`. For the best throughput use
+`cargo run --release`.
+
+**Verify**
+
+- [ ] Type in a shell on a high-latency host: characters echo back promptly
+      (roughly one network round trip), not only after the next keypress.
+- [ ] Hold a key down or run `seq 1 300`: output scrolls smoothly and the
+      window stays responsive.
+- [ ] `cat` a large file and press `Ctrl+C`: the UI reacts and the transfer
+      stops; the window does not freeze while output is being decoded.
+- [ ] Open two sessions in separate tabs; run a long output in the background
+      tab, switch to it → output is already up to date rather than dumped in one
+      visible burst.
+- [ ] Connect to an OpenSSH 5.x host (e.g. `172.31.251.23`): no "no common key
+      exchange algorithm" error, and only one host-key prompt on first use.
+- [ ] Idle CPU still stays ~0% while connected.
+
+## 12. Saved session profiles — [U]
+
+**How:** on the **New Session** tab, fill in Host/Port/User, optionally type a
+**Profile name** (leave it blank to use `user@host`), and press **Save profile**.
+The profile appears in the list below. Click an entry to load its host, port and
+user back into the form, then type the password and press **Connect**. Select an
+entry and press **Delete selected** to remove it.
+
+Profiles are stored atomically in:
+
+```
+$XDG_CONFIG_HOME/rustterm/sessions.toml      # if XDG_CONFIG_HOME is set
+~/.config/rustterm/sessions.toml             # otherwise
+```
+
+Only connection metadata is written to that file. Saving a profile whose name
+already exists updates it in place. Load/save problems are shown inline
+(red = error, green = confirmation) and never stop the app from starting.
+
+### Optional keyring password
+
+Tick **Save password in the system keyring** (under the Password field) before
+pressing **Save profile** to store the password too. This is strictly opt-in and
+per profile. When it is ticked:
+
+- an explicit **Profile name is mandatory** — a blank name is rejected with
+  `Profile name is required when saving the password`;
+- the password must be non-empty;
+- the secret is written to the OS keyring under service `rustterm` and account
+  = profile name (on Linux: GNOME Keyring / KWallet through Secret Service), so
+  it is **never** written to `sessions.toml`;
+- if the keyring is locked or unavailable, saving fails with a red error and the
+  profile file is left untouched.
+
+Loading such a profile fills the password box from the keyring. If the entry is
+missing or cannot be read, an error is shown and you can type the password
+manually; **Connect** always uses whatever is in the password box.
+
+Unticking the box and saving again deletes the stored secret. Deleting the
+profile also deletes its keyring entry. Entries appear in **Seahorse** (Passwords
+and Keys) under `rustterm` / `<profile name>`, or with
+`secret-tool search service rustterm`.
+
+### Lean builds without keyring support
+
+The keyring stack is optional at **compile time** (`keyring-secrets`, on by
+default). Packagers or minimal installs can build without it:
+
+```bash
+cargo build --release --no-default-features
+```
+
+That drops 47 crates (the zbus/Secret Service stack) and about 2.3 MB from the
+stripped binary. In such a build:
+
+- the **Save password in the system keyring** checkbox is not shown;
+- passwords are always typed manually and never stored by the app;
+- a profile saved elsewhere with `save_password = true` still lists and loads,
+  but shows *“this build has no keyring support”* instead of filling the
+  password; re-saving it keeps the flag, so the secret is not orphaned if the
+  full build is used again.
+
+There is no runtime plugin download: Rust links the keyring code at build time.
+Offering the feature later requires installing a build that includes it (or a
+future separate helper binary).
+
+Example file (the password itself never appears):
+
+```toml
+# rustterm saved sessions.
+# Passwords are never stored here.
+
+[[sessions]]
+name = "legacy box"
+host = "172.31.251.23"
+port = 22
+user = "anuragb"
+save_password = true          # secret lives in the OS keyring
+```
+
+**Verify**
+
+- [ ] Launch with no config file. The list says "No saved sessions yet."
+- [ ] Fill Host `172.31.251.23`, Port `22`, User `anuragb`, leave the name
+      blank, press **Save profile** → green `Saved profile 'anuragb@172.31.251.23'`
+      and one entry appears without restarting.
+- [ ] `cat ~/.config/rustterm/sessions.toml` → it contains name/host/port/user
+      and **no plaintext password** (only an optional `save_password` flag).
+- [ ] Click the saved entry → Host/Port/User are filled in, the password box is
+      empty, the name box shows the profile name, and the entry is highlighted.
+- [ ] Type the password and **Connect** → the session opens normally.
+- [ ] **Name is mandatory for keyring saves**: tick **Save password in the
+      system keyring**, clear the Profile name, press **Save profile** → red
+      `Profile name is required when saving the password`; no file change.
+- [ ] **Store**: enter name `legacy`, tick the box, type the password, press
+      **Save profile** → green confirmation. The TOML gains
+      `save_password = true` but no password text.
+- [ ] **Load**: click another profile, then `legacy` → the password box is
+      filled automatically from the keyring and the box stays ticked.
+- [ ] Connect with the auto-filled password → login succeeds.
+- [ ] The secret exists in the OS keyring: Seahorse shows `rustterm` / `legacy`,
+      or `secret-tool search service rustterm` finds it.
+- [ ] **Stop storing**: untick the box and press **Save profile** → green
+      confirmation; the keyring entry is gone and loading `legacy` no longer
+      fills a password.
+- [ ] Re-tick, save, then **Delete selected** → profile and keyring entry both
+      disappear.
+- [ ] **Missing secret recovery**: remove the entry manually in Seahorse, click
+      the profile → red `No password is stored for '…'`; type the password and
+      **Connect** still works.
+- [ ] **No keyring available** (only on a system without Secret Service): tick
+      the box, press Save → red keyring error; no profile is written, and
+      password-based connections still work.
+- [ ] **Lean build**: `cargo run --no-default-features` → the keyring checkbox is
+      absent; saving profiles and connecting with a typed password work as before.
+- [ ] **Lean build + stored profile**: with a `save_password = true` profile from
+      a full build, load it in the lean build → red “this build has no keyring
+      support”; type the password and **Connect** still works. Re-saving keeps
+      `save_password = true` in the TOML.
+- [ ] Quit and `cargo run` again → the profile is still listed, and keyring
+      passwords load again.
+- [ ] Save a second profile with a custom name, e.g. `prod`. Both entries appear;
+      the list scrolls after roughly five entries.
+- [ ] With `prod` loaded, change the port and press **Save profile** again →
+      still one `prod` entry, now with the new port (no duplicate).
+- [ ] Select `prod`, press **Delete selected** → it disappears immediately and
+      is gone after a restart.
+- [ ] Clear Host, press **Save profile** → red `Host is required`; the file is
+      unchanged.
+- [ ] Set Port to `abc`, press **Save profile** → red `Port must be a number`.
+- [ ] Set Port to `0`, press **Save profile** → red `Port must be between 1 and 65535`.
+- [ ] Malformed-file resilience: back up the file, replace it with `garbage = =`,
+      relaunch → a red parse error is shown but the app still starts and can
+      connect manually. Saving a new profile replaces the malformed file.
+- [ ] `XDG_CONFIG_HOME=/tmp/rt-config cargo run` → profiles are read/written
+      under `/tmp/rt-config/rustterm/sessions.toml`.

@@ -17,6 +17,7 @@
 //! host asks the UI for a trust-on-first-use decision and records the answer;
 //! a *changed* key is refused outright, with no way to click through it.
 
+use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
@@ -28,9 +29,13 @@ use russh::client::{self, Handle, Msg as ClientMsg};
 // `keys` root. `HashAlg` does not exist in russh 0.45 — `fingerprint()` takes
 // no arguments and hashes with SHA-256 internally.
 use russh::keys::key::PublicKey;
-use russh::keys::{check_known_hosts, learn_known_hosts};
-use russh::{Channel, ChannelMsg};
+use russh::keys::{check_known_hosts, known_host_keys, learn_known_hosts};
+use russh::{compression, Channel, ChannelMsg};
+use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
+
+/// Wakes the egui thread when asynchronous SSH data arrives.
+pub type Wake = Arc<dyn Fn() + Send + Sync>;
 
 pub struct SshConfig {
     pub host: String,
@@ -93,6 +98,7 @@ impl SshSession {
     pub fn connect(
         config: SshConfig,
         prompt_tx: Option<std_mpsc::Sender<HostKeyPrompt>>,
+        wake: Option<Wake>,
     ) -> Result<Self> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -120,6 +126,7 @@ impl SshSession {
                     resize_rx,
                     disconnect_rx,
                     output_tx,
+                    wake,
                 ));
             })
             .context("failed to spawn SSH session thread")?;
@@ -158,11 +165,46 @@ impl SshSession {
     }
 }
 
+/// Build the SSH client configuration.
+///
+/// Keep russh's modern defaults first, but append two legacy fallbacks for old
+/// OpenSSH servers. In particular, OpenSSH 5.3 only offers SHA-1 key exchange
+/// (`diffie-hellman-group14-sha1`) and an `ssh-rsa` host key. Modern servers
+/// still negotiate the preferred algorithms because the client's list order is
+/// preserved.
+fn client_config() -> client::Config {
+    let mut preferred = russh::Preferred::DEFAULT.clone();
+
+    let mut kex = preferred.kex.into_owned();
+    kex.push(russh::kex::DH_G14_SHA1);
+    preferred.kex = Cow::Owned(kex);
+
+    let mut key = preferred.key.into_owned();
+    key.push(russh::keys::key::SSH_RSA);
+    preferred.key = Cow::Owned(key);
+
+    // Prefer OpenSSH's "delayed" zlib (`zlib@openssh.com`), matching `ssh -C`.
+    // `russh` only starts compressing after authentication for both zlib names,
+    // so this behaves like OpenSSH's delayed mode. The client's list order is
+    // what gets negotiated, so putting the legacy name first makes OpenSSH
+    // servers choose it; plain `zlib` stays as a fallback for servers that do
+    // not implement the OpenSSH extension.
+    let mut compress = preferred.compression.into_owned();
+    compress.retain(|name| *name != compression::ZLIB_LEGACY);
+    compress.insert(0, compression::ZLIB_LEGACY);
+    preferred.compression = Cow::Owned(compress);
+
+    client::Config {
+        preferred,
+        ..client::Config::default()
+    }
+}
+
 async fn connect_and_auth(
     config: &SshConfig,
     prompt_tx: Option<std_mpsc::Sender<HostKeyPrompt>>,
 ) -> Result<(Handle<ClientHandler>, Channel<ClientMsg>)> {
-    let ssh_config = Arc::new(client::Config::default());
+    let ssh_config = Arc::new(client_config());
     let addr = (config.host.as_str(), config.port);
 
     // The handler is moved into `client::connect`, so the reason for a
@@ -175,7 +217,17 @@ async fn connect_and_auth(
         failure: Arc::clone(&failure),
     };
 
-    let mut session = match client::connect(ssh_config, addr, handler).await {
+    // `client::connect` does not set TCP_NODELAY. On high-latency links Nagle's
+    // algorithm then delays small keystrokes by hundreds of milliseconds waiting
+    // for an ACK. OpenSSH sets this itself; do the same explicitly.
+    let socket = TcpStream::connect(addr)
+        .await
+        .context("TCP connection failed")?;
+    socket
+        .set_nodelay(true)
+        .context("failed to enable TCP_NODELAY")?;
+
+    let mut session = match client::connect_stream(ssh_config, socket, handler).await {
         Ok(session) => session,
         Err(err) => {
             let reason = failure.lock().ok().and_then(|mut slot| slot.take());
@@ -236,6 +288,7 @@ async fn run_session(
     mut resize_rx: mpsc::UnboundedReceiver<(u16, u16)>,
     mut disconnect_rx: mpsc::UnboundedReceiver<()>,
     output_tx: std_mpsc::Sender<Vec<u8>>,
+    wake: Option<Wake>,
 ) {
     loop {
         tokio::select! {
@@ -268,10 +321,16 @@ async fn run_session(
                         if output_tx.send(data.to_vec()).is_err() {
                             break;
                         }
+                        if let Some(wake) = wake.as_ref() {
+                            wake();
+                        }
                     }
                     Some(ChannelMsg::ExtendedData { data, .. }) => {
                         if output_tx.send(data.to_vec()).is_err() {
                             break;
+                        }
+                        if let Some(wake) = wake.as_ref() {
+                            wake();
                         }
                     }
                     Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
@@ -285,6 +344,9 @@ async fn run_session(
     let _ = session
         .disconnect(russh::Disconnect::ByApplication, "", "en")
         .await;
+    if let Some(wake) = wake.as_ref() {
+        wake();
+    }
 }
 
 struct ClientHandler {
@@ -315,7 +377,7 @@ impl client::Handler for ClientHandler {
         // 1. Already known and matching?
         match check_known_hosts(&self.host, self.port, server_public_key) {
             Ok(true) => return Ok(true),
-            // Unknown host: fall through to the TOFU prompt.
+            // Unknown host or an RSA algorithm-name mismatch: fall through.
             Ok(false) => {}
             // A *different* key is recorded for this host. Refuse, and do not
             // offer a way to accept it from the client.
@@ -327,6 +389,29 @@ impl client::Handler for ClientHandler {
             }
             // Unreadable known_hosts or another verification problem: fail
             // closed.
+            Err(err) => {
+                self.fail(HostKeyFailure::Error {
+                    message: format!("known_hosts: {err}"),
+                });
+                return Ok(false);
+            }
+        }
+
+        // `check_known_hosts` compares algorithm names as well as keys. It
+        // always parses an RSA entry as `rsa-sha2-256`, but an old server that
+        // negotiated `ssh-rsa` presents the same key with the `ssh-rsa` name.
+        // Compare the key material for RSA entries before showing a TOFU
+        // prompt, otherwise the prompt would reappear on every connection.
+        match known_rsa_key_status(&self.host, self.port, server_public_key) {
+            Ok(Some(true)) => return Ok(true),
+            Ok(Some(false)) => {
+                self.fail(HostKeyFailure::Changed {
+                    fingerprint: fingerprint(server_public_key),
+                });
+                return Ok(false);
+            }
+            // No RSA entry for this host: genuinely unknown.
+            Ok(None) => {}
             Err(err) => {
                 self.fail(HostKeyFailure::Error {
                     message: format!("known_hosts: {err}"),
@@ -378,6 +463,38 @@ impl client::Handler for ClientHandler {
 /// it hashes the key with SHA-256 internally and returns the `SHA256:...` string.
 fn fingerprint(key: &PublicKey) -> String {
     key.fingerprint()
+}
+
+/// Compare RSA host-key material while ignoring the signature algorithm name.
+///
+/// `known_hosts` entries are always parsed with `rsa-sha2-256` as the algorithm,
+/// whereas an OpenSSH 5.x server negotiated with `ssh-rsa` reports `ssh-rsa`.
+/// `PublicKey` equality already ignores that hash field, so direct comparison
+/// works once the RSA entries for the host are collected.
+///
+/// Returns `Ok(None)` when no RSA key is recorded for the host, `Ok(Some(true))`
+/// when one matches, and `Ok(Some(false))` when RSA keys exist but none match
+/// (a changed key).
+fn known_rsa_key_status(
+    host: &str,
+    port: u16,
+    server_key: &PublicKey,
+) -> std::result::Result<Option<bool>, russh::keys::Error> {
+    if !matches!(server_key, PublicKey::RSA { .. }) {
+        return Ok(None);
+    }
+
+    let mut saw_rsa = false;
+    for (_, recorded) in known_host_keys(host, port)? {
+        if matches!(recorded, PublicKey::RSA { .. }) {
+            saw_rsa = true;
+            if &recorded == server_key {
+                return Ok(Some(true));
+            }
+        }
+    }
+
+    Ok(if saw_rsa { Some(false) } else { None })
 }
 
 /// Record a host key in `~/.ssh/known_hosts`.

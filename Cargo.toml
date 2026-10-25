@@ -5,6 +5,13 @@ edition = "2021"
 description = "A lightweight MobaXterm-style SSH client for Linux"
 license = "MIT"
 
+[features]
+# Enabled for normal builds. Packagers can build a lean binary without the
+# Secret Service / zbus stack using `--no-default-features`; the keyring
+# checkbox then disappears and passwords are typed manually.
+default = ["keyring-secrets"]
+keyring-secrets = ["dep:keyring"]
+
 [dependencies]
 eframe = { version = "0.29", default-features = false, features = ["glow", "default_fonts"] }
 egui = "0.29"
@@ -15,8 +22,22 @@ async-trait = "0.1"
 anyhow = "1"
 log = "0.4"
 env_logger = "0.11"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+keyring = { version = "4.2", optional = true }
+
+[profile.dev]
+# `cargo run` is the normal development command; without optimisation the
+# terminal renderer and per-byte VTE decoding are painfully slow.
+opt-level = 1
+
+[profile.dev.package."*"]
+# Dependencies (especially flate2, russh and egui) benefit more from full
+# optimisation than from debug assertions during normal app use.
+opt-level = 2
 
 [profile.release]
-opt-level = 2
-lto = true
+opt-level = 3
+lto = "thin"
+codegen-units = 1
 strip = true

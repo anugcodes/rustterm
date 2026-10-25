@@ -15,28 +15,36 @@
 //!
 //! Resize forwarding uses `TerminalView::take_resize()`.
 //!
-//! Repaint gating: egui is left to sleep when nothing has happened. A repaint
-//! is only scheduled while a connect is pending, or in the few frames after
-//! input/output (`poll_countdown`).
+//! Repaint gating: egui is left to sleep when nothing has happened. The SSH
+//! thread calls `request_repaint` when output arrives, while a timer is only
+//! needed while a connection attempt is still in progress.
 
 use std::sync::mpsc as std_mpsc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use eframe::egui;
 
 use crate::input;
-use crate::ssh::{HostKeyPrompt, SshConfig, SshSession};
+use crate::secrets;
+use crate::sessions::{SessionProfile, SessionStore};
+use crate::ssh::{HostKeyPrompt, SshConfig, SshSession, Wake};
 use crate::terminal::{TermAction, TerminalView};
 
 const NEW_SESSION_TAB: usize = 0;
 const DEFAULT_COLS: usize = 80;
 const DEFAULT_ROWS: usize = 24;
 
-/// Delay between "activity" frames while polling for SSH output.
-const REPAINT_DELAY_MS: u64 = 8;
-/// Number of extra frames to keep polling after the last sign of activity,
-/// so echo that lags behind a keystroke by a few frames is not dropped.
-const POST_ACTIVITY_FRAMES: u8 = 3;
+/// Delay between frames while a connection attempt is still in progress. Once
+/// connected, the SSH thread wakes the UI itself when output arrives.
+const CONNECT_POLL_MS: u64 = 8;
+
+/// Upper bound on remote bytes decoded in a single frame. This keeps a large
+/// burst from stalling the UI while still allowing tens of MiB/s sustained.
+const MAX_OUTPUT_PER_FRAME: usize = 256 * 1024;
+
+/// Whether this build includes the optional OS-keyring support.
+const KEYRING_ENABLED: bool = cfg!(feature = "keyring-secrets");
 
 pub struct RustTermApp {
     sessions: Vec<ActiveSession>,
@@ -44,10 +52,20 @@ pub struct RustTermApp {
     active: usize,
     form: ConnectForm,
     connecting: Option<ConnectingState>,
-    status: String,
-    /// Frames left in the current "keep polling" window. Refreshed whenever
-    /// output is read or input is sent; when it hits zero, egui sleeps.
-    poll_countdown: u8,
+    /// Persisted profiles loaded at startup (F19: no passwords stored).
+    store: SessionStore,
+    /// Name used by the "Save profile" button.
+    profile_name: String,
+    /// Highlighted entry in the saved-session list.
+    selected_profile: Option<usize>,
+    status: StatusMessage,
+}
+
+/// One line of user feedback below the connect form.
+#[derive(Default)]
+struct StatusMessage {
+    text: String,
+    is_error: bool,
 }
 
 struct ActiveSession {
@@ -71,6 +89,8 @@ struct ConnectForm {
     port: String,
     user: String,
     password: String,
+    /// Opt-in: store the password in the OS keyring for this profile.
+    save_password: bool,
 }
 
 impl Default for ConnectForm {
@@ -80,19 +100,31 @@ impl Default for ConnectForm {
             port: "22".to_string(),
             user: String::new(),
             password: String::new(),
+            save_password: false,
         }
     }
 }
 
 impl Default for RustTermApp {
     fn default() -> Self {
+        let store = SessionStore::load_default();
+        let status = match store.error() {
+            Some(err) => StatusMessage {
+                text: err.to_string(),
+                is_error: true,
+            },
+            None => StatusMessage::default(),
+        };
+
         Self {
             sessions: Vec::new(),
             active: NEW_SESSION_TAB,
             form: ConnectForm::default(),
             connecting: None,
-            status: String::new(),
-            poll_countdown: 0,
+            store,
+            profile_name: String::new(),
+            selected_profile: None,
+            status,
         }
     }
 }
@@ -102,7 +134,22 @@ impl RustTermApp {
         Self::default()
     }
 
-    fn start_connect(&mut self) {
+    fn set_error(&mut self, text: impl Into<String>) {
+        self.status.text = text.into();
+        self.status.is_error = true;
+    }
+
+    fn set_info(&mut self, text: impl Into<String>) {
+        self.status.text = text.into();
+        self.status.is_error = false;
+    }
+
+    fn clear_status(&mut self) {
+        self.status.text.clear();
+        self.status.is_error = false;
+    }
+
+    fn start_connect(&mut self, ctx: &egui::Context) {
         if self.connecting.is_some() {
             return; // one connect attempt at a time
         }
@@ -111,13 +158,13 @@ impl RustTermApp {
         let port: u16 = match self.form.port.trim().parse() {
             Ok(p) => p,
             Err(_) => {
-                self.status = "Port must be a number".to_string();
+                self.set_error("Port must be a number");
                 return;
             }
         };
         let user = self.form.user.trim().to_string();
         if host.is_empty() || user.is_empty() {
-            self.status = "Host and user are required".to_string();
+            self.set_error("Host and user are required");
             return;
         }
 
@@ -129,10 +176,19 @@ impl RustTermApp {
         };
         let label = format!("{}@{}:{}", config.user, config.host, config.port);
 
+        // The SSH thread wakes egui as soon as output arrives. Without this,
+        // remote echo on a high-latency link was only displayed on the next
+        // keyboard/mouse event (the previous 8 ms polling tail had long expired).
+        let wake: Wake = {
+            let ctx = ctx.clone();
+            Arc::new(move || ctx.request_repaint())
+        };
+
         let (tx, rx) = std_mpsc::channel();
         let (prompt_tx, prompt_rx) = std_mpsc::channel();
         std::thread::spawn(move || {
-            let result = SshSession::connect(config, Some(prompt_tx)).map_err(|e| format!("{e:#}"));
+            let result = SshSession::connect(config, Some(prompt_tx), Some(wake))
+                .map_err(|e| format!("{e:#}"));
             let _ = tx.send(result);
         });
 
@@ -142,10 +198,8 @@ impl RustTermApp {
             prompt: None,
             label,
         });
-        self.status.clear();
+        self.clear_status();
         self.active = NEW_SESSION_TAB;
-        // Poll the connect result without waiting for the user to click.
-        self.poll_countdown = POST_ACTIVITY_FRAMES;
     }
 
     /// Poll the background connect attempt.
@@ -185,7 +239,7 @@ impl RustTermApp {
             Polled::Pending => false,
             Polled::WorkerGone => {
                 self.connecting = None;
-                self.status = "Connect failed: worker thread died".to_string();
+                self.set_error("Connect failed: worker thread died");
                 true
             }
             Polled::Ready(Ok(ssh)) => {
@@ -204,7 +258,7 @@ impl RustTermApp {
             }
             Polled::Ready(Err(err)) => {
                 self.connecting = None;
-                self.status = format!("Connect failed: {err}");
+                self.set_error(format!("Connect failed: {err}"));
                 true
             }
         }
@@ -287,6 +341,46 @@ impl RustTermApp {
         }
     }
 
+    /// Drain output for *every* session, not just the visible tab.
+    ///
+    /// Leaving background sessions unread would stall their SSH window and
+    /// make switching tabs dump a large backlog all at once. Titles/bells also
+    /// arrive for background tabs, so process them here.
+    ///
+    /// At most [`MAX_OUTPUT_PER_FRAME`] bytes are decoded per frame. A huge
+    /// burst (`cat` of a large file) would otherwise block painting for
+    /// hundreds of milliseconds; the remainder is picked up on the next frame
+    /// and a repaint is requested so it is not left waiting for a wake-up.
+    fn pump_sessions(&mut self, ctx: &egui::Context) -> bool {
+        let mut activity = false;
+        let mut budget = MAX_OUTPUT_PER_FRAME;
+
+        for session in &mut self.sessions {
+            while budget > 0 {
+                let Some(chunk) = session.ssh.try_read() else {
+                    break;
+                };
+                budget = budget.saturating_sub(chunk.len());
+                session.terminal.feed(&chunk);
+                activity = true;
+            }
+            if let Some(title) = session.terminal.take_title() {
+                session.title = title;
+                activity = true;
+            }
+            if session.terminal.take_bell() {
+                log::info!("terminal bell");
+            }
+        }
+
+        if budget == 0 {
+            // Work was left over: keep painting until every queue is empty.
+            ctx.request_repaint();
+        }
+
+        activity
+    }
+
     fn tabs_ui(&mut self, ui: &mut egui::Ui) {
         let mut switch_to: Option<usize> = None;
         let mut close: Option<usize> = None;
@@ -334,6 +428,251 @@ impl RustTermApp {
         }
     }
 
+    /// Fill the connect form from a saved profile.
+    fn load_profile(&mut self, index: usize) {
+        let Some(profile) = self.store.profiles().get(index).cloned() else {
+            return;
+        };
+
+        self.form.host = profile.host;
+        self.form.port = profile.port.to_string();
+        self.form.user = profile.user;
+        self.form.save_password = KEYRING_ENABLED && profile.save_password;
+        // The password is only ever read from the keyring, never from TOML.
+        self.form.password.clear();
+        self.profile_name = profile.name.clone();
+        self.selected_profile = Some(index);
+        self.clear_status();
+
+        if profile.save_password {
+            if KEYRING_ENABLED {
+                match secrets::load(&profile.name) {
+                    Ok(Some(password)) => self.form.password = password,
+                    Ok(None) => self.set_error(format!(
+                        "No password is stored for '{}'. Type one and press Save profile to store it.",
+                        profile.name
+                    )),
+                    Err(err) => {
+                        self.set_error(format!("Could not read the stored password: {err}"))
+                    }
+                }
+            } else {
+                self.set_error(format!(
+                    "'{}' stores its password in the system keyring, but this build \
+                     has no keyring support. Type the password manually.",
+                    profile.name
+                ));
+            }
+        }
+    }
+
+    fn save_profile(&mut self) {
+        let host = self.form.host.trim().to_string();
+        let user = self.form.user.trim().to_string();
+        let port: u16 = match self.form.port.trim().parse() {
+            Ok(port) => port,
+            Err(_) => {
+                self.set_error("Port must be a number");
+                return;
+            }
+        };
+        let requested = self.form.save_password;
+
+        // A blank name falls back to user@host, but only when the password is
+        // *not* being stored: keyring entries are identified by profile name,
+        // so an explicit name is mandatory in that case.
+        let mut name = self.profile_name.trim().to_string();
+        if name.is_empty() && !requested && !host.is_empty() && !user.is_empty() {
+            name = format!("{user}@{host}");
+        }
+
+        // Whether the previous version of this profile had a keyring entry.
+        // Used to decide if unchecking the box needs a keyring call at all.
+        let had_stored_password = self
+            .store
+            .profiles()
+            .iter()
+            .find(|existing| existing.name == name)
+            .is_some_and(|existing| existing.save_password);
+
+        // In a lean build the checkbox is never shown, so keep any flag that
+        // is already on disk instead of silently dropping the metadata.
+        let save_password = if KEYRING_ENABLED {
+            requested
+        } else {
+            had_stored_password
+        };
+
+        let profile = SessionProfile {
+            name,
+            host,
+            port,
+            user,
+            save_password,
+        };
+        if let Err(message) = profile.validate() {
+            self.set_error(message);
+            return;
+        }
+
+        if KEYRING_ENABLED && requested {
+            if self.form.password.is_empty() {
+                self.set_error("Type a password to store it in the system keyring");
+                return;
+            }
+            // Store the secret first: if the keyring is unavailable, do not
+            // write a profile that claims to have a stored password.
+            if let Err(err) = secrets::save(&profile.name, &self.form.password) {
+                self.set_error(format!(
+                    "Could not store the password in the system keyring: {err}"
+                ));
+                return;
+            }
+        }
+
+        let saved_name = profile.name.clone();
+        match self.store.upsert(profile) {
+            Ok(index) => {
+                self.profile_name = saved_name.clone();
+                self.selected_profile = Some(index);
+
+                if KEYRING_ENABLED && !requested && had_stored_password {
+                    if let Err(err) = secrets::delete(&saved_name) {
+                        self.set_error(format!(
+                            "Profile saved, but its keyring password could not be removed: {err}"
+                        ));
+                        return;
+                    }
+                }
+
+                self.set_info(format!("Saved profile '{saved_name}'"));
+            }
+            Err(err) => self.set_error(format!("Could not save profile: {err}")),
+        }
+    }
+
+    fn delete_selected_profile(&mut self) {
+        let Some(index) = self.selected_profile else {
+            return;
+        };
+
+        match self.store.remove(index) {
+            Ok(Some(profile)) => {
+                self.selected_profile = None;
+
+                if KEYRING_ENABLED && profile.save_password {
+                    if let Err(err) = secrets::delete(&profile.name) {
+                        self.set_error(format!(
+                            "Deleted profile '{}', but its keyring password could not be removed: {err}",
+                            profile.name
+                        ));
+                        return;
+                    }
+                }
+
+                self.set_info(format!("Deleted profile '{}'", profile.name));
+            }
+            Ok(None) => self.selected_profile = None,
+            Err(err) => {
+                // The profile is still on disk; leave it selected.
+                self.set_error(format!("Could not delete profile: {err}"));
+            }
+        }
+    }
+
+    /// Name field + save button, drawn right below the connect form.
+    fn save_profile_ui(&mut self, ui: &mut egui::Ui) {
+        let mut save_clicked = false;
+        let name_hint = if self.form.save_password {
+            "required to save password"
+        } else {
+            "blank = user@host"
+        };
+
+        ui.horizontal(|ui| {
+            ui.label("Profile name");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.profile_name)
+                    .hint_text(name_hint)
+                    .desired_width(220.0),
+            );
+            if ui
+                .button("Save profile")
+                .on_hover_text(
+                    "Saves host, port and user; if the keyring box is checked, \
+                     the password too (requires a profile name).",
+                )
+                .clicked()
+            {
+                save_clicked = true;
+            }
+        });
+
+        if save_clicked {
+            self.save_profile();
+            // The name field was drawn before a blank name was replaced with
+            // `user@host`, so redraw to show the stored name.
+            ui.ctx().request_repaint();
+        }
+    }
+
+    /// Saved-profile list plus the delete control.
+    fn saved_sessions_ui(&mut self, ui: &mut egui::Ui) {
+        let profiles = self.store.profiles().to_vec();
+        let mut delete_clicked = false;
+        let mut load: Option<usize> = None;
+
+        let empty_hint = "No saved sessions yet. Fill in the form above and press Save profile.";
+        if profiles.is_empty() {
+            ui.label(egui::RichText::new(empty_hint).weak());
+            return;
+        }
+
+        ui.label(format!("Saved sessions ({}):", profiles.len()));
+        egui::ScrollArea::vertical()
+            .id_salt("saved_sessions")
+            .max_height(140.0)
+            .show(ui, |ui| {
+                for (index, profile) in profiles.iter().enumerate() {
+                    let text = format!(
+                        "{}  —  {}@{}:{}",
+                        profile.name, profile.user, profile.host, profile.port
+                    );
+                    let response = ui.selectable_label(self.selected_profile == Some(index), text);
+                    if response.clicked() {
+                        load = Some(index);
+                    }
+                    // No double-click shortcut: passwords are not stored, so a
+                    // one-click connect would usually fail authentication.
+                    response.on_hover_text("Click to load into the form");
+                }
+            });
+
+        ui.horizontal(|ui| {
+            let can_delete = self.selected_profile.is_some();
+            if ui
+                .add_enabled(can_delete, egui::Button::new("Delete selected"))
+                .on_hover_text("Removes the profile from sessions.toml")
+                .clicked()
+            {
+                delete_clicked = true;
+            }
+            ui.label(egui::RichText::new(format!("File: {}", self.store.path().display())).weak());
+        });
+
+        if let Some(index) = load {
+            self.load_profile(index);
+            // The form is drawn above this list, so it must be redrawn with
+            // the newly loaded values (and any keyring error).
+            ui.ctx().request_repaint();
+        }
+        if delete_clicked {
+            self.delete_selected_profile();
+            // Redraw the list without the removed entry.
+            ui.ctx().request_repaint();
+        }
+    }
+
     fn new_session_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("New SSH session");
         ui.add_space(8.0);
@@ -357,6 +696,20 @@ impl RustTermApp {
                 ui.label("Password");
                 ui.add(egui::TextEdit::singleline(&mut self.form.password).password(true));
                 ui.end_row();
+
+                // Hidden entirely in lean builds (`--no-default-features`).
+                if KEYRING_ENABLED {
+                    ui.label("");
+                    ui.checkbox(
+                        &mut self.form.save_password,
+                        "Save password in the system keyring",
+                    )
+                    .on_hover_text(
+                        "Optional, per profile. Requires an explicit profile name. \
+                         Stored by the OS keyring, never in sessions.toml.",
+                    );
+                    ui.end_row();
+                }
             });
 
         ui.add_space(8.0);
@@ -367,7 +720,7 @@ impl RustTermApp {
                 .add_enabled(!connecting, egui::Button::new("Connect"))
                 .clicked()
             {
-                self.start_connect();
+                self.start_connect(ui.ctx());
             }
             if let Some(state) = &self.connecting {
                 ui.spinner();
@@ -379,10 +732,23 @@ impl RustTermApp {
             }
         });
 
-        if !self.status.is_empty() {
+        ui.add_space(4.0);
+        self.save_profile_ui(ui);
+
+        if !self.status.text.is_empty() {
             ui.add_space(8.0);
-            ui.colored_label(egui::Color32::LIGHT_RED, &self.status);
+            let color = if self.status.is_error {
+                egui::Color32::LIGHT_RED
+            } else {
+                egui::Color32::LIGHT_GREEN
+            };
+            ui.colored_label(color, &self.status.text);
         }
+
+        ui.add_space(10.0);
+        ui.separator();
+        ui.add_space(6.0);
+        self.saved_sessions_ui(ui);
     }
 
     /// Render one session.
@@ -398,12 +764,6 @@ impl RustTermApp {
     ) -> (bool, bool) {
         let session = &mut self.sessions[index];
         let mut activity = false;
-
-        // Drain queued output before painting so the frame shows fresh data.
-        while let Some(chunk) = session.ssh.try_read() {
-            session.terminal.feed(&chunk);
-            activity = true;
-        }
 
         let response = session.terminal.ui(ui);
 
@@ -434,16 +794,6 @@ impl RustTermApp {
         if !mouse_input.is_empty() {
             session.ssh.write(mouse_input);
             activity = true;
-        }
-
-        if let Some(title) = session.terminal.take_title() {
-            session.title = title;
-            // The tab bar was drawn earlier in this frame; request a repaint so
-            // the new title is shown on the next one.
-            activity = true;
-        }
-        if session.terminal.take_bell() {
-            log::info!("terminal bell");
         }
 
         // Focus: on first appearance, and on click. Never unconditionally per
@@ -522,16 +872,12 @@ impl RustTermApp {
 
 impl eframe::App for RustTermApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if self.poll_connecting() {
-            self.poll_countdown = POST_ACTIVITY_FRAMES;
-        }
-        // Any pending connect keeps us polling: its result — or a host-key
-        // prompt — arrives on a background thread and has to be observed.
-        if self.connecting.is_some() {
-            self.poll_countdown = POST_ACTIVITY_FRAMES;
-        }
+        self.poll_connecting();
 
-        let mut activity = false;
+        // Read background tabs too: SSH flow control must keep moving even when
+        // another session is visible. New output is what wakes egui, so this
+        // happens before the UI is painted.
+        let mut activity = self.pump_sessions(ctx);
 
         egui::TopBottomPanel::top("tab_bar").show(ctx, |ui| {
             self.tabs_ui(ui);
@@ -561,23 +907,16 @@ impl eframe::App for RustTermApp {
         }
 
         if activity {
-            self.poll_countdown = POST_ACTIVITY_FRAMES;
+            // Local terminal actions (selection, mouse reports) also need an
+            // immediate repaint. Remote output already calls `request_repaint`
+            // from the SSH thread.
+            ctx.request_repaint();
         }
 
-        if self.poll_countdown > 0 {
-            self.poll_countdown -= 1;
-            ctx.request_repaint_after(Duration::from_millis(REPAINT_DELAY_MS));
+        // Only connection setup needs a polling timer. Established sessions
+        // wake the UI on demand and otherwise let egui sleep at zero CPU.
+        if self.connecting.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(CONNECT_POLL_MS));
         }
-        if activity {
-            self.poll_countdown = POST_ACTIVITY_FRAMES;
-            // Render immediately so new output (htop, tmux) appears without
-            // waiting for the tail timer.
-            ctx.request_repaint();
-        } else if self.poll_countdown > 0 {
-            self.poll_countdown -= 1;
-            // Short tail so echo arriving a few frames later is still picked up.
-            ctx.request_repaint_after(Duration::from_millis(8));
-        }
-        // Otherwise: no request → egui sleeps until the next input event.
     }
 }

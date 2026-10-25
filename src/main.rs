@@ -1,5 +1,7 @@
 mod app;
 mod input;
+mod secrets;
+mod sessions;
 mod ssh;
 mod terminal;
 

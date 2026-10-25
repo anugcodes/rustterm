@@ -1,8 +1,10 @@
 # Handoff — rustterm (working title)
 
-> **Status:** MVP Terminal & Tabs complete. Core rendering (F1-F5, F7-F9) is finished.
-> F7 EventProxy compiles and runs; copy/paste (F14) is done.
-> Next milestone is session persistence and SFTP. Read section 12 before writing any code.
+> **Status:** MVP Terminal & Tabs complete. Core rendering (F1-F5, F7-F9) is
+> finished, copy/paste (F14) is done, saved session profiles persist to
+> `~/.config/rustterm/sessions.toml`, and profiles can optionally store their
+> password in the OS keyring. Key auth and SFTP are next. Read section 12 before
+> writing any code.
 
 Last updated: 2026-10-25
 Repo: `~/Desktop/VsTerm` (local) — remote may be `rustterm` on GitHub
@@ -27,9 +29,9 @@ open protocols.
 
 | # | Feature | Status |
 |---|---|---|
-| 1 | SSH terminal with colors, resize, copy/paste | **Partial** — colors, resize, scrollback, bg colors yes. Copy/paste no. |
+| 1 | SSH terminal with colors, resize, copy/paste | **Done** — colors, resize, scrollback, bg colors, copy/paste. |
 | 2 | Multiple SSH sessions in tabs | **Done** |
-| 3 | Saved sessions, key auth, keyring passwords | Not started |
+| 3 | Saved sessions, key auth, keyring passwords | **Partial** — profiles + optional keyring done; key auth next. |
 | 4 | SFTP side panel following the active session's path | Not started |
 | 5 | Upload/download, drag & drop, progress | Not started |
 | 6 | Open remote file in local editor, auto-upload on save | Not started |
@@ -48,11 +50,13 @@ open protocols.
 | Error handling | `anyhow` | 1 | |
 | Async trait | `async-trait` | 0.1 | Required for `russh::client::Handler`. |
 | Logging | `log` + `env_logger` | 0.11 | `RUST_LOG=info cargo run` |
+| Profiles | `serde` + `toml` | 1 / 0.8 | `~/.config/rustterm/sessions.toml` |
+| Secrets | `keyring` | 4.2 | OS keyring (Secret Service on Linux); opt-in per profile |
 
 `eframe` uses `default-features = false, features = ["glow", "default_fonts"]`.
 
-**Not yet added but will be needed:** `russh-sftp` (SFTP), `keyring` (secrets),
-`notify` (file watching for auto-upload), `rfd` (native file dialogs), `dirs` or
+**Not yet added but will be needed:** `russh-sftp` (SFTP), `notify` (file
+watching for auto-upload), `rfd` (native file dialogs), `dirs` or
 `directories` (config/temp paths).
 
 ---
@@ -76,6 +80,8 @@ src/
 main.rs                   # font loading, eframe::run_native
 app.rs                    # RustTermApp: tabs, connect form, terminal UI, input dispatch
 ssh.rs                    # SshSession: russh client, host-key prompt, thread + tokio
+sessions.rs               # SessionStore: saved profiles in sessions.toml (metadata only)
+secrets.rs                # optional OS-keyring password storage (service "rustterm")
 terminal.rs               # TerminalView: Term<EventProxy> + egui rendering + layout
 input.rs                  # egui events -> pty bytes (xterm encoding)
 
@@ -110,6 +116,30 @@ RUST_LOG=info cargo run   # see font-loading and session logs
 ```
 
 CI runs `cargo clippy -- -D warnings`. Fix all warnings before pushing.
+
+### Optional keyring feature (packaging)
+
+`keyring` is behind the `keyring-secrets` Cargo feature, which is **on by
+default**. It adds the zbus / Secret Service stack: **47 extra crates**
+(264 → 311 unique names) and roughly **2.3 MB** of stripped release binary
+(13.6 MB → 11.2 MB lean).
+
+```bash
+cargo build --release                          # keyring support (default)
+cargo build --release --no-default-features    # lean: no keyring, no zbus
+```
+
+In a lean build the **Save password in the system keyring** checkbox is hidden,
+`src/secrets.rs` compiles a stub that reports "this build has no keyring
+support", and passwords are always typed manually. Profiles that were saved
+with `save_password = true` still load; they just show that message instead of
+auto-filling, and a lean build preserves the flag when re-saving the profile.
+The lean build is verified to link no keyring/zbus symbols.
+
+Recommended: publish both, or default to the keyring build and document the
+lean variant for minimal installs. Do **not** try to dlopen a Rust crate at
+runtime; if truly on-demand secrets are needed later, ship a separate helper
+binary and invoke it from the app.
 
 ---
 
@@ -153,8 +183,11 @@ OS keyboard ──► egui ──► app.rs::terminal_ui
                             │
                             ▼
                     std::sync::mpsc::Receiver<Vec<u8>>
-                            │
-              app.rs drains each frame -> TerminalView::feed()
+                            │                    ▲
+                            │     Wake: SSH thread calls ctx.request_repaint()
+                            ▼
+              app.rs::pump_sessions drains every session (256 KiB/frame
+              budget) -> TerminalView::feed()
                             │
                             ▼
               alacritty_terminal vte::Processor -> Term<EventProxy> grid
@@ -170,9 +203,16 @@ Key design points:
 thread never blocks on network I/O.
 - **Two different channel types on purpose:** `tokio::sync::mpsc` for UI→SSH (async
 side), `std::sync::mpsc` for SSH→UI (drained with `try_recv`, never blocks).
-- **Repaint gating:** `app.rs` only requests a repaint when output arrives, a
-prompt is pending, or during a 3-frame tail (`POST_ACTIVITY_FRAMES`). Idle CPU is
-~0%.
+- **Repaint gating:** the SSH thread owns a `Wake` callback
+  (`Arc<dyn Fn() + Send + Sync>`) that calls `egui::Context::request_repaint`
+  as soon as output arrives. `app.rs` therefore never polls an established
+  session; a timer is only used while a connect attempt is pending. Idle CPU is
+  ~0%. This replaced the old 8 ms polling window / 3-frame tail, which could
+  leave remote echo invisible until the next input event on a high-latency link.
+- **All tabs are pumped.** `pump_sessions` drains every session queue, not just
+  the visible one, so background SSH windows keep moving and tab switches do
+  not dump a backlog. Decoding is capped at 256 KiB per frame and re-requests
+  a repaint if work remains.
 - **EventProxy holds `input_tx`.** It answers DA1/DA2/DSR queries by writing the
 reply bytes back to the PTY. It also handles `Title`, `Bell`, `TextAreaSizeRequest`,
 and `ColorRequest`.
@@ -183,6 +223,20 @@ and `ColorRequest`.
 
 - **Tabs**: Multiple concurrent SSH sessions. `＋ New Session` tab is always present
 and not closable. Closing a tab disconnects its SSH cleanly.
+- **Saved profiles**: On the New Session tab, fill in host/port/user, optional
+  profile name (blank → `user@host`), and press **Save profile**. Profiles are
+  written atomically to `~/.config/rustterm/sessions.toml`
+  (`$XDG_CONFIG_HOME` respected). Clicking one loads it into the form; **Delete
+  selected** removes it. Saving an existing name updates it.
+- **Optional keyring passwords (F19)**: tick **Save password in the system
+  keyring** before saving. The secret goes to the OS keyring under service
+  `rustterm` and account = profile name; an explicit profile name is mandatory
+  in that case. Unchecking the box (and saving again) or deleting the profile
+  removes the keyring entry. `sessions.toml` still contains metadata only.
+  Loading a profile reads the secret from the keyring; if it is missing or the
+  keyring is locked/unavailable, the form shows an error and the password can
+  be typed manually. Keyring I/O only happens when a profile with the flag is
+  loaded/saved/deleted, so users who never opt in are unaffected.
 - **Host key verification (F3)**: `known_hosts` checking via `russh-keys`. TOFU
 prompt for unknown hosts; *hard failure* (no bypass) for changed keys. Handles
 hashed `known_hosts` and missing `~/.ssh`.
@@ -203,6 +257,19 @@ history. Alt-screen programs (`vim`, `htop`) ignore it, as intended.
 and `tput` do not stall on capability queries. `Title` updates the tab label.
 `Bell` logs.
 - **Resize forwarding**: `take_resize()` reports grid changes to the remote PTY.
+- **Legacy SSH servers**: modern KEX/host-key algorithms stay first, with
+  `diffie-hellman-group14-sha1` and `ssh-rsa` appended as fallbacks. Verified
+  against `172.31.251.23` (OpenSSH 5.3) — the handshake completes and only the
+  password decides the outcome. RSA `known_hosts` matching ignores the
+  `ssh-rsa` vs `rsa-sha2-256` algorithm-name difference, so the TOFU prompt
+  appears once, not on every connect.
+- **Interactive latency**: `TCP_NODELAY`, delayed zlib compression
+  (`zlib@openssh.com`, like `ssh -C`), and the SSH-thread repaint wake are all
+  enabled. Input no longer waits behind Nagle or an expired polling window.
+- **Full-speed output**: all sessions are drained every frame with a 256 KiB
+  budget; the terminal decoder sustains ~44 MiB/s even in the dev profile, far
+  above the link rate. `Cargo.toml` also optimises dev builds (local crates
+  `opt-level = 1`, dependencies `opt-level = 2`).
 
 ---
 
@@ -226,9 +293,11 @@ Severity: **A** = must fix before MVP, **B** = should fix, **C** = polish/later.
 
 ### Active
 
-**F6 — `vte::Processor::advance` is one byte at a time. (B)**
-Still a loop. Fine for interactive use, slow for `cat bigfile`. Requires a `vte`
-upgrade which `alacritty_terminal` 0.24 does not currently allow.
+**F6 — `vte::Processor::advance` is one byte at a time. (B, mitigated)**
+Still a loop, but measured at ~44 MiB/s in the dev profile, which is far above
+any SSH link this app targets. `pump_sessions` also caps decoding at 256 KiB
+per frame so a burst cannot stall painting. A proper `vte` upgrade would still
+reduce CPU for `cat bigfile`, but `alacritty_terminal` 0.24 does not allow one.
 
 **F10 — Wide characters (B)**
 Spacer cells are skipped, but full CJK / emoji alignment is not verified. Double-width
@@ -252,8 +321,16 @@ Read once per frame rather than per event.
 **F18 — Tests (B)**
 `terminal.rs` has unit tests for `bg_runs`, the colour mapping and the mouse encoding; `input.rs` has tests for the key encoding incl. DECCKM. **19 tests**, run with `cargo test`. Still missing: end-to-end tests for `ssh.rs`.
 
-**F19 — Plaintext password field (A before shipping)**
-No zeroize, no keyring. Must move to `keyring` + `secrecy` before release.
+**F19 — Password storage / memory hygiene (B, mostly resolved)**
+Passwords are never written to `sessions.toml`. Opt-in keyring storage is
+implemented (`src/secrets.rs`, keyring 4.2 → Secret Service on Linux) and is
+tied to an explicit profile name. The dependency is behind the default-on
+`keyring-secrets` feature; `--no-default-features` produces a lean build with a
+stub that reports keyring support as unavailable. Remaining work before release:
+zeroize the in-memory `String` (`secrecy`/`zeroize`) instead of leaving the
+password in a plain `String` until it is replaced or the app exits. Errors are
+reported inline; keyring I/O is synchronous on the UI thread but only runs for
+user-initiated profile load/save/delete actions.
 
 **F20 / F21 — Repo polish (C)**
 Fix `YOUR_USERNAME` in README badges; remove the pointless `.gitignore` rule.
@@ -319,7 +396,14 @@ through a `pty` so the byte sequences can be injected.
 - Server key type is `russh::keys::key::PublicKey`.
 - `authenticate_password(...)` returns `Result<bool, _>`.
 - `PublicKey::fingerprint()` takes **no arguments** and returns `String`.
-- `known_hosts` helpers are at `russh::keys::{check_known_hosts, learn_known_hosts}`.
+- `known_hosts` helpers are at `russh::keys::{check_known_hosts, learn_known_hosts}`;
+  `known_host_keys(host, port)` returns the parsed entries for key-material
+  comparison (needed for old `ssh-rsa` host keys, see `known_rsa_key_status`).
+- `client::connect` does **not** set `TCP_NODELAY`. Build a `tokio::net::TcpStream`,
+  `set_nodelay(true)`, then call `client::connect_stream(config, socket, handler)`.
+- Compression names: `russh::compression::{ZLIB, ZLIB_LEGACY}`. The default
+  preference list is `[NONE, ZLIB, ZLIB_LEGACY]`, so compression is **off**
+  until reordered. Both zlib variants are initialised only after authentication.
 - `Channel::data` takes `AsyncRead`; a byte slice works.
 
 ---
@@ -330,10 +414,15 @@ through a `pty` so the byte sequences can be injected.
 
 1. **Fix `terminal.rs` compile errors** ✅ done (`event::WindowSize` + `vte::ansi::Rgb`).
 2. **Copy/paste (F14)** ✅ done. **Keyring password storage (F19)** still open.
-3. **Session persistence** — saved profiles in `~/.config/rustterm/sessions.toml`.
-4. **Key auth** — `russh::client::Handler::auth_publickey` + ssh-agent.
-5. **SFTP panel** — `russh-sftp`, directory listing, follows active session.
-6. **Transfers** — upload/download with progress bars.
+3. **Session persistence** ✅ done — saved profiles in
+   `~/.config/rustterm/sessions.toml` (`src/sessions.rs`). Passwords stay out of
+   the file until keyring support lands.
+4. **Keyring password storage (F19)** ✅ done — opt-in per profile via
+   `src/secrets.rs` + `keyring` 4.2. Missing/locked keyrings fall back to
+   manual password entry. In-memory zeroization is still tracked under F19.
+5. **Key auth** — `russh::client::Handler::auth_publickey` + ssh-agent. ← next
+6. **SFTP panel** — `russh-sftp`, directory listing, follows active session.
+7. **Transfers** — upload/download with progress bars.
 
 ### V2
 
@@ -359,14 +448,28 @@ and never delivers the raw key, so the gesture is distinguished by the frame's
 current `Modifiers` (`input::is_copy_gesture`), not by the event. `Ctrl+C` with no
 Shift still sends `ETX`.
 
-**Step 3 — Session persistence + keyring (F19).** ← next
-`~/.config/rustterm/sessions.toml` for profiles, plus `keyring` for passwords.
+**Step 3 — Session persistence.** ✅ done.
+`src/sessions.rs` loads/saves `~/.config/rustterm/sessions.toml`
+(`$XDG_CONFIG_HOME` respected) with atomic writes. The New Session tab can save,
+load and delete profiles. Only name/host/port/user are stored; a blank name
+defaults to `user@host`, and saving an existing name updates that profile.
+Load/save failures are reported inline and never prevent startup.
 
-**Step 3 — Session persistence.**
-`~/.config/rustterm/sessions.toml` for profiles, plus `keyring` for passwords.
-This unblocks the tab bar from being "type the host every time".
+**Step 3b — Keyring password storage (F19).** ✅ done.
+`src/secrets.rs` wraps `keyring` 4.2 (Secret Service on Linux) with service
+`rustterm` and account = profile name. The New Session form has an opt-in
+**Save password in the system keyring** checkbox; enabling it makes an explicit
+profile name mandatory. Storing happens before the profile is written, so the
+TOML never claims a password exists when the keyring failed. Unchecking or
+deleting the profile removes the entry. Read failures degrade to manual entry.
+Verified end-to-end against the running GNOME Keyring.
 
-**Step 4 — SFTP.**
+**Step 4 — Key auth.** ← next
+Add public-key authentication: load `~/.ssh/id_*`, try keys before/instead of
+a password, and (later) ssh-agent support. Decide the profile field set
+(`key_path`, `use_agent`) before touching the UI.
+
+**Step 5 — SFTP.**
 `russh-sftp` on a second channel per session, left panel, follows the active
 session's `cwd`.
 
@@ -398,8 +501,12 @@ Format:
 1. **Tab bar placement** — top bar (classic MobaXterm) ✅ chosen.
 2. **Connect form placement** — own tab in the tab bar ✅ chosen.
 3. **Session storage format** — TOML at `~/.config/rustterm/sessions.toml`.
-4. **Keyring backend** — `keyring` crate with Secret Service on Linux. Needs
-verification on Mint 22 before committing.
+4. **Keyring backend** — `keyring` crate with Secret Service on Linux ✅
+   verified against GNOME Keyring. Behind the default-on `keyring-secrets`
+   feature so packagers can build lean with `--no-default-features`.
+5. **On-demand keyring download** — rejected for now: Rust cannot load a crate
+   at runtime. A separate helper binary would be the only option if it is ever
+   required.
 
 ---
 
@@ -415,6 +522,16 @@ sudo locale-gen en_US.UTF-8
 sudo update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
 ```
 - `vim` is installed. Use it for serious terminal-compat testing.
+- Saved profiles: `~/.config/rustterm/sessions.toml` (or
+  `$XDG_CONFIG_HOME/rustterm/sessions.toml`). Safe to delete to start fresh; it
+  contains no secrets.
+- Keyring entries: service `rustterm`, account = profile name. Inspect/remove
+  them with **Seahorse** (Passwords and Keys) or
+  `secret-tool search service rustterm`. Deleting a profile in the app removes
+  its entry; editing the TOML by hand does not.
+- Keyring used for verification: GNOME Keyring (`gnome-keyring-d`) over the
+  user's D-Bus session. On systems without a Secret Service, password saving
+  fails with an inline error and manual entry still works.
 
 ---
 
@@ -444,7 +561,8 @@ Maintained by the assistant. Update after each successful `cargo build`.
 | F5 (font metrics) | `terminal.rs`, `main.rs` | `TerminalView::new` signature | ✅ done |
 | F8 (scrollback) | `terminal.rs` | `Term::scroll_display` / `renderable_content` paths | ✅ done |
 | F4 (batched rows) | `terminal.rs` | `LayoutJob`, `Painter::galley` | ✅ done |
-| Repaint gating | `app.rs`, `Cargo.toml` | `poll_countdown`, `request_repaint` | ✅ done |
+| Repaint gating | `app.rs`, `Cargo.toml` | `poll_countdown`, `request_repaint` | ✅ superseded |
+| Legacy SSH + performance | `ssh.rs`, `app.rs`, `Cargo.toml` | `SshSession::connect(config, prompt_tx, wake)`, `Wake`, `client_config()`, `known_rsa_key_status()`, `connect_stream`+`set_nodelay`, `compression::ZLIB_LEGACY`, `pump_sessions(ctx)`, `MAX_OUTPUT_PER_FRAME` | ✅ done (legacy handshake verified; user confirmed the speed-up) |
 | F3 (known_hosts) | `ssh.rs`, `app.rs`, `Cargo.toml` | `check_known_hosts`, `learn_known_hosts`, `PublicKey::fingerprint()` | ✅ done |
 | F7 (EventProxy) | `ssh.rs`, `terminal.rs`, `app.rs` | `Event::PtyWrite`, `Event::Title`, `Event::Bell`, `Event::TextAreaSizeRequest`, `Event::ColorRequest`, `event::WindowSize`, `vte::ansi::Rgb` | ✅ done |
 | F14 (Copy/Paste) | `terminal.rs`, `app.rs`, `input.rs` | `TerminalView::selected_text()`, `clear_selection()`, `select_all()`, `take_action()`, `TermAction`, `input::is_copy_gesture()`, `ViewportCommand::RequestPaste` | ✅ done |
@@ -452,7 +570,9 @@ Maintained by the assistant. Update after each successful `cargo build`.
 | Rendering fix (nano/htop) | `terminal.rs` | `bg_runs()`, `named_color_to_egui`, `indexed_color_to_egui`; selection now drawn over backgrounds | ✅ done (unit-tested; GUI-unverified) |
 | F17 (Mouse reporting) | `terminal.rs`, `app.rs` | `TermMode::MOUSE_*`/`SGR_MOUSE`, `TerminalView::forward_mouse()`, `encode_mouse()`, `take_input()` | ✅ done (unit-tested; GUI-unverified) |
 | F22 (DECCKM) + wheel codes | `input.rs`, `terminal.rs`, `app.rs` | `TermMode::APP_CURSOR`, `input::cursor_key()`, `wheel_button_code()` | ✅ done (verified against ncurses; GUI-unverified) |
-| Next: Session persistence | `app.rs`, `Cargo.toml`, new `sessions.rs` | TBD | ⏳ pending |
+| Session persistence | `sessions.rs` (new), `app.rs`, `main.rs`, `Cargo.toml` | `SessionStore::{load_default,load,upsert,remove,profiles,path,error}`, `SessionProfile::validate`, `save_profile_ui`, `saved_sessions_ui`, `load_profile` | ✅ done (user-verified in GUI) |
+| Keyring passwords (F19) | `secrets.rs` (new), `sessions.rs`, `app.rs`, `main.rs`, `Cargo.toml` | `secrets::{save,load,delete}`, `SessionProfile::save_password`, `save_profile_ui`, keyring 4.2 behind `keyring-secrets` | ✅ done (default + lean builds; 29 tests each; keyring flow verified on GNOME Keyring) |
+| Next: key auth | `ssh.rs`, `app.rs`, `sessions.rs`, `Cargo.toml` | TBD | ⏳ pending |
 ⚙
 
 ---

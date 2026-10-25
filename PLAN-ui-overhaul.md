@@ -1,6 +1,6 @@
 # UI overhaul plan
 
-Status: **in progress**
+Status: **done**
 
 This plan covers the SFTP side panel, the New Session page and a shared theme
 for the whole application. It is being implemented in small, compiling commits.
@@ -109,6 +109,21 @@ New folder…, Refresh. These remain reachable from the icon toolbar.
 - `src/sftp.rs` — status log, editor picker, custom editor command.
 - `README.md`, `USAGE.md`, `handoff.md`, `CHANGES.md` — document the result.
 
+## Result
+
+All eight items are implemented and committed in small steps:
+
+- `18f217d` — plan
+- `a5ee2d0` — theme system + New Session page
+- `c93bcd3` — SFTP table, status bar, icon toolbar, dialogs, open-with picker
+- `e6ca79f`, `4e7a8b0` — status-message preservation, theme placement and
+  font-safe icon glyphs
+
+The SFTP table follows the header/click behaviour above, and the message log
+keeps the last 50 entries. Fonts: only egui's bundled families are available
+(Ubuntu-Light, NotoEmoji, emoji-icon-font), so the UI uses `+ 🏠 ⬆ 🔄 ➕ 🗐 📋 👁
+⚡ ➡ ☰ 🎨 ✔ • ×` and avoids glyphs that render as tofu.
+
 ## Verification
 
 - `cargo fmt --check`
@@ -120,3 +135,10 @@ New folder…, Refresh. These remain reachable from the icon toolbar.
   right-click menu, double-click, dialogs, editor picker, status history,
   reconnect, errors, theme switching, new-session layout at small and large
   window sizes.
+
+## Manual checks still pending
+
+- Live SFTP server: table at the 340 px minimum, right-click menu, recursive
+  delete warning, status history during a large copy, editor launch and
+  reconnect. Run the checklist in `USAGE.md` §14.
+- Very small window sizes (< 900 px wide) with the SFTP panel open.

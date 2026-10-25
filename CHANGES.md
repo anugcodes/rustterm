@@ -533,3 +533,83 @@ dlopen of crates.
 - Symlinks are shown and copied but not navigated. The panel still does not
   follow shell `cd`.
 - Editor changes are not watched or uploaded; close/reopen after editing.
+
+# Step: UI overhaul (SFTP table, status bar, New Session, themes)
+
+## What changed
+
+**`Cargo.toml` / `Cargo.lock`**
+- Added `egui_extras` 0.29 (default features off) for `TableBuilder`.
+
+**`src/theme.rs` (new)**
+- Theme registry with `ThemeId::{Midnight, Graphite}`, `Palette` and `Metrics`
+  tokens, and `apply()` which installs the full egui style (visuals, widget
+  states, spacing, rounding, fonts, scrollbars, shadows) globally.
+- Helpers used by the screens: `card_frame`, `modal_frame`, `callout_frame`,
+  `section_label`, `muted`, `icon_button`, `icon_toggle`.
+
+**`src/settings.rs` (new)**
+- `Settings { theme }` loaded from and saved atomically to
+  `$XDG_CONFIG_HOME/rustterm/settings.toml` (or `~/.config/rustterm/…`).
+  Missing/unknown theme falls back to Midnight.
+
+**`src/main.rs`**
+- Registers the new modules and applies the saved theme in
+  `RustTermApp::new`.
+
+**`src/app.rs`**
+- SFTP listing is a `TableBuilder` with a sticky **Name / Owner / Modified /
+  Size** header, resizable/elided columns, striping and a 420 px default /
+  340 px minimum panel. Single click selects, double click opens, right-click
+  selects and opens the menu.
+- Context menu trimmed to Open / Open with… / Paste into this folder /
+  Rename… / Copy path / Delete… (no Copy, New folder… or Refresh).
+- Icon toolbar with tooltips (🏠 ⬆ 🔄 ➕ 🗐 📋 👁 ⚡ ×) and a ➡ path button.
+- Bottom status bar: latest message with severity colour, spinner/operation
+  label while busy, ☰ history popover (last 50 entries) and Clear. The old
+  selected-file footer and inline notice/error block are removed.
+- **Open with…** modal (Default editor, Zed, gvim, VS Code, Desktop default,
+  Custom command) with disabled unavailable editors and a remembered choice.
+- Rename / New folder / Delete share `theme::modal_frame`; Delete shows the
+  path and a tinted warning for recursive folder removal. `Esc` cancels.
+- New Session page rebuilt as a centred column of Connection, Profile and
+  Saved sessions cards with a primary Connect button and in-flight spinner.
+- Theme picker pinned to the far-right of the tab bar; selection applies
+  immediately and persists.
+- Replaced font-unsupported glyphs (`＋ ⌂ ↑ → ⧉ ◉ ◐ ✓ ● ⋯`) with ones present
+  in egui's bundled fonts (`+ 🏠 ⬆ ➡ 🗐 👁 ✔ • ☰ 🎨`) so nothing renders as tofu.
+
+**`src/sftp.rs`**
+- `StatusLog`/`StatusEntry`/`StatusKind` replace `notice`/`error`; every listing,
+  operation, reconnect and editor launch reports to it (bounded at 50).
+- `EditorPicker` + `begin_open_with` / `submit_open_with` / `cancel_open_with`;
+  `EditorChoice::Custom`, command parsing, `editor_program` and
+  `command_available` for the picker.
+- Automatic refreshes no longer overwrite a success message from the operation
+  that triggered them.
+
+**Docs**
+- `README.md`, `USAGE.md` (§14 rewritten, new §15 themes and §16 New Session),
+  `handoff.md` (layout, status, gotchas, tracker) and `PLAN-ui-overhaul.md`.
+
+## Verified
+
+- `cargo fmt --check` ✅
+- `cargo clippy --all-targets -- -D warnings` ✅ (default and
+  `--no-default-features`)
+- `cargo test` ✅ **48 passed** in both feature sets
+- `cargo build --release` ✅
+- On-screen checks: New Session layout at 1600×1000 and narrow widths, tab bar
+  with the theme picker pinned right, Midnight ↔ Graphite switching, persisted
+  theme across restart.
+
+## Known limits
+
+- Live-SFTP GUI verification (table columns at 340 px, right-click menu,
+  status history while copying, editor picker launch, delete dialog) still needs
+  a server with credentials; the code paths are unit-tested and the checklist is
+  in `USAGE.md` §14.
+- The table sorts directories first by name (as before); clicking headers does
+  not change the sort yet.
+- Themes style the application chrome only; the terminal ANSI palette is
+  unchanged.

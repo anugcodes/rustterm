@@ -34,9 +34,9 @@ open protocols.
 | 1 | SSH terminal with colors, resize, copy/paste | **Done** — colors, resize, scrollback, bg colors, copy/paste. |
 | 2 | Multiple SSH sessions in tabs | **Done** |
 | 3 | Saved sessions, key auth, keyring passwords | **Done** — profiles, optional keyring passwords, key file + ssh-agent auth. |
-| 4 | SFTP side panel following the active session's path | **Done except shell-cd following** — per-tab browsing, reconnect, row context menu, hidden toggle, copy/paste, owner/modified rows. The panel does not follow shell `cd` (no OSC 7), and symlinks are not navigated. |
+| 4 | SFTP side panel following the active session's path | **Done except shell-cd following** — per-tab browsing, resizable Name/Owner/Modified/Size table, reconnect, right-click menu, hidden toggle, copy/paste, status bar with history. The panel does not follow shell `cd` (no OSC 7), and symlinks are not navigated. |
 | 5 | Upload/download, drag & drop, progress | **Next** — copy/editor downloads already stream file contents; general transfers, progress and drag & drop are not implemented. |
-| 6 | Open remote file in local editor, auto-upload on save | **Partial** — **Open in local editor** downloads to a temp file and launches `$VISUAL`/`$EDITOR`, Zed, gvim, VS Code or the desktop default. Automatic upload-on-save is V2. |
+| 6 | Open remote file in local editor, auto-upload on save | **Partial** — the **Open with…** picker downloads to a temp file and launches `$VISUAL`/`$EDITOR`, Zed, gvim, VS Code, the desktop default or a custom command. Automatic upload-on-save is V2. |
 | 7 | GUI tools via X11 forwarding (`ssh -X`) or VNC-over-tunnel | Not started |
 
 ---
@@ -68,7 +68,7 @@ open protocols.
 
 ```
 
-Cargo.toml                  # eframe/egui 0.29, russh 0.45, russh-sftp 3.0, alacritty_terminal 0.24, chrono 0.4
+Cargo.toml                  # eframe/egui 0.29, egui_extras 0.29, russh 0.45, russh-sftp 3.0, alacritty_terminal 0.24, chrono 0.4, toml
 Cargo.lock                  # COMMITTED (binary crate — reproducible builds)
 README.md                   # badges use YOUR_USERNAME placeholder — fix before push
 LICENSE                     # MIT
@@ -85,6 +85,8 @@ app.rs                    # RustTermApp: tabs, connect form, terminal UI, input 
 ssh.rs                    # SshSession: russh client, host-key prompt, thread + tokio
 sftp.rs                   # SftpExplorer: panel state, operations, dialogs, editor launch, formatting
 sessions.rs               # SessionStore: saved profiles in sessions.toml (metadata only)
+settings.rs               # persisted UI preferences (theme) in settings.toml
+theme.rs                  # theme registry, palette/metrics tokens, widget helpers
 secrets.rs                # optional OS-keyring password storage (service "rustterm")
 terminal.rs               # TerminalView: Term<EventProxy> + egui rendering + layout
 input.rs                  # egui events -> pty bytes (xterm encoding)
@@ -266,8 +268,17 @@ SftpExplorer::poll ── sftp_home/list/rename/delete/create_dir/copy/fetch() �
 
 ## 7. What works today (verified)
 
-- **Tabs**: Multiple concurrent SSH sessions. `＋ New Session` tab is always present
-and not closable. Closing a tab disconnects its SSH cleanly.
+- **Tabs**: Multiple concurrent SSH sessions. `+ New Session` tab is always present
+and not closable. Closing a tab disconnects its SSH cleanly. The theme picker is
+pinned to the far right of the tab bar.
+- **New Session page**: a centred 560 px column inside a scroll area, with
+  Connection, Profile and Saved sessions cards. Connect shows an in-flight
+  spinner; save/load/delete of profiles live in the same page.
+- **Themes**: a shared `theme::Palette`/`Metrics` registry styles the whole app
+  (top bar, cards, tables, dialogs, status bar). **Midnight** (default) and
+  **Graphite** ship today; the choice is persisted in
+  `~/.config/rustterm/settings.toml` (`$XDG_CONFIG_HOME` respected). Terminal
+  ANSI colours are independent of the UI theme.
 - **Saved profiles**: On the New Session tab, fill in host/port/user, optional
   profile name (blank → `user@host`), and press **Save profile**. Profiles are
   written atomically to `~/.config/rustterm/sessions.toml`
@@ -291,28 +302,33 @@ and not closable. Closing a tab disconnects its SSH cleanly.
   list every attempted method (missing file, encrypted key, rejected key,
   agent unavailable, wrong password) instead of a bare "rejected".
 - **SFTP side panel**: a second channel per session opens the `sftp` subsystem at
-  connect time. The left panel starts in the remote login directory
-  (`canonicalize(".")`) and lists entries with directories first. Every row shows
-  an icon, name, owner and local last-modified timestamp (the footer adds path,
-  size and exact details). **Home**, **Up**, **Refresh**, **Reconnect** and an
-  editable path + **Enter**/**Go** navigate; clicking a directory opens it and
-  clicking a file selects it.
-- **SFTP operations**: right-click a row for **Open**, **Open in editor**
-  (default/Zed/gvim/VS Code/desktop), **Rename…**, **Copy**, **Copy path**,
-  **Paste** (into a folder or the current directory), **New folder…**, **Delete…**
-  and **Refresh**. Delete confirms first and removes non-empty directories
-  recursively. **Copy path** uses the system clipboard; remote **Copy**/**Paste**
-  streams a recursive duplicate with a unique `(copy)` name. The **Hidden**
-  toggle filters dotfiles client-side (default hidden, per session). Operations
-  confirm in a dialog, run off the UI thread, report progress and refresh the
-  listing on completion.
+  connect time. The left panel (420 px default, 340 px minimum) starts in the
+  remote login directory (`canonicalize(".")`) and renders a sticky-header table
+  with **Name / Owner / Modified / Size** columns (resizable, elided, striped).
+  Single-click selects; double-click opens a folder or brings up **Open with…**
+  for a file; right-click selects and opens the row menu. **Home**, **Up**,
+  **Refresh**, **Reconnect** and an editable path + **Enter**/➡ navigate.
+- **SFTP operations**: right-click a row for **Open**/**Open with…**,
+  **Rename…**, **Copy path**, **Delete…**, plus **Paste into this folder** on
+  folders when the clipboard has an entry. Delete confirms first and removes
+  non-empty directories recursively. **Copy path** uses the system clipboard;
+  remote **Copy**/**Paste** streams a recursive duplicate with a unique
+  `(copy)` name. The **Hidden** toggle filters dotfiles client-side (default
+  hidden, per session). Operations run off the UI thread and refresh the listing
+  on completion.
+- **SFTP status bar**: the bottom strip shows the latest message (info/success/
+  error), a spinner plus operation label while busy, and a ☰ history popover with
+  the last 50 messages and **Clear messages**. The old selected-file footer and
+  inline error block are gone; row tooltips carry file details.
 - **SFTP reconnect** reopens only the SFTP channel/subsystem on the existing SSH
   connection and then resolves the home directory again. It is available both in
   the toolbar and in the unavailable state; the terminal is never disconnected.
   If the server had no SFTP subsystem at login, this is the way to retry.
-- **Open in local editor** downloads the selected file to a unique
-  `rustterm-edit-<pid>-<nanos>` temp directory and launches the chosen editor
-  asynchronously. Save-watching/auto-upload is still V2.
+- **Open with…** opens a modal picker (Default editor, Zed, gvim, VS Code,
+  Desktop default, Custom command). Editors missing from `PATH` are disabled,
+  and the last choice is remembered per session. The selected file is
+  downloaded to a unique `rustterm-edit-<pid>-<nanos>` temp directory and the
+  editor is launched asynchronously. Save-watching/auto-upload is still V2.
 - The **Files** toggle in the tab bar, or the panel's **×**, hides the panel. Each
   tab keeps its own directory. Servers without SFTP show a clear unavailable
   message; terminal I/O is never blocked by a slow listing. Symlinks are shown but
@@ -455,6 +471,13 @@ program.
 4. **Do not call `request_focus()` unconditionally.** It fights the lock filter.
 5. **Set the lock filter every frame**, after the focus request.
 6. **`include_bytes!` is compile-time.** Use `std::fs::read` at runtime.
+7. **Only bundled fonts are available.** Proportional text falls back through
+   Ubuntu-Light → NotoEmoji → emoji-icon-font. Glyphs outside those fonts render
+   as tofu boxes: avoid `＋`, `⌂`, `↑`, `→`, `⧉`, `◉`, `◐`, `✓`, `●`, `⋯`.
+   Use `+`, `🏠`, `⬆`, `➡`, `🗐`, `👁`, `✔`, `•`, `☰`, `🎨` or plain text.
+8. **`egui_extras::TableBuilder` rows are closures.** Capture actions in an
+   `Option` and apply them after the table body; the explorer cannot be borrowed
+   mutably inside a row while the table iterates it.
 
 ---
 
@@ -578,32 +601,37 @@ through a `pty` so the byte sequences can be injected.
    - **Reconnect** — toolbar and unavailable-state buttons reopen only the
      SFTP channel/subsystem on the existing SSH connection. The terminal is never
      torn down; the home directory is resolved again after the swap.
-   - **Right-click row menu** — Open, Open in editor (default, Zed, gvim,
-     VS Code, desktop), Rename…, Copy, Copy path, Paste into this folder,
-     New folder…, Delete…, Refresh. Delete confirms first and removes non-empty
-     directories recursively. **Download…/Upload here…** remain in transfers.
-   - **Open in local editor** — unique temp download, then `$VISUAL`/`$EDITOR`,
-     Zed, gvim, VS Code or `xdg-open`, spawned asynchronously. No save watching.
+   - **Right-click row menu** — file: Open with…, Rename…, Copy path, Delete…;
+     folder: Open, Paste into this folder (when copied), Rename…, Copy path,
+     Delete…. Delete confirms first and removes non-empty directories
+     recursively. **Download…/Upload here…** remain in transfers.
+   - **Open with…** — modal picker (default, Zed, gvim, VS Code, desktop,
+     custom command), unique temp download and asynchronous launch. No save
+     watching.
    - **Show/hide hidden files** — per-session toggle, default hidden; filters
      dotfiles client-side and survives Refresh/navigation. The selection is
      cleared if it becomes hidden.
    - **Copy / paste** — toolbar + context menu. SFTP has no server-side copy, so
      files stream through `tokio::io::copy`; directories recurse; symlinks are
      recreated with their original target; conflicts get `name (copy N)`.
-   - **Owner + modified columns** — each row shows owner and local
-     `YYYY-MM-DD HH:MM`. Owner precedence is cached `/etc/passwd`, then
-     `Metadata.user`, then UID. The footer carries path and size.
+   - **Owner + modified columns** — the table shows Name, Owner, Modified and
+     Size. Owner precedence is cached `/etc/passwd`, then `Metadata.user`, then
+     UID. Details live in row tooltips and the status bar.
    - Keyboard `Ctrl+C`/`Ctrl+V` were deliberately **not** bound in the panel;
      terminal copy/paste must not be stolen. The toolbar/context menu are always
      available.
-8. **Transfers** ← next — upload/download with progress bars, queue and drag &
+8. **UI overhaul** ✅ done — `egui_extras` SFTP table, icon toolbar with
+   tooltips, bottom status bar with history, font-safe glyphs, **Open with…**
+   modal, padded delete/rename dialogs, centred New Session page, and a global
+   persisted theme system (`src/theme.rs`, `src/settings.rs`).
+9. **Transfers** ← next — upload/download with progress bars, queue and drag &
    drop; reuse the streaming read/write helpers from copy/editor download.
 
 ### V2
 
-9. Edit-and-auto-upload. Watch the **folder**, not the file.
-10. X11 forwarding via system `ssh -X`.
-11. VNC over SSH tunnel + external viewer.
+10. Edit-and-auto-upload. Watch the **folder**, not the file.
+11. X11 forwarding via system `ssh -X`.
+12. VNC over SSH tunnel + external viewer.
 
 ---
 
@@ -694,7 +722,23 @@ release build. GUI file-operation probing against a live server is still in the
 manual checklist (`USAGE.md` §14), including recursive delete, copy of files and
 folders, symlink copy, hidden filtering, editor launch and reconnect.
 
-**Step 7 — Transfers.** ← next
+**Step 7 — UI overhaul.** ✅ done.
+`egui_extras::TableBuilder` renders the SFTP listing (Name/Owner/Modified/Size,
+resizable columns, sticky header) instead of two-line rows. The selected-file
+footer and inline error block were replaced by a bottom status bar backed by
+`StatusLog` (last 50 messages, ☰ history, Clear). The toolbar is icon-only with
+tooltips; right-click is the only menu gesture. **Open with…** is a modal with
+availability checks and a custom command. Dialogs share `theme::modal_frame`
+with padded content and right-aligned actions. The New Session page is a centred
+column of cards. `src/theme.rs` + `src/settings.rs` provide a global theme
+registry (Midnight, Graphite) persisted in
+`~/.config/rustterm/settings.toml`.
+
+Verified with **48 tests** (both feature sets), clippy `-D warnings`, fmt and a
+release build. The New Session page, tab bar and theme switching were checked on
+screen; live-SFTP GUI checks remain in `USAGE.md` §14.
+
+**Step 8 — Transfers.** ← next
 Upload/download over the existing `SftpSession`, with progress reporting, a
 transfer queue, and drag & drop. Reuse the streaming read/write helpers from
 copy/editor download. Runs off the terminal select loop like the existing SFTP
@@ -765,11 +809,13 @@ sudo update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
 ## 15. Git status
 
 Tabs + F1 + F2 + F3 + F4 + F5 + F7 + F8 + F9, saved profiles, keyring
-passwords, public-key/agent auth, the SFTP panel and its follow-up operations
-have landed on `main`. Reconnect, file operations, hidden filtering, copy/paste,
-open-in-editor and owner/modified rows are implemented and verified with tests;
-GUI file-operation testing against a live server is still pending. Check
-`git status` before starting the transfers step.
+passwords, public-key/agent auth, the SFTP panel and its follow-up operations,
+plus the UI overhaul (table, icon toolbar, status bar, **Open with…** modal,
+dialogs, New Session page and themes) have landed on `main`. `cargo test` (48),
+clippy (both feature sets) and the release build are green. GUI verification of
+the New Session page, tab bar and theme switching is done; live-SFTP table/
+dialog testing still needs a server with credentials. Check `git status` before
+starting the transfers step.
 
 Before pushing:
 
@@ -805,6 +851,7 @@ Maintained by the assistant. Update after each successful `cargo build`.
 | Public-key / agent auth | `ssh.rs`, `app.rs`, `sessions.rs` | `SshConfig::{use_key,key_path,use_agent}`, `authenticate()`, `authenticate_with_agent()`, `key_candidates()`, `expand_tilde()`, `SessionProfile::{use_key,key_path,use_agent}` | ✅ done (31 tests; file key + agent + password verified against a temporary russh server; GUI-unverified) |
 | SFTP panel | `sftp.rs` (new), `ssh.rs`, `app.rs`, `main.rs`, `Cargo.toml` | `SshSession::{sftp_unavailable,sftp_home,sftp_list}`, `RemoteEntry`, `SftpExplorer::{start,poll,load_home,navigate,refresh,up,selected_entry}`, `join_path`, `parent_path`, `sort_entries`, `format_size`, `format_age`, `RustTermApp::sftp_ui`, `show_sftp` | ✅ done (36 tests; transport verified against a temporary in-process russh SFTP server; GUI-unverified) |
 | SFTP follow-ups | `sftp.rs`, `ssh.rs`, `app.rs`, `Cargo.toml` | `SshSession::{sftp_reconnect,sftp_rename,sftp_delete,sftp_create_dir,sftp_copy,sftp_fetch}`, `SftpClient`, `SharedSftp`, `RemoteEntry::owner`, `SftpExplorer::{reconnect,copy_entry,paste,paste_into,begin_rename,begin_delete,begin_new_folder,begin_new_folder_in,submit_dialog,open_in_editor}`, `SftpDialog`, `EditorChoice`, `format_timestamp`, `RustTermApp::{sftp_ui,sftp_dialogs_ui}`, `chrono` | ✅ done (42 tests both feature sets; clippy/fmt/release clean; GUI-unverified) |
+| UI overhaul | `theme.rs` (new), `settings.rs` (new), `app.rs`, `sftp.rs`, `main.rs`, `Cargo.toml` | `theme::{ThemeId,Theme,Palette,Metrics,apply,card_frame,modal_frame,callout_frame,icon_button,icon_toggle}`, `Settings::{load_default,load_from,save_default,save_to}`, `SftpExplorer::status`, `StatusLog`, `EditorPicker`, `SftpExplorer::{begin_open_with,submit_open_with,cancel_open_with}`, `RustTermApp::{tabs_ui,theme_menu_ui,editor_picker_ui}`, `egui_extras::{TableBuilder,Column}` | ✅ done (48 tests; clippy/fmt/release clean; New Session + theme verified in GUI, live-SFTP pass pending) |
 | Next: transfers | `ssh.rs`, `sftp.rs`, `app.rs` | TBD — upload/download, progress, queue, drag & drop | ⏳ pending |
 ⚙
 

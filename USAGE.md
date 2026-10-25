@@ -418,3 +418,58 @@ save_password = true          # secret lives in the OS keyring
       connect manually. Saving a new profile replaces the malformed file.
 - [ ] `XDG_CONFIG_HOME=/tmp/rt-config cargo run` → profiles are read/written
       under `/tmp/rt-config/rustterm/sessions.toml`.
+
+---
+
+## 13. Public-key and ssh-agent authentication — [U]
+
+**How:** on the **New Session** tab there are two extra rows:
+
+- **Public key** — tick **Use**. Leave the path blank to try the usual
+  `~/.ssh/id_ed25519`, `id_ecdsa`, `id_rsa` and `id_dsa` (only files that exist),
+  or type an explicit private-key path. `~` and `~/...` are expanded.
+- **SSH agent** — tick **Use identities from SSH_AUTH_SOCK** to offer every key
+  currently loaded in ssh-agent.
+
+Authentication is tried in this order: **key file(s) → ssh-agent → password**.
+The password box is optional when key/agent auth is enabled, but if it is
+filled in it remains a fallback after a rejected key. A passphrase-protected
+key file is **not** decrypted by the app: add it to ssh-agent (`ssh-add`) and
+use the agent option instead. If every method fails, the red error lists what
+was tried (missing file, encrypted key, key rejected, agent unavailable, …).
+
+These settings are saved with the profile (`use_key`, `key_path`, `use_agent`);
+no key material or passphrase is ever written to `sessions.toml`. Old profiles
+load with both options off.
+
+**Verify**
+
+Setup: a local sshd with `PubkeyAuthentication yes`, plus
+`ssh-keygen -t ed25519 -f /tmp/rt-test-key -N ''` and its `.pub` appended to
+`~/.ssh/authorized_keys`.
+
+- [ ] **Explicit key**: Host/User set, type `/tmp/rt-test-key` in **Public key**,
+      tick **Use**, leave the password empty, **Connect** → login succeeds.
+- [ ] **Auto-detect**: clear the key path, keep **Use** ticked, connect with a
+      normal `~/.ssh/id_*` key available → login succeeds.
+- [ ] **`~` expansion**: use `~/.ssh/id_ed25519` as the path → login succeeds.
+- [ ] **Agent**: `eval $(ssh-agent)` + `ssh-add ~/.ssh/id_ed25519` in the shell
+      that launches `cargo run`, tick only the agent row, leave the password
+      empty → login succeeds.
+- [ ] **Password fallback**: key/agent enabled with a key the server rejects,
+      correct password typed → login still succeeds (no error).
+- [ ] **Encrypted key**: `ssh-keygen -t ed25519 -N 'x' -f /tmp/enc-key`, use it
+      with no password → red error mentioning *passphrase-protected* and
+      `ssh-add`; no crash.
+- [ ] **Missing path**: `/tmp/does-not-exist`, no password → red error naming
+      that path. Add the correct password → login still works.
+- [ ] **Agent not running**: `env -u SSH_AUTH_SOCK cargo run`, agent row ticked,
+      no key/password → red *could not connect to $SSH_AUTH_SOCK*.
+- [ ] **No method**: all key/agent boxes off, password empty, **Connect** → red
+      `Type a password or enable key/agent authentication` (no connection).
+- [ ] **Profile round-trip**: save with a key path and agent ticked, load
+      another profile, then reload it → path and both checkboxes restored.
+      `cat ~/.config/rustterm/sessions.toml` shows `use_key`, `key_path`,
+      `use_agent` and still **no key contents or passphrase**.
+- [ ] **Legacy profile**: a profile file without the new fields loads with both
+      options off and connects with a password.

@@ -2,9 +2,9 @@
 
 > **Status:** MVP Terminal & Tabs complete. Core rendering (F1-F5, F7-F9) is
 > finished, copy/paste (F14) is done, saved session profiles persist to
-> `~/.config/rustterm/sessions.toml`, and profiles can optionally store their
-> password in the OS keyring. Key auth and SFTP are next. Read section 12 before
-> writing any code.
+> `~/.config/rustterm/sessions.toml`, profiles can optionally store their
+> password in the OS keyring, and public-key / ssh-agent authentication works.
+> SFTP is next. Read section 12 before writing any code.
 
 Last updated: 2026-10-25
 Repo: `~/Desktop/VsTerm` (local) — remote may be `rustterm` on GitHub
@@ -31,7 +31,7 @@ open protocols.
 |---|---|---|
 | 1 | SSH terminal with colors, resize, copy/paste | **Done** — colors, resize, scrollback, bg colors, copy/paste. |
 | 2 | Multiple SSH sessions in tabs | **Done** |
-| 3 | Saved sessions, key auth, keyring passwords | **Partial** — profiles + optional keyring done; key auth next. |
+| 3 | Saved sessions, key auth, keyring passwords | **Done** — profiles, optional keyring passwords, key file + ssh-agent auth. |
 | 4 | SFTP side panel following the active session's path | Not started |
 | 5 | Upload/download, drag & drop, progress | Not started |
 | 6 | Open remote file in local editor, auto-upload on save | Not started |
@@ -237,6 +237,14 @@ and not closable. Closing a tab disconnects its SSH cleanly.
   keyring is locked/unavailable, the form shows an error and the password can
   be typed manually. Keyring I/O only happens when a profile with the flag is
   loaded/saved/deleted, so users who never opt in are unaffected.
+- **Public-key / ssh-agent auth**: tick **Use** on the **Public key** row and
+  optionally give a path (blank auto-detects `~/.ssh/id_ed25519`, `id_ecdsa`,
+  `id_rsa`, `id_dsa`); tick **Use identities from SSH_AUTH_SOCK** for the agent.
+  Order is key file(s) → agent → password, so a typed password remains a
+  fallback. `~` is expanded. Passphrase-protected files are not decrypted:
+  load them into ssh-agent (`ssh-add`) and enable the agent option. Failures
+  list every attempted method (missing file, encrypted key, rejected key,
+  agent unavailable, wrong password) instead of a bare "rejected".
 - **Host key verification (F3)**: `known_hosts` checking via `russh-keys`. TOFU
 prompt for unknown hosts; *hard failure* (no bypass) for changed keys. Handles
 hashed `known_hosts` and missing `~/.ssh`.
@@ -319,7 +327,7 @@ Hardcoded `80x24` until the first `ui()` frame. Produces a small reflow on conne
 Read once per frame rather than per event.
 
 **F18 — Tests (B)**
-`terminal.rs` has unit tests for `bg_runs`, the colour mapping and the mouse encoding; `input.rs` has tests for the key encoding incl. DECCKM. **19 tests**, run with `cargo test`. Still missing: end-to-end tests for `ssh.rs`.
+`terminal.rs` has unit tests for `bg_runs`, the colour mapping and the mouse encoding; `input.rs` has tests for the key encoding incl. DECCKM; `sessions.rs` covers persistence, validation and profile defaults. **31 tests**, run with `cargo test`. Still missing: automated tests for `ssh.rs` (key auth was verified with a temporary russh-server probe, not a committed test).
 
 **F19 — Password storage / memory hygiene (B, mostly resolved)**
 Passwords are never written to `sessions.toml`. Opt-in keyring storage is
@@ -334,6 +342,21 @@ user-initiated profile load/save/delete actions.
 
 **F20 / F21 — Repo polish (C)**
 Fix `YOUR_USERNAME` in README badges; remove the pointless `.gitignore` rule.
+
+**F23 — Encrypted private-key files (B)**
+`secrets`/passphrase input is not implemented; `load_secret_key(path, None)`
+returns `KeyIsEncrypted`. The UI explains the workaround (ssh-agent) instead of
+prompting. A passphrase modal would be the next refinement.
+
+**F24 — Legacy `ssh-rsa` signatures (B)**
+russh-keys 0.45 only signs RSA with `rsa-sha2-256/512`; OpenSSH 5.3 servers
+that offer only `ssh-rsa` (SHA-1) will reject key auth. Password auth against
+those hosts still works (the current legacy target uses a password). Supporting
+them would need a SHA-1 signing path, which is deliberately not a priority.
+
+**F25 — Agent identity errors (C)**
+An agent signing error aborts the remaining identities instead of trying the
+next one. Rare in practice; revisit if it shows up with hardware tokens.
 
 ---
 
@@ -405,6 +428,15 @@ through a `pty` so the byte sequences can be injected.
   preference list is `[NONE, ZLIB, ZLIB_LEGACY]`, so compression is **off**
   until reordered. Both zlib variants are initialised only after authentication.
 - `Channel::data` takes `AsyncRead`; a byte slice works.
+- Public-key auth: `russh::keys::load_secret_key(path, None)` →
+  `KeyPair` (`Error::KeyIsEncrypted` for passphrase files),
+  `Handle::authenticate_publickey(user, Arc<KeyPair>)`.
+- Agent auth: `AgentClient::connect_env()` → `request_identities()` →
+  `Handle::authenticate_future(user, key, agent)`. That call **consumes** the
+  agent and returns `(agent, Result<bool, AgentAuthError>)`, so the same
+  connection is reused for the next identity.
+- `KeyPair::RSA` carries a `SignatureHash` limited to SHA2-256/512; there is no
+  SHA-1 path, so `ssh-rsa`-only servers reject key auth (see F24).
 
 ---
 
@@ -413,15 +445,15 @@ through a `pty` so the byte sequences can be injected.
 ### MVP
 
 1. **Fix `terminal.rs` compile errors** ✅ done (`event::WindowSize` + `vte::ansi::Rgb`).
-2. **Copy/paste (F14)** ✅ done. **Keyring password storage (F19)** still open.
+2. **Copy/paste (F14)** ✅ done. **Keyring password storage (F19)** ✅ done.
 3. **Session persistence** ✅ done — saved profiles in
    `~/.config/rustterm/sessions.toml` (`src/sessions.rs`). Passwords stay out of
-   the file until keyring support lands.
+   the file; keyring storage is opt-in (step 4).
 4. **Keyring password storage (F19)** ✅ done — opt-in per profile via
    `src/secrets.rs` + `keyring` 4.2. Missing/locked keyrings fall back to
    manual password entry. In-memory zeroization is still tracked under F19.
-5. **Key auth** — `russh::client::Handler::auth_publickey` + ssh-agent. ← next
-6. **SFTP panel** — `russh-sftp`, directory listing, follows active session.
+5. **Key auth** ✅ done — key files + ssh-agent before the password.
+6. **SFTP panel** — `russh-sftp`, directory listing, follows active session. ← next
 7. **Transfers** — upload/download with progress bars.
 
 ### V2
@@ -464,12 +496,17 @@ TOML never claims a password exists when the keyring failed. Unchecking or
 deleting the profile removes the entry. Read failures degrade to manual entry.
 Verified end-to-end against the running GNOME Keyring.
 
-**Step 4 — Key auth.** ← next
-Add public-key authentication: load `~/.ssh/id_*`, try keys before/instead of
-a password, and (later) ssh-agent support. Decide the profile field set
-(`key_path`, `use_agent`) before touching the UI.
+**Step 4 — Key auth.** ✅ done.
+`src/ssh.rs` now authenticates in the order key file(s) → ssh-agent → password.
+The form has **Public key** (Use + optional path; blank auto-detects
+`~/.ssh/id_*`) and **SSH agent** (`SSH_AUTH_SOCK`) rows. `~` is expanded.
+Failures are collected per method and reported together. Profiles gained
+`use_key`, `key_path` and `use_agent` (all default-off, so old files load
+unchanged). Verified end-to-end against a temporary russh server: file key,
+agent identity and password all succeed; an encrypted key produces the
+passphrase/agent guidance. GUI checklist in `USAGE.md` §13.
 
-**Step 5 — SFTP.**
+**Step 5 — SFTP.** ← next
 `russh-sftp` on a second channel per session, left panel, follows the active
 session's `cwd`.
 
@@ -572,7 +609,8 @@ Maintained by the assistant. Update after each successful `cargo build`.
 | F22 (DECCKM) + wheel codes | `input.rs`, `terminal.rs`, `app.rs` | `TermMode::APP_CURSOR`, `input::cursor_key()`, `wheel_button_code()` | ✅ done (verified against ncurses; GUI-unverified) |
 | Session persistence | `sessions.rs` (new), `app.rs`, `main.rs`, `Cargo.toml` | `SessionStore::{load_default,load,upsert,remove,profiles,path,error}`, `SessionProfile::validate`, `save_profile_ui`, `saved_sessions_ui`, `load_profile` | ✅ done (user-verified in GUI) |
 | Keyring passwords (F19) | `secrets.rs` (new), `sessions.rs`, `app.rs`, `main.rs`, `Cargo.toml` | `secrets::{save,load,delete}`, `SessionProfile::save_password`, `save_profile_ui`, keyring 4.2 behind `keyring-secrets` | ✅ done (default + lean builds; 29 tests each; keyring flow verified on GNOME Keyring) |
-| Next: key auth | `ssh.rs`, `app.rs`, `sessions.rs`, `Cargo.toml` | TBD | ⏳ pending |
+| Public-key / agent auth | `ssh.rs`, `app.rs`, `sessions.rs` | `SshConfig::{use_key,key_path,use_agent}`, `authenticate()`, `authenticate_with_agent()`, `key_candidates()`, `expand_tilde()`, `SessionProfile::{use_key,key_path,use_agent}` | ✅ done (31 tests; file key + agent + password verified against a temporary russh server; GUI-unverified) |
+| Next: SFTP | `ssh.rs`, `app.rs`, `Cargo.toml` | TBD | ⏳ pending |
 ⚙
 
 ---

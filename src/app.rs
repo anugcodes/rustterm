@@ -91,6 +91,12 @@ struct ConnectForm {
     password: String,
     /// Opt-in: store the password in the OS keyring for this profile.
     save_password: bool,
+    /// Try private-key auth before the password.
+    use_key: bool,
+    /// Explicit key file; blank means auto-detect `~/.ssh/id_*`.
+    key_path: String,
+    /// Offer identities from `$SSH_AUTH_SOCK`.
+    use_agent: bool,
 }
 
 impl Default for ConnectForm {
@@ -101,6 +107,9 @@ impl Default for ConnectForm {
             user: String::new(),
             password: String::new(),
             save_password: false,
+            use_key: false,
+            key_path: String::new(),
+            use_agent: false,
         }
     }
 }
@@ -167,12 +176,19 @@ impl RustTermApp {
             self.set_error("Host and user are required");
             return;
         }
+        if self.form.password.is_empty() && !self.form.use_key && !self.form.use_agent {
+            self.set_error("Type a password or enable key/agent authentication");
+            return;
+        }
 
         let config = SshConfig {
             host,
             port,
             user,
             password: self.form.password.clone(),
+            use_key: self.form.use_key,
+            key_path: self.form.key_path.trim().to_string(),
+            use_agent: self.form.use_agent,
         };
         let label = format!("{}@{}:{}", config.user, config.host, config.port);
 
@@ -438,6 +454,9 @@ impl RustTermApp {
         self.form.port = profile.port.to_string();
         self.form.user = profile.user;
         self.form.save_password = KEYRING_ENABLED && profile.save_password;
+        self.form.use_key = profile.use_key;
+        self.form.key_path = profile.key_path.clone();
+        self.form.use_agent = profile.use_agent;
         // The password is only ever read from the keyring, never from TOML.
         self.form.password.clear();
         self.profile_name = profile.name.clone();
@@ -509,6 +528,9 @@ impl RustTermApp {
             port,
             user,
             save_password,
+            use_key: self.form.use_key,
+            key_path: self.form.key_path.trim().to_string(),
+            use_agent: self.form.use_agent,
         };
         if let Err(message) = profile.validate() {
             self.set_error(message);
@@ -693,8 +715,37 @@ impl RustTermApp {
                 ui.text_edit_singleline(&mut self.form.user);
                 ui.end_row();
 
+                ui.label("Public key");
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.form.use_key, "Use");
+                    ui.add_enabled(
+                        self.form.use_key,
+                        egui::TextEdit::singleline(&mut self.form.key_path)
+                            .hint_text("blank = auto-detect ~/.ssh/id_*")
+                            .desired_width(240.0),
+                    );
+                })
+                .response
+                .on_hover_text(
+                    "Tried before the password. Leave the path blank to use \
+                     ~/.ssh/id_ed25519, id_ecdsa, id_rsa or id_dsa.",
+                );
+                ui.end_row();
+
+                ui.label("SSH agent");
+                ui.checkbox(
+                    &mut self.form.use_agent,
+                    "Use identities from SSH_AUTH_SOCK",
+                )
+                .on_hover_text(
+                    "Tried after a key file and before the password. Best for \
+                     passphrase-protected keys loaded with ssh-add.",
+                );
+                ui.end_row();
+
                 ui.label("Password");
-                ui.add(egui::TextEdit::singleline(&mut self.form.password).password(true));
+                ui.add(egui::TextEdit::singleline(&mut self.form.password).password(true))
+                    .on_hover_text("Used when key/agent authentication is disabled or fails.");
                 ui.end_row();
 
                 // Hidden entirely in lean builds (`--no-default-features`).

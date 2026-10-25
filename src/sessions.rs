@@ -31,6 +31,16 @@ pub struct SessionProfile {
     /// password itself is never part of the TOML file.
     #[serde(default, skip_serializing_if = "is_false")]
     pub save_password: bool,
+    /// Try public-key authentication before falling back to a password.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub use_key: bool,
+    /// Private-key file for `use_key`. Empty means "auto-detect the usual
+    /// `~/.ssh/id_*` files". `~` is expanded when connecting.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub key_path: String,
+    /// Offer identities from `$SSH_AUTH_SOCK` (ssh-agent).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub use_agent: bool,
 }
 
 fn default_port() -> u16 {
@@ -253,6 +263,9 @@ mod tests {
             port: 22,
             user: "anurag".to_string(),
             save_password: false,
+            use_key: false,
+            key_path: String::new(),
+            use_agent: false,
         }
     }
 
@@ -277,6 +290,9 @@ mod tests {
                 port: 22,
                 user: "anuragb".to_string(),
                 save_password: false,
+                use_key: false,
+                key_path: String::new(),
+                use_agent: false,
             })
             .unwrap();
         store.upsert(profile("local", "localhost")).unwrap();
@@ -399,12 +415,52 @@ mod tests {
         let mut store = SessionStore::load(dir.file());
         assert!(store.error().is_none());
         assert!(!store.profiles()[0].save_password);
+        // Key auth is opt-in too.
+        assert!(!store.profiles()[0].use_key);
+        assert!(store.profiles()[0].key_path.is_empty());
+        assert!(!store.profiles()[0].use_agent);
 
         // `false` is omitted when re-saved, keeping old files tidy.
         store.upsert(store.profiles()[0].clone()).unwrap();
         assert!(!fs::read_to_string(dir.file())
             .unwrap()
             .contains("save_password"));
+    }
+
+    #[test]
+    fn key_auth_settings_round_trip() {
+        let dir = TempDir::new();
+        let mut store = SessionStore::load(dir.file());
+        let mut keyed = profile("keyed", "example.com");
+        keyed.use_key = true;
+        keyed.key_path = "~/.ssh/id_ed25519".to_string();
+        keyed.use_agent = true;
+        store.upsert(keyed).unwrap();
+
+        let text = fs::read_to_string(dir.file()).unwrap();
+        assert!(text.contains("use_key = true"));
+        assert!(text.contains("key_path = \"~/.ssh/id_ed25519\""));
+        assert!(text.contains("use_agent = true"));
+
+        let reloaded = SessionStore::load(dir.file());
+        let profile = &reloaded.profiles()[0];
+        assert!(profile.use_key);
+        assert_eq!(profile.key_path, "~/.ssh/id_ed25519");
+        assert!(profile.use_agent);
+    }
+
+    #[test]
+    fn blank_key_path_is_omitted_from_the_file() {
+        let dir = TempDir::new();
+        let mut store = SessionStore::load(dir.file());
+        let mut keyed = profile("keyed", "example.com");
+        keyed.use_key = true;
+        store.upsert(keyed).unwrap();
+
+        let text = fs::read_to_string(dir.file()).unwrap();
+        assert!(text.contains("use_key = true"));
+        assert!(!text.contains("key_path"));
+        assert!(!text.contains("use_agent"));
     }
 
     #[test]

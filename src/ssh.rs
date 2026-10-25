@@ -28,8 +28,9 @@ use russh::client::{self, Handle, Msg as ClientMsg};
 // `PublicKey` lives in the `key` submodule; the known-hosts helpers are at the
 // `keys` root. `HashAlg` does not exist in russh 0.45 — `fingerprint()` takes
 // no arguments and hashes with SHA-256 internally.
+use russh::keys::agent::client::AgentClient;
 use russh::keys::key::PublicKey;
-use russh::keys::{check_known_hosts, known_host_keys, learn_known_hosts};
+use russh::keys::{check_known_hosts, known_host_keys, learn_known_hosts, load_secret_key};
 use russh::{compression, Channel, ChannelMsg};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
@@ -41,7 +42,16 @@ pub struct SshConfig {
     pub host: String,
     pub port: u16,
     pub user: String,
+    /// Used as a fallback after key/agent auth, or on its own when they are
+    /// disabled. May be empty.
     pub password: String,
+    /// Try private-key authentication (auto-detected `~/.ssh/id_*` when
+    /// `key_path` is blank).
+    pub use_key: bool,
+    /// Explicit private-key file. `~` is expanded here.
+    pub key_path: String,
+    /// Offer identities from `$SSH_AUTH_SOCK`.
+    pub use_agent: bool,
 }
 
 /// A pending trust-on-first-use decision.
@@ -256,13 +266,7 @@ async fn connect_and_auth(
         }
     };
 
-    let ok = session
-        .authenticate_password(&config.user, &config.password)
-        .await
-        .context("password authentication request failed")?;
-    if !ok {
-        return Err(anyhow!("authentication rejected by server"));
-    }
+    authenticate(&mut session, config).await?;
 
     let channel = session
         .channel_open_session()
@@ -279,6 +283,149 @@ async fn connect_and_auth(
         .context("shell request rejected")?;
 
     Ok((session, channel))
+}
+
+/// Authenticate in the same order `ssh` users expect: key file(s), then
+/// ssh-agent identities, then the typed password.
+///
+/// Every method is optional. Failures are accumulated so the UI can explain
+/// *why* nothing worked (missing key, encrypted key, agent not running, …)
+/// instead of a bare "authentication rejected". The password is never included
+/// in any message.
+async fn authenticate(session: &mut Handle<ClientHandler>, config: &SshConfig) -> Result<()> {
+    let mut failures: Vec<String> = Vec::new();
+
+    if config.use_key {
+        let candidates = key_candidates(&config.key_path);
+        if candidates.is_empty() {
+            failures.push(if config.key_path.trim().is_empty() {
+                "no key found in ~/.ssh (id_ed25519, id_ecdsa, id_rsa, id_dsa)".to_string()
+            } else {
+                format!("key file not found: {}", config.key_path.trim())
+            });
+        }
+
+        for path in candidates {
+            let display = path.display();
+            let key = match load_secret_key(&path, None) {
+                Ok(key) => key,
+                Err(russh::keys::Error::KeyIsEncrypted) => {
+                    failures.push(format!(
+                        "{display}: key is passphrase-protected; add it to ssh-agent \
+                         (ssh-add) and enable the agent option"
+                    ));
+                    continue;
+                }
+                Err(err) => {
+                    failures.push(format!("{display}: {err}"));
+                    continue;
+                }
+            };
+
+            match session
+                .authenticate_publickey(&config.user, Arc::new(key))
+                .await
+            {
+                Ok(true) => return Ok(()),
+                Ok(false) => failures.push(format!("{display}: key rejected by server")),
+                Err(err) => failures.push(format!("{display}: {err}")),
+            }
+        }
+    }
+
+    if config.use_agent {
+        match authenticate_with_agent(session, &config.user).await {
+            Ok(true) => return Ok(()),
+            Ok(false) => failures.push("ssh-agent: no identity was accepted".to_string()),
+            Err(err) => failures.push(format!("ssh-agent: {err}")),
+        }
+    }
+
+    if !config.password.is_empty() {
+        match session
+            .authenticate_password(&config.user, &config.password)
+            .await
+        {
+            Ok(true) => return Ok(()),
+            Ok(false) => failures.push("password: rejected by server".to_string()),
+            Err(err) => return Err(anyhow!("password authentication request failed: {err}")),
+        }
+    }
+
+    if failures.is_empty() {
+        return Err(anyhow!(
+            "no authentication method selected: enable a key or ssh-agent, or type a password"
+        ));
+    }
+    Err(anyhow!("authentication failed: {}", failures.join("; ")))
+}
+
+/// Try every identity currently loaded in `$SSH_AUTH_SOCK`.
+///
+/// `authenticate_future` consumes the agent connection and hands it back, so a
+/// single connection is reused for all identities — the agent never has to be
+/// re-opened after a rejected key.
+async fn authenticate_with_agent(session: &mut Handle<ClientHandler>, user: &str) -> Result<bool> {
+    let mut agent = AgentClient::connect_env()
+        .await
+        .context("could not connect to $SSH_AUTH_SOCK (is ssh-agent running?)")?;
+    let identities = agent
+        .request_identities()
+        .await
+        .context("could not list ssh-agent identities")?;
+    if identities.is_empty() {
+        return Err(anyhow!("the agent has no identities (run ssh-add)"));
+    }
+
+    for key in identities {
+        let (returned, result) = session.authenticate_future(user, key, agent).await;
+        agent = returned;
+        match result {
+            Ok(true) => return Ok(true),
+            Ok(false) => {}
+            Err(err) => return Err(anyhow!("signing with an agent key failed: {err}")),
+        }
+    }
+    Ok(false)
+}
+
+const DEFAULT_KEY_NAMES: [&str; 4] = ["id_ed25519", "id_ecdsa", "id_rsa", "id_dsa"];
+
+/// Explicit path if configured, otherwise the usual `~/.ssh/id_*` files that
+/// actually exist. Missing *default* keys are simply skipped; an explicit path
+/// is always returned so its load error is reported.
+fn key_candidates(configured: &str) -> Vec<PathBuf> {
+    let configured = configured.trim();
+    if !configured.is_empty() {
+        return vec![expand_tilde(configured)];
+    }
+
+    let Some(home) = home_dir() else {
+        return Vec::new();
+    };
+    let ssh = home.join(".ssh");
+    DEFAULT_KEY_NAMES
+        .iter()
+        .map(|name| ssh.join(name))
+        .filter(|path| path.is_file())
+        .collect()
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+/// Expand a leading `~` / `~/`. `~user` is left untouched.
+fn expand_tilde(path: &str) -> PathBuf {
+    if path == "~" {
+        return home_dir().unwrap_or_else(|| PathBuf::from(path));
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = home_dir() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(path)
 }
 
 async fn run_session(

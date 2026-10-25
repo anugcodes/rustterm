@@ -311,3 +311,57 @@ Keep `keyring-secrets` default-on and document
 `cargo build --release --no-default-features` for minimal packaging. Users who
 want the feature later install a build that includes it; do not attempt runtime
 dlopen of crates.
+
+---
+
+# Step: Public-key and ssh-agent authentication
+
+## What changed
+
+**`src/ssh.rs`**
+- `SshConfig` gained `use_key`, `key_path` and `use_agent`.
+- New `authenticate()` runs methods in the order users expect:
+  1. private key file(s) — explicit `key_path`, or auto-detect
+     `~/.ssh/id_ed25519`, `id_ecdsa`, `id_rsa`, `id_dsa` when blank;
+  2. every identity in `$SSH_AUTH_SOCK`, reusing one agent connection via
+     `authenticate_future`;
+  3. the typed password (fallback, or sole method).
+- `~` / `~/…` expansion for the key path.
+- Failures are collected per method and reported together. The message never
+  contains the password. Encrypted keys get a specific hint: `ssh-add` + enable
+  the agent option.
+- `AgentClient::connect_env()` errors (agent missing/not running, no identities)
+  are surfaced clearly.
+
+**`src/app.rs`**
+- New form rows: **Public key** (Use checkbox + path, blank = auto-detect) and
+  **SSH agent**.
+- `start_connect` refuses to start with no password and no key/agent method.
+- Profile load/save round-trips the three new fields.
+
+**`src/sessions.rs`**
+- `SessionProfile` gained `use_key`, `key_path` and `use_agent`, all with serde
+  defaults and omitted when off/empty, so older TOML files load unchanged.
+- Tests: key settings round-trip, blank `key_path` omitted, old files default to
+  password-only.
+
+## Verified
+
+- `cargo fmt --check` ✅
+- `cargo clippy --all-targets -- -D warnings` ✅ (default and
+  `--no-default-features`)
+- `cargo test` ✅ **31 passed** (default and `--no-default-features`)
+- `cargo build --release` ✅
+- End-to-end probe against a temporary russh SSH server on loopback:
+  - explicit Ed25519 key file → **FILE_KEY_OK**
+  - identity loaded in a real `ssh-agent` (`SSH_AUTH_SOCK`) → **AGENT_OK**
+  - password fallback → **PASSWORD_OK**
+  - passphrase-protected key → clear inline error, no hang/crash.
+
+## Known limits (documented in handoff F23/F24)
+
+- Passphrase-protected key files are not decrypted in-app; use ssh-agent.
+- russh-keys 0.45 has no SHA-1 RSA signing path, so OpenSSH 5.3 servers that
+  only offer `ssh-rsa` will reject key auth. Password auth to those hosts still
+  works (the legacy target uses a password).
+- GUI checklist still needs a manual pass (`USAGE.md` §13).

@@ -70,7 +70,7 @@ open protocols.
 
 Cargo.toml                  # eframe/egui 0.29, russh 0.45, russh-sftp 3.0, alacritty_terminal 0.24, chrono 0.4, toml
 Cargo.lock                  # COMMITTED (binary crate — reproducible builds)
-README.md                   # badges use YOUR_USERNAME placeholder — fix before push
+README.md                   # project overview, features budget and build instructions
 LICENSE                     # MIT
 CONTRIBUTING.md
 USAGE.md                    # feature usage + manual GUI test checklist
@@ -439,8 +439,8 @@ password in a plain `String` until it is replaced or the app exits. Errors are
 reported inline; keyring I/O is synchronous on the UI thread but only runs for
 user-initiated profile load/save/delete actions.
 
-**F20 / F21 — Repo polish (C)**
-Fix `YOUR_USERNAME` in README badges; remove the pointless `.gitignore` rule.
+**F20 / F21 — Repo polish (C)** ✅ done
+README badges point at `anugcodes`, and the stale `.gitignore` rule is gone.
 
 **F23 — Encrypted private-key files (B)**
 `secrets`/passphrase input is not implemented; `load_secret_key(path, None)`
@@ -845,7 +845,6 @@ starting the transfers step.
 
 Before pushing:
 
-- fix `YOUR_USERNAME` in README badges (F20);
 - `cargo fmt` and `cargo clippy -- -D warnings`;
 - `chmod +x scripts/setup-github.sh`.
 

@@ -6,9 +6,9 @@ Thanks for helping build rustterm. This is an early-stage project, so the most v
 
 1. Install Rust (1.75+): https://rustup.rs
 2. Install Linux GUI deps:
-   ```bash
+   ```sh
    sudo apt install libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
-```
+   ```
 
 3. Build and run:
 
@@ -37,15 +37,3 @@ cargo run
 5. Edit-and-auto-upload
 
 If you want to work on one of these, open an issue first so we don't duplicate effort.
-
-</BDS:create_file>
-<BDS:create_file fileName=".gitignore">
-
-```text
-/target
-**/*.rs.bk
-Cargo.lock
-.idea/
-.vscode/
-*.swp
-

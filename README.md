@@ -73,6 +73,7 @@ Enter a host, port, username, and password, then click **Connect**.
 ## Documentation
 
 - [`USAGE.md`](USAGE.md) — how each feature works, plus a manual test checklist.
+- [`TESTING.md`](TESTING.md) — the manual smoke and full test procedures.
 - [`handoff.md`](handoff.md) — architecture, status and the development roadmap.
 
 ## Roadmap

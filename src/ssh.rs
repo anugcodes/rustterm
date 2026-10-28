@@ -108,6 +108,17 @@ pub struct SshSession {
     sftp_unavailable: Option<String>,
     /// Wakes egui when an SFTP reply is ready.
     wake: Option<Wake>,
+    /// False once the session thread has finished (normal exit or panic).
+    alive: Arc<AtomicBool>,
+}
+
+/// Flips `alive` to false when the session thread ends, including on panic.
+struct SessionGuard(Arc<AtomicBool>);
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
 }
 
 /// One entry returned by the remote directory listing.
@@ -254,10 +265,13 @@ impl SshSession {
         let (output_tx, output_rx) = std_mpsc::channel::<Vec<u8>>();
         let (sftp_tx, sftp_rx) = mpsc::unbounded_channel::<SftpRequest>();
         let session_wake = wake.clone();
+        let alive = Arc::new(AtomicBool::new(true));
+        let alive_thread = Arc::clone(&alive);
 
         std::thread::Builder::new()
             .name(format!("ssh-{}@{}", config.user, config.host))
             .spawn(move || {
+                let _guard = SessionGuard(alive_thread);
                 rt.block_on(run_session(
                     session,
                     channel,
@@ -282,7 +296,15 @@ impl SshSession {
             sftp_tx,
             sftp_unavailable: sftp_error,
             wake: session_wake,
+            alive,
         })
+    }
+
+    /// Whether the session thread is still running. A false value means the
+    /// connection is gone: input would be discarded and SFTP requests cannot
+    /// be answered, so the UI must show a closed state instead of a stale tab.
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Relaxed)
     }
 
     /// Why SFTP is unavailable for this connection, if it is.
@@ -530,16 +552,16 @@ fn client_config() -> client::Config {
     key.push(russh::keys::key::SSH_RSA);
     preferred.key = Cow::Owned(key);
 
-    // Prefer OpenSSH's "delayed" zlib (`zlib@openssh.com`), matching `ssh -C`.
-    // `russh` only starts compressing after authentication for both zlib names,
-    // so this behaves like OpenSSH's delayed mode. The client's list order is
-    // what gets negotiated, so putting the legacy name first makes OpenSSH
-    // servers choose it; plain `zlib` stays as a fallback for servers that do
-    // not implement the OpenSSH extension.
-    let mut compress = preferred.compression.into_owned();
-    compress.retain(|name| *name != compression::ZLIB_LEGACY);
-    compress.insert(0, compression::ZLIB_LEGACY);
-    preferred.compression = Cow::Owned(compress);
+    // Do **not** enable compression. russh 0.45's outbound zlib compressor
+    // reserves `input.len() + 10` bytes and stops as soon as `flate2` reports
+    // `Ok`, even when the buffer filled up and input is still pending. The
+    // tail of an incompressible packet (PDF, PNG, zip) is then dropped, the
+    // server sees a malformed SSH packet and disconnects the whole connection.
+    // Uploads of text worked only because their compressed output fit.
+    // Upstream fixed this later (see russh >= 0.65's
+    // `incompressible_packets_round_trip` test); until we upgrade, advertise
+    // `none` so the broken path cannot be negotiated.
+    preferred.compression = Cow::Owned(vec![compression::NONE]);
 
     client::Config {
         preferred,
@@ -1091,7 +1113,9 @@ impl SftpAction {
                 progress,
                 reply,
             } => {
-                let result = upload_items(client, local, &remote_dir, policy, &progress).await;
+                let result = upload_items(client, local, &remote_dir, policy, &progress)
+                    .await
+                    .map_err(normalise_transfer_error);
                 let _ = reply.send(result);
             }
             SftpAction::Download {
@@ -1101,7 +1125,9 @@ impl SftpAction {
                 progress,
                 reply,
             } => {
-                let result = download_items(client, remote, &local_dir, policy, &progress).await;
+                let result = download_items(client, remote, &local_dir, policy, &progress)
+                    .await
+                    .map_err(normalise_transfer_error);
                 let _ = reply.send(result);
             }
         }
@@ -1385,6 +1411,35 @@ async fn fetch_file(client: &SftpClient, remote: &str, local: &Path) -> Result<S
 /// pipeline well without making cancellation feel unresponsive.
 const TRANSFER_CHUNK: usize = 64 * 1024;
 
+/// Message used when the SSH transport disappeared mid-transfer, instead of
+/// leaking library strings such as `sender dropped` into the status bar.
+pub(crate) const CONNECTION_LOST: &str =
+    "the SSH connection closed during the transfer — reconnect and retry";
+
+/// Whether an error means the transport is gone rather than one file failing.
+fn is_connection_loss(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    [
+        "sender dropped",
+        "session closed",
+        "channel closed",
+        "broken pipe",
+        "connection reset",
+        "connection aborted",
+        "not connected",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn normalise_transfer_error(message: String) -> String {
+    if is_connection_loss(&message) {
+        CONNECTION_LOST.to_string()
+    } else {
+        message
+    }
+}
+
 struct UploadItem {
     local: PathBuf,
     remote: String,
@@ -1508,33 +1563,42 @@ async fn upload_file_inner(
         .map_err(|err| format!("could not create '{part}': {err}"))?;
 
     let mut buffer = vec![0u8; TRANSFER_CHUNK];
+    let mut failure: Option<String> = None;
     loop {
         if progress.is_cancelled() {
-            let _ = destination.close().await;
-            return Err("Transfer cancelled".to_string());
+            failure = Some("Transfer cancelled".to_string());
+            break;
         }
-        let read = source
-            .read(&mut buffer)
-            .await
-            .map_err(|err| format!("could not read '{}': {err}", local.display()))?;
+        let read = match source.read(&mut buffer).await {
+            Ok(read) => read,
+            Err(err) => {
+                failure = Some(format!("could not read '{}': {err}", local.display()));
+                break;
+            }
+        };
         if read == 0 {
             break;
         }
-        destination
-            .write_all(&buffer[..read])
-            .await
-            .map_err(|err| format!("could not write '{remote}': {err}"))?;
+        if let Err(err) = destination.write_all(&buffer[..read]).await {
+            failure = Some(format!("could not write '{remote}': {err}"));
+            break;
+        }
         progress.add_bytes(read as u64);
     }
 
-    destination
-        .flush()
-        .await
-        .map_err(|err| format!("could not finish writing '{remote}': {err}"))?;
-    destination
-        .close()
-        .await
-        .map_err(|err| format!("could not close '{part}': {err}"))?;
+    if failure.is_none() {
+        if let Err(err) = destination.flush().await {
+            failure = Some(format!("could not finish writing '{remote}': {err}"));
+        }
+    }
+    // Always close, even after a write error: an unclosed handle keeps a
+    // descriptor open on the server until the channel ends, which adds up over
+    // a folder with many files.
+    let closed = destination.close().await;
+    if let Some(err) = failure {
+        return Err(err);
+    }
+    closed.map_err(|err| format!("could not close '{part}': {err}"))?;
 
     // OpenSSH's rename overwrites, but not every server does. Retry once after
     // removing the target so an overwrite never silently fails.
@@ -1577,7 +1641,18 @@ async fn upload_items(
                 Err(err) => return Err(format!("could not check '{destination}': {err}")),
             },
         };
-        collect_upload(path, &destination, &mut plan)?;
+        let local_path = path.clone();
+        // Walking a large local tree can take seconds. On the session's
+        // current-thread runtime that would stall terminal I/O and the SFTP
+        // reader, so keep the pre-walk off the async thread.
+        let scanned = tokio::task::spawn_blocking(move || {
+            let mut items = Vec::new();
+            collect_upload(&local_path, &destination, &mut items)?;
+            Ok::<_, String>(items)
+        })
+        .await
+        .map_err(|err| format!("could not scan '{}': {err}", path.display()))??;
+        plan.extend(scanned);
     }
 
     let total_bytes: u64 = plan
@@ -1610,7 +1685,13 @@ async fn upload_items(
                     uploaded += 1;
                 }
             }
-            Err(err) => failures.push(err),
+            Err(err) => {
+                if is_connection_loss(&err) {
+                    // The transport is gone; every later item would fail too.
+                    return Err(err);
+                }
+                failures.push(err);
+            }
         }
     }
 
@@ -1740,34 +1821,44 @@ async fn download_file_inner(
         .map_err(|err| format!("could not create '{}': {err}", part.display()))?;
 
     let mut buffer = vec![0u8; TRANSFER_CHUNK];
+    let mut failure: Option<String> = None;
     loop {
         if progress.is_cancelled() {
-            drop(destination);
-            return Err("Transfer cancelled".to_string());
+            failure = Some("Transfer cancelled".to_string());
+            break;
         }
-        let read = source
-            .read(&mut buffer)
-            .await
-            .map_err(|err| format!("could not read '{remote}': {err}"))?;
+        let read = match source.read(&mut buffer).await {
+            Ok(read) => read,
+            Err(err) => {
+                failure = Some(format!("could not read '{remote}': {err}"));
+                break;
+            }
+        };
         if read == 0 {
             break;
         }
-        destination
-            .write_all(&buffer[..read])
-            .await
-            .map_err(|err| format!("could not write '{}': {err}", part.display()))?;
+        if let Err(err) = destination.write_all(&buffer[..read]).await {
+            failure = Some(format!("could not write '{}': {err}", part.display()));
+            break;
+        }
         progress.add_bytes(read as u64);
     }
 
-    destination
-        .flush()
-        .await
-        .map_err(|err| format!("could not finish writing '{}': {err}", part.display()))?;
+    if failure.is_none() {
+        if let Err(err) = destination.flush().await {
+            failure = Some(format!(
+                "could not finish writing '{}': {err}",
+                part.display()
+            ));
+        }
+    }
     drop(destination);
-    source
-        .close()
-        .await
-        .map_err(|err| format!("could not close '{remote}': {err}"))?;
+    // Always close the remote handle; dropping it does not send CLOSE.
+    let closed = source.close().await;
+    if let Some(err) = failure {
+        return Err(err);
+    }
+    closed.map_err(|err| format!("could not close '{remote}': {err}"))?;
     // `rename` replaces an existing file on Unix, so an overwrite is atomic.
     std::fs::rename(part, local)
         .map_err(|err| format!("could not finalise '{}': {err}", local.display()))
@@ -1863,7 +1954,12 @@ async fn download_items(
                     downloaded += 1;
                 }
             }
-            Err(err) => failures.push(err),
+            Err(err) => {
+                if is_connection_loss(&err) {
+                    return Err(err);
+                }
+                failures.push(err);
+            }
         }
     }
 
@@ -2176,5 +2272,30 @@ bob:x:1001:1001::/home/bob:/bin/sh
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn client_config_advertises_no_compression() {
+        // russh 0.45's zlib compressor corrupts incompressible packets; the
+        // client must not offer a compression algorithm until we upgrade.
+        let config = client_config();
+        assert_eq!(config.preferred.compression.len(), 1);
+        assert_eq!(config.preferred.compression[0], compression::NONE);
+    }
+
+    #[test]
+    fn classifies_transport_loss_from_library_errors() {
+        assert!(is_connection_loss("could not write 'x': sender dropped"));
+        assert!(is_connection_loss("session closed"));
+        assert!(is_connection_loss("Broken pipe"));
+        assert!(!is_connection_loss("permission denied"));
+        assert_eq!(
+            normalise_transfer_error("could not write 'x': sender dropped".to_string()),
+            CONNECTION_LOST
+        );
+        assert_eq!(
+            normalise_transfer_error("permission denied".to_string()),
+            "permission denied"
+        );
     }
 }

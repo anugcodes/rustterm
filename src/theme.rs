@@ -81,6 +81,9 @@ pub const MENU_WIDTH: f32 = 220.0;
 pub const MENU_ROW_HEIGHT: f32 = 22.0;
 /// Width shared by every modal dialog (rename, delete, host key, editor picker).
 pub const DIALOG_WIDTH: f32 = 440.0;
+/// Font size of a modal heading. Deliberately smaller than `heading_size`:
+/// popups are compact and a 17 px title crowds the fields below it.
+pub const DIALOG_HEADING_SIZE: f32 = 15.0;
 
 /// Spacing and sizing tokens.
 #[derive(Debug, Clone, Copy)]
@@ -403,6 +406,44 @@ pub fn muted(ui: &mut egui::Ui, theme: &Theme, text: impl Into<String>) {
             .color(theme.palette.muted)
             .size(theme.metrics.small_size),
     );
+}
+
+/// Draw a modal heading that truncates (with the full text as a tooltip)
+/// instead of pushing the close button out of the dialog.
+pub fn modal_heading(ui: &mut egui::Ui, theme: &Theme, text: &str) -> egui::Response {
+    let width = (ui.available_width() - 28.0).max(80.0);
+    ui.add_sized(
+        [width, 22.0],
+        egui::Label::new(
+            egui::RichText::new(text)
+                .size(DIALOG_HEADING_SIZE)
+                .strong()
+                .color(theme.palette.text),
+        )
+        .truncate(),
+    )
+    .on_hover_text(text)
+}
+
+/// Wrapped monospace text for a path or fingerprint inside a dialog.
+///
+/// Long remote paths wrap onto multiple lines; only headings truncate.
+pub fn modal_path(ui: &mut egui::Ui, theme: &Theme, text: &str) -> egui::Response {
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(text)
+                .monospace()
+                .size(theme.metrics.small_size)
+                .color(theme.palette.muted),
+        )
+        .wrap(),
+    )
+    .on_hover_text(text)
+}
+
+/// The ✕ in a modal's top-right corner.
+pub fn modal_close(ui: &mut egui::Ui) -> bool {
+    ui.small_button("×").on_hover_text("Close").clicked()
 }
 
 /// Filled accent button used for the primary action of a screen.

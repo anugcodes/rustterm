@@ -172,7 +172,7 @@ enum TransferKind {
         remote_dir: String,
     },
     Download {
-        remote: Vec<String>,
+        remote: Vec<RemoteEntry>,
         local_dir: PathBuf,
     },
 }
@@ -197,7 +197,6 @@ pub struct ConflictPrompt {
 /// The transfer currently running.
 #[derive(Debug)]
 pub struct ActiveTransfer {
-    pub label: String,
     pub progress: Arc<TransferProgress>,
     rx: std_mpsc::Receiver<Result<String, String>>,
     verb: &'static str,
@@ -383,7 +382,11 @@ impl SftpExplorer {
                 true
             }
             Ok(Err(err)) => {
-                self.status.error(err);
+                if crate::ssh::is_sftp_timeout(&err) {
+                    self.mark_unavailable_with(crate::ssh::SFTP_TIMEOUT);
+                } else {
+                    self.status.error(err);
+                }
                 true
             }
             Err(std_mpsc::TryRecvError::Empty) => {
@@ -391,8 +394,7 @@ impl SftpExplorer {
                 false
             }
             Err(std_mpsc::TryRecvError::Disconnected) => {
-                self.status
-                    .error("the SFTP session closed during the file operation");
+                self.mark_unavailable_with("the SFTP session closed during the file operation");
                 true
             }
         }
@@ -525,7 +527,7 @@ impl SftpExplorer {
         let request = TransferRequest {
             label,
             kind: TransferKind::Download {
-                remote: entries.iter().map(|entry| entry.path.clone()).collect(),
+                remote: entries.to_vec(),
                 local_dir,
             },
             policy: ConflictPolicy::Overwrite,
@@ -638,7 +640,7 @@ impl SftpExplorer {
     pub fn transfer_label(&self) -> Option<&str> {
         self.transfer
             .as_ref()
-            .map(|transfer| transfer.label.as_str())
+            .map(|transfer| transfer.progress.label())
     }
 
     pub fn queued_transfers(&self) -> usize {
@@ -695,12 +697,7 @@ impl SftpExplorer {
             self.mark_unavailable(ssh);
             return false;
         };
-        self.transfer = Some(ActiveTransfer {
-            label: request.label,
-            progress,
-            rx,
-            verb,
-        });
+        self.transfer = Some(ActiveTransfer { progress, rx, verb });
         true
     }
 
@@ -724,6 +721,9 @@ impl SftpExplorer {
                     // the same way, and Reconnect SFTP is the only recovery.
                     self.queue.clear();
                     self.mark_unavailable_with(err);
+                } else if crate::ssh::is_sftp_timeout(&err) {
+                    self.queue.clear();
+                    self.mark_unavailable_with(crate::ssh::SFTP_TIMEOUT);
                 } else {
                     self.status.error(err);
                     self.start_next_transfer(ssh);
@@ -1066,6 +1066,14 @@ impl SftpExplorer {
 
     fn fail(&mut self, message: impl Into<String>) {
         self.loading = false;
+        let message = message.into();
+        if crate::ssh::is_sftp_timeout(&message) {
+            // A timeout is not a property of the path; the SFTP channel is
+            // unresponsive. Offer the reconnect path instead of a dead end.
+            self.unavailable = Some(crate::ssh::SFTP_TIMEOUT.to_string());
+            self.status.error(crate::ssh::SFTP_TIMEOUT);
+            return;
+        }
         self.status.error(message);
         // Keep the panel consistent with the listing that is still on screen.
         if !self.listed_path.is_empty() {

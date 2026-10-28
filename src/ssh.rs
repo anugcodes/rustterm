@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -112,12 +112,19 @@ pub struct SshSession {
     alive: Arc<AtomicBool>,
 }
 
-/// Flips `alive` to false when the session thread ends, including on panic.
-struct SessionGuard(Arc<AtomicBool>);
+/// Flips `alive` to false and wakes egui when the session thread ends,
+/// including on panic, so a dead tab is noticed even while the UI is idle.
+struct SessionGuard {
+    alive: Arc<AtomicBool>,
+    wake: Option<Wake>,
+}
 
 impl Drop for SessionGuard {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::Relaxed);
+        self.alive.store(false, Ordering::Relaxed);
+        if let Some(wake) = &self.wake {
+            wake();
+        }
     }
 }
 
@@ -240,21 +247,34 @@ impl SshSession {
     /// **Blocks** the calling thread through the whole handshake — including,
     /// possibly, waiting for the user to answer a host-key prompt on
     /// `prompt_tx`. Call this from a background thread.
+    ///
+    /// `cancel` aborts the attempt at any await point (dropping the socket and
+    /// handshake). The returned error is never shown when it fires.
     pub fn connect(
         config: SshConfig,
         prompt_tx: Option<std_mpsc::Sender<HostKeyPrompt>>,
         wake: Option<Wake>,
+        cancel: Option<oneshot::Receiver<()>>,
     ) -> Result<Self> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .context("failed to build tokio runtime")?;
 
-        let (session, channel, sftp, sftp_error) = rt
-            .block_on(connect_and_auth(&config, prompt_tx))
-            .with_context(|| {
-                format!("connect to {}@{}:{}", config.user, config.host, config.port)
-            })?;
+        let attempt = async {
+            match cancel {
+                Some(cancel) => {
+                    tokio::select! {
+                        _ = cancel => Err(anyhow!("connection cancelled")),
+                        result = connect_and_auth(&config, prompt_tx) => result,
+                    }
+                }
+                None => connect_and_auth(&config, prompt_tx).await,
+            }
+        };
+        let (session, channel, sftp, sftp_error) = rt.block_on(attempt).with_context(|| {
+            format!("connect to {}@{}:{}", config.user, config.host, config.port)
+        })?;
         // The handle is shared so the SFTP reconnect task can open a channel
         // while the session loop keeps ownership for terminal I/O.
         let session = Arc::new(session);
@@ -267,11 +287,15 @@ impl SshSession {
         let session_wake = wake.clone();
         let alive = Arc::new(AtomicBool::new(true));
         let alive_thread = Arc::clone(&alive);
+        let guard_wake = session_wake.clone();
 
         std::thread::Builder::new()
             .name(format!("ssh-{}@{}", config.user, config.host))
             .spawn(move || {
-                let _guard = SessionGuard(alive_thread);
+                let _guard = SessionGuard {
+                    alive: alive_thread,
+                    wake: guard_wake,
+                };
                 rt.block_on(run_session(
                     session,
                     channel,
@@ -487,7 +511,7 @@ impl SshSession {
     /// Download remote files or folders into `local_dir`.
     pub fn sftp_download(
         &self,
-        remote: Vec<String>,
+        remote: Vec<RemoteEntry>,
         local_dir: PathBuf,
         policy: ConflictPolicy,
         progress: Arc<TransferProgress>,
@@ -565,6 +589,12 @@ fn client_config() -> client::Config {
 
     client::Config {
         preferred,
+        // Detect a wedged transport instead of letting the tab freeze forever.
+        // russh sends keepalives and closes the session after three unanswered
+        // ones (~45 s), which flips `SshSession::is_alive()` and shows the
+        // "Connection lost" banner.
+        keepalive_interval: Some(Duration::from_secs(15)),
+        keepalive_max: 3,
         ..client::Config::default()
     }
 }
@@ -578,6 +608,10 @@ async fn connect_and_auth(
     Option<SftpSession>,
     Option<String>,
 )> {
+    /// How long to wait for the TCP handshake before reporting a timeout.
+    /// The OS default can be over two minutes on an unreachable host.
+    const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
     let ssh_config = Arc::new(client_config());
     let addr = (config.host.as_str(), config.port);
 
@@ -594,8 +628,16 @@ async fn connect_and_auth(
     // `client::connect` does not set TCP_NODELAY. On high-latency links Nagle's
     // algorithm then delays small keystrokes by hundreds of milliseconds waiting
     // for an ACK. OpenSSH sets this itself; do the same explicitly.
-    let socket = TcpStream::connect(addr)
+    let socket = tokio::time::timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(addr))
         .await
+        .map_err(|_| {
+            anyhow!(
+                "timed out after {}s connecting to {}:{}",
+                TCP_CONNECT_TIMEOUT.as_secs(),
+                config.host,
+                config.port
+            )
+        })?
         .context("TCP connection failed")?;
     socket
         .set_nodelay(true)
@@ -673,7 +715,11 @@ async fn open_sftp(session: &Handle<ClientHandler>) -> Result<SftpSession, Strin
     SftpSession::new_with_config(
         channel.into_stream(),
         SftpConfig {
-            request_timeout_secs: 10,
+            // Network filesystems (NFS/GPFS mounts such as /remote/...) can
+            // take well over ten seconds to answer a cold `stat`. The old 10 s
+            // limit surfaced as "could not inspect '...': Timeout" on the first
+            // click even though the channel was healthy.
+            request_timeout_secs: 30,
             ..SftpConfig::default()
         },
     )
@@ -1034,7 +1080,9 @@ enum SftpAction {
         reply: std_mpsc::Sender<Result<String, String>>,
     },
     Download {
-        remote: Vec<String>,
+        /// Known entries from the listing, so the first request is not delayed
+        /// by a redundant `stat` on a slow network mount.
+        remote: Vec<RemoteEntry>,
         local_dir: PathBuf,
         policy: ConflictPolicy,
         progress: Arc<TransferProgress>,
@@ -1435,9 +1483,53 @@ fn is_connection_loss(message: &str) -> bool {
 fn normalise_transfer_error(message: String) -> String {
     if is_connection_loss(&message) {
         CONNECTION_LOST.to_string()
+    } else if is_sftp_timeout(&message) {
+        SFTP_TIMEOUT.to_string()
     } else {
         message
     }
+}
+
+/// Message shown when an SFTP request gets no answer in time.
+pub(crate) const SFTP_TIMEOUT: &str =
+    "the server did not answer the SFTP request (30 s timeout) — try Reconnect SFTP";
+
+/// Whether an error is russh-sftp's request timeout rather than a real file
+/// error. Slow network mounts can produce this on a healthy connection.
+pub(crate) fn is_sftp_timeout(message: &str) -> bool {
+    message.to_ascii_lowercase().contains("timeout")
+}
+
+/// Turn a chained connect error into one actionable sentence.
+///
+/// The raw library text stays useful as a tooltip, but on its own it hides the
+/// cause ("TCP connection failed: Connection refused (os error 111)").
+pub fn explain_connect_error(message: &str) -> String {
+    let lower = message.to_ascii_lowercase();
+    // A changed host key already carries a full warning; never shorten it.
+    if lower.contains("host key changed") {
+        return message.to_string();
+    }
+    if lower.contains("password: rejected by server") {
+        return "Login failed — the server rejected this username or password.".to_string();
+    }
+    if lower.contains("connection refused") {
+        return "Connection refused — nothing is listening on that host and port.".to_string();
+    }
+    if lower.contains("timed out") || lower.contains("timeout") {
+        return "Connection timed out — the host did not answer. Check the host, port and network."
+            .to_string();
+    }
+    if lower.contains("failed to lookup address")
+        || lower.contains("name or service not known")
+        || lower.contains("nodename nor servname")
+    {
+        return "Host not found — check the hostname.".to_string();
+    }
+    if lower.contains("network is unreachable") {
+        return "Network unreachable — check this machine's connection.".to_string();
+    }
+    message.to_string()
 }
 
 struct UploadItem {
@@ -1717,20 +1809,22 @@ enum RemoteKind {
     Symlink(String),
 }
 
+/// Walk one remote entry into `out`, using attributes that are already known.
+///
+/// The panel's listing and every `READDIR` reply carry the file attributes, so
+/// a download walk costs one request per directory instead of an extra `stat`
+/// per entry — which is what made the first click time out on a slow network
+/// mount.
 async fn collect_download(
     client: &SftpClient,
     remote: &str,
     local: PathBuf,
+    is_dir: bool,
+    is_symlink: bool,
+    size: u64,
     out: &mut Vec<DownloadItem>,
 ) -> Result<(), String> {
-    let metadata = client
-        .session
-        .symlink_metadata(remote)
-        .await
-        .map_err(|err| format!("could not inspect '{remote}': {err}"))?;
-    let file_type = metadata.file_type();
-
-    if file_type.is_symlink() {
+    if is_symlink {
         let target = client
             .session
             .read_link(remote)
@@ -1745,7 +1839,7 @@ async fn collect_download(
         return Ok(());
     }
 
-    if file_type.is_dir() {
+    if is_dir {
         out.push(DownloadItem {
             remote: remote.to_string(),
             local: local.clone(),
@@ -1757,12 +1851,31 @@ async fn collect_download(
             .read_dir(remote)
             .await
             .map_err(|err| format!("could not read folder '{remote}': {err}"))?;
-        let mut children: Vec<(String, String)> = entries
-            .map(|entry| (entry.file_name(), entry.path()))
+        let mut children: Vec<(String, String, bool, bool, u64)> = entries
+            .map(|entry| {
+                let metadata = entry.metadata();
+                let file_type = metadata.file_type();
+                (
+                    entry.file_name(),
+                    entry.path(),
+                    file_type.is_dir(),
+                    file_type.is_symlink(),
+                    metadata.len(),
+                )
+            })
             .collect();
         children.sort_by(|a, b| a.0.cmp(&b.0));
-        for (name, path) in children {
-            Box::pin(collect_download(client, &path, local.join(&name), out)).await?;
+        for (name, path, child_is_dir, child_is_symlink, child_size) in children {
+            Box::pin(collect_download(
+                client,
+                &path,
+                local.join(&name),
+                child_is_dir,
+                child_is_symlink,
+                child_size,
+                out,
+            ))
+            .await?;
         }
         return Ok(());
     }
@@ -1771,7 +1884,7 @@ async fn collect_download(
         remote: remote.to_string(),
         local,
         kind: RemoteKind::File,
-        size: metadata.len(),
+        size,
     });
     Ok(())
 }
@@ -1900,14 +2013,14 @@ fn summarise_failures(mut failures: Vec<String>) -> String {
 
 async fn download_items(
     client: &SftpClient,
-    remote: Vec<String>,
+    remote: Vec<RemoteEntry>,
     local_dir: &Path,
     policy: ConflictPolicy,
     progress: &TransferProgress,
 ) -> Result<String, String> {
     let mut plan = Vec::new();
-    for path in &remote {
-        let name = remote_file_name(path).to_string();
+    for entry in &remote {
+        let name = remote_file_name(&entry.path).to_string();
         let local = local_dir.join(&name);
         let local = match policy {
             ConflictPolicy::Overwrite => local,
@@ -1919,7 +2032,16 @@ async fn download_items(
                 }
             }
         };
-        Box::pin(collect_download(client, path, local, &mut plan)).await?;
+        Box::pin(collect_download(
+            client,
+            &entry.path,
+            local,
+            entry.is_dir,
+            entry.is_symlink,
+            entry.size,
+            &mut plan,
+        ))
+        .await?;
     }
 
     let total_bytes: u64 = plan
@@ -2297,5 +2419,49 @@ bob:x:1001:1001::/home/bob:/bin/sh
             normalise_transfer_error("permission denied".to_string()),
             "permission denied"
         );
+    }
+
+    #[test]
+    fn explains_common_connect_failures() {
+        assert_eq!(
+            explain_connect_error(
+                "connect to u@h:22: connect to u@h:22: authentication failed: password: rejected by server"
+            ),
+            "Login failed — the server rejected this username or password."
+        );
+        assert_eq!(
+            explain_connect_error("TCP connection failed: Connection refused (os error 111)"),
+            "Connection refused — nothing is listening on that host and port."
+        );
+        assert_eq!(
+            explain_connect_error(
+                "failed to lookup address information: Name or service not known"
+            ),
+            "Host not found — check the hostname."
+        );
+        assert_eq!(
+            explain_connect_error("timed out after 15s connecting to h:22"),
+            "Connection timed out — the host did not answer. Check the host, port and network."
+        );
+        // A changed host key is already actionable and must not be shortened.
+        let changed = "HOST KEY CHANGED for h:22 — the server presented a different key";
+        assert_eq!(explain_connect_error(changed), changed);
+    }
+
+    #[test]
+    fn classifies_sftp_timeouts() {
+        assert!(is_sftp_timeout("could not inspect '/x.tar': Timeout"));
+        assert!(!is_sftp_timeout("permission denied"));
+        assert_eq!(
+            normalise_transfer_error("could not inspect '/x.tar': Timeout".to_string()),
+            SFTP_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn keepalive_is_enabled() {
+        let config = client_config();
+        assert_eq!(config.keepalive_interval, Some(Duration::from_secs(15)));
+        assert_eq!(config.keepalive_max, 3);
     }
 }

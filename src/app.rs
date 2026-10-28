@@ -265,10 +265,83 @@ impl Default for SftpColumns {
 }
 
 const NAME_MIN_WIDTH: f32 = 80.0;
+/// Share of the table the `Name` column keeps before metadata columns shrink.
+const NAME_SHARE: f32 = 0.55;
+const MIN_OWNER_WIDTH: f32 = 44.0;
+const MIN_MODIFIED_WIDTH: f32 = 64.0;
+const MIN_SIZE_WIDTH: f32 = 36.0;
 
 impl SftpColumns {
     fn name_width(self, total: f32) -> f32 {
         (total - self.owner - self.modified - self.size).max(NAME_MIN_WIDTH)
+    }
+
+    /// Widths to actually paint at `total`, keeping the name readable.
+    ///
+    /// The stored widths are the user's preference. On a narrow panel they are
+    /// scaled down as a group; a column that becomes too narrow to read is
+    /// hidden (least informative first: Size, then Modified, then Owner) and
+    /// the freed space goes to `Name`.
+    fn fitted(self, total: f32) -> Self {
+        let total = total.max(0.0);
+        let name_target = (total * NAME_SHARE).max(NAME_MIN_WIDTH).min(total);
+        let budget = (total - name_target).max(0.0);
+        let mins = [MIN_OWNER_WIDTH, MIN_MODIFIED_WIDTH, MIN_SIZE_WIDTH];
+        let preferred = [
+            self.owner.max(0.0),
+            self.modified.max(0.0),
+            self.size.max(0.0),
+        ];
+        let mut visible = [true, true, true];
+
+        // Hide unreadable columns (least informative first) until the rest fit
+        // in the metadata budget. Shrinking is always computed from the user's
+        // preferred widths, so hiding one column does not distort the others.
+        loop {
+            let meta: f32 = (0..3)
+                .filter(|&column| visible[column])
+                .map(|column| preferred[column])
+                .sum();
+            if meta <= budget || meta <= 0.0 {
+                break;
+            }
+            let scale = budget / meta;
+            let unreadable = (0..3)
+                .rev()
+                .find(|&column| visible[column] && preferred[column] * scale < mins[column]);
+            match unreadable {
+                Some(column) => visible[column] = false,
+                None => break,
+            }
+        }
+
+        let meta: f32 = (0..3)
+            .filter(|&column| visible[column])
+            .map(|column| preferred[column])
+            .sum();
+        let scale = if meta > budget && meta > 0.0 {
+            budget / meta
+        } else {
+            1.0
+        };
+
+        Self {
+            owner: if visible[0] {
+                preferred[0] * scale
+            } else {
+                0.0
+            },
+            modified: if visible[1] {
+                preferred[1] * scale
+            } else {
+                0.0
+            },
+            size: if visible[2] {
+                preferred[2] * scale
+            } else {
+                0.0
+            },
+        }
     }
 }
 
@@ -281,6 +354,7 @@ struct SftpLayout {
 
 impl SftpLayout {
     fn new(rect: egui::Rect, columns: SftpColumns) -> Self {
+        let columns = columns.fitted(rect.width());
         let owner_x = rect.left() + columns.name_width(rect.width());
         let modified_x = owner_x + columns.owner;
         let size_x = modified_x + columns.modified;
@@ -292,112 +366,27 @@ impl SftpLayout {
     }
 }
 
-/// Latest SFTP message, transfer progress and message history.
-///
-/// Transfers share this row instead of a second bottom panel: one fixed-height
-/// row cannot overlap itself, and it removes the duplicated "Downloading …"
-/// label the old two-bar layout showed.
+/// Latest SFTP message, operation state, queue depth and message history.
 fn sftp_status_bar(ui: &mut egui::Ui, theme: &Theme, explorer: &mut SftpExplorer) {
-    let transfer = explorer.transfer_progress().map(|progress| {
-        (
-            progress.label().to_string(),
-            progress.fraction(),
-            progress.bytes_done(),
-            progress.total_bytes(),
-            progress.items_done(),
-            progress.total_items(),
-            progress.is_cancelled(),
-        )
-    });
+    let busy = explorer.busy_label().map(str::to_string);
     let queued = explorer.queued_transfers();
     let current = explorer.status.current().cloned();
 
     ui.horizontal(|ui| {
-        if let Some((label, fraction, done, total, items_done, items_total, cancelled)) = transfer {
-            // Reserve the fixed widgets first; the label truncates into
-            // whatever is left, so nothing can overlap at any panel width.
-            let available = ui.available_width();
-            let wide = available >= 400.0;
-            let mut reserved = 30.0 /* history */ + 26.0 /* cancel */ + 28.0 /* gaps */;
-            reserved += if fraction.is_some() { 144.0 } else { 72.0 };
-            if wide {
-                reserved += 58.0;
-            }
-            if queued > 0 {
-                reserved += 46.0;
-            }
-            let label_width = (available - reserved).max(48.0);
-
-            ui.add_sized(
-                [label_width, 16.0],
-                egui::Label::new(
-                    egui::RichText::new(&label)
-                        .small()
-                        .color(theme.palette.text),
-                )
-                .truncate(),
-            )
-            .on_hover_text(&label);
-
-            if cancelled {
-                ui.label(
-                    egui::RichText::new("cancelling…")
-                        .small()
-                        .color(theme.palette.warning),
-                );
-            } else if let Some(fraction) = fraction {
-                let text = match total {
-                    Some(total) => format!("{} / {}", format_size(done), format_size(total)),
-                    None => format_size(done),
-                };
-                ui.add(
-                    egui::ProgressBar::new(fraction)
-                        .desired_width(140.0)
-                        .desired_height(12.0)
-                        .fill(theme.palette.accent)
-                        .text(egui::RichText::new(text).small()),
-                );
+        if let Some(label) = busy {
+            ui.spinner();
+            // Queue depth rides along with the status text instead of living in
+            // the transfer bar, where it could overlap the progress widgets.
+            let text = if queued > 0 {
+                format!("{label} (+{queued} queued)")
             } else {
-                ui.spinner();
-                ui.label(
-                    egui::RichText::new(format_size(done))
-                        .small()
-                        .color(theme.palette.muted),
-                );
-            }
-
-            if wide {
-                if let Some(items_total) = items_total {
-                    ui.add_sized(
-                        [56.0, 16.0],
-                        egui::Label::new(
-                            egui::RichText::new(format!("{items_done}/{items_total}"))
-                                .small()
-                                .color(theme.palette.muted),
-                        )
-                        .truncate(),
-                    )
-                    .on_hover_text("files transferred");
-                }
-            }
-            if queued > 0 {
-                ui.add_sized(
-                    [44.0, 16.0],
-                    egui::Label::new(
-                        egui::RichText::new(format!("+{queued}"))
-                            .small()
-                            .color(theme.palette.muted),
-                    )
+                label
+            };
+            ui.add(
+                egui::Label::new(egui::RichText::new(&text).small().color(theme.palette.text))
                     .truncate(),
-                )
-                .on_hover_text(format!("{queued} transfer(s) queued"));
-            }
-            if theme::icon_button(ui, theme, "×", "Cancel this transfer", !cancelled).clicked() {
-                explorer.cancel_transfer();
-            }
-            // Progress is polled, not pushed: keep frames coming while a
-            // transfer runs.
-            ui.ctx().request_repaint_after(Duration::from_millis(100));
+            )
+            .on_hover_text(text);
         } else {
             let (color, icon, text) = match &current {
                 Some(entry) => (
@@ -449,6 +438,69 @@ fn sftp_status_bar(ui: &mut egui::Ui, theme: &Theme, explorer: &mut SftpExplorer
             response.response.on_hover_text("Message history");
         });
     });
+}
+
+/// Running transfer: byte bar, byte count, file count and cancel.
+///
+/// A separate fixed-height row keeps the progress widgets stable; queue depth
+/// lives in the status bar above so it cannot overlap them.
+fn sftp_transfer_bar(ui: &mut egui::Ui, theme: &Theme, explorer: &mut SftpExplorer) {
+    let info = explorer.transfer_progress().map(|progress| {
+        (
+            progress.fraction(),
+            progress.bytes_done(),
+            progress.total_bytes(),
+            progress.items_done(),
+            progress.total_items(),
+            progress.is_cancelled(),
+        )
+    });
+
+    ui.horizontal(|ui| {
+        let Some((fraction, done, total, items_done, items_total, cancelled)) = info else {
+            return;
+        };
+        if cancelled {
+            ui.label(
+                egui::RichText::new("cancelling…")
+                    .small()
+                    .color(theme.palette.warning),
+            );
+        } else if let Some(fraction) = fraction {
+            ui.add(
+                egui::ProgressBar::new(fraction)
+                    .desired_width(110.0)
+                    .desired_height(8.0)
+                    .fill(theme.palette.accent),
+            );
+            let size = match total {
+                Some(total) => format!("{} / {}", format_size(done), format_size(total)),
+                None => format_size(done),
+            };
+            ui.label(egui::RichText::new(size).small().color(theme.palette.muted));
+        } else {
+            ui.spinner();
+            ui.label(
+                egui::RichText::new(format_size(done))
+                    .small()
+                    .color(theme.palette.muted),
+            );
+        }
+        if let Some(items_total) = items_total {
+            ui.label(
+                egui::RichText::new(format!("{items_done}/{items_total} files"))
+                    .small()
+                    .color(theme.palette.muted),
+            );
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if theme::icon_button(ui, theme, "×", "Cancel this transfer", !cancelled).clicked() {
+                explorer.cancel_transfer();
+            }
+        });
+    });
+    // Progress is polled, not pushed: keep frames coming while a transfer runs.
+    ui.ctx().request_repaint_after(Duration::from_millis(100));
 }
 
 fn status_color(theme: &Theme, kind: StatusKind) -> egui::Color32 {
@@ -561,14 +613,19 @@ fn sftp_header(
         egui::Align::Max,
     );
 
-    let separators = [
-        ("owner", layout.owner.left()),
-        ("modified", layout.modified.left()),
-        ("size", layout.size.left()),
-    ];
-    for (_, x) in separators {
+    let mut separators: Vec<(&str, f32)> = Vec::new();
+    if layout.owner.width() > 0.0 {
+        separators.push(("owner", layout.owner.left()));
+    }
+    if layout.modified.width() > 0.0 {
+        separators.push(("modified", layout.modified.left()));
+    }
+    if layout.size.width() > 0.0 {
+        separators.push(("size", layout.size.left()));
+    }
+    for (_, x) in &separators {
         painter.vline(
-            x,
+            *x,
             rect.y_range(),
             egui::Stroke::new(1.0_f32, theme.palette.border),
         );
@@ -663,6 +720,8 @@ struct ConnectingState {
     /// Taken out to draw the modal, put back if the user has not answered yet.
     prompt: Option<HostKeyPrompt>,
     label: String,
+    /// Fires to abort the attempt at any await point in `SshSession::connect`.
+    cancel_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 struct ConnectForm {
@@ -788,8 +847,9 @@ impl RustTermApp {
 
         let (tx, rx) = std_mpsc::channel();
         let (prompt_tx, prompt_rx) = std_mpsc::channel();
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
         std::thread::spawn(move || {
-            let result = SshSession::connect(config, Some(prompt_tx), Some(wake))
+            let result = SshSession::connect(config, Some(prompt_tx), Some(wake), Some(cancel_rx))
                 .map_err(|e| format!("{e:#}"));
             let _ = tx.send(result);
         });
@@ -799,9 +859,23 @@ impl RustTermApp {
             prompt_rx,
             prompt: None,
             label,
+            cancel_tx: Some(cancel_tx),
         });
         self.clear_status();
         self.active = NEW_SESSION_TAB;
+    }
+
+    /// Abort an in-flight connection attempt.
+    ///
+    /// The UI hides the "Connecting…" state immediately; the worker thread
+    /// notices the cancel signal at its next await and drops the socket.
+    fn cancel_connect(&mut self) {
+        if let Some(mut state) = self.connecting.take() {
+            if let Some(tx) = state.cancel_tx.take() {
+                let _ = tx.send(());
+            }
+            self.set_info("Connection cancelled");
+        }
     }
 
     /// Poll the background connect attempt.
@@ -865,7 +939,11 @@ impl RustTermApp {
             }
             Polled::Ready(Err(err)) => {
                 self.connecting = None;
-                self.set_error(format!("Connect failed: {err}"));
+                log::warn!("connect failed: {err}");
+                self.set_error(format!(
+                    "Connect failed: {}",
+                    crate::ssh::explain_connect_error(&err)
+                ));
                 true
             }
         }
@@ -898,14 +976,9 @@ impl RustTermApp {
             .show(ctx, |ui| {
                 ui.set_width(theme::dialog_inner_width(theme));
                 ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("Unknown host key")
-                            .size(18.0)
-                            .strong()
-                            .color(theme.palette.text),
-                    );
+                    theme::modal_heading(ui, theme, "Unknown host key");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("×").on_hover_text("Reject").clicked() {
+                        if theme::modal_close(ui) {
                             answer = Some(false);
                         }
                     });
@@ -1539,22 +1612,39 @@ impl RustTermApp {
                                 ui.add_space(6.0);
                                 let connecting = self.connecting.is_some();
                                 let mut connect_clicked = false;
+                                let mut cancel_clicked = false;
+                                let connecting_label = self.connecting.as_ref().map(|state| {
+                                    if state.prompt.is_some() {
+                                        "Waiting for host key confirmation…".to_string()
+                                    } else {
+                                        format!("Connecting to {}…", state.label)
+                                    }
+                                });
                                 ui.horizontal(|ui| {
                                     let button = theme::primary_button(theme, "Connect")
                                         .min_size(egui::vec2(104.0, control));
                                     if ui.add_enabled(!connecting, button).clicked() {
                                         connect_clicked = true;
                                     }
-                                    if let Some(state) = &self.connecting {
+                                    if let Some(label) = connecting_label {
                                         ui.spinner();
-                                        let label = if state.prompt.is_some() {
-                                            "Waiting for host key confirmation…".to_string()
-                                        } else {
-                                            format!("Connecting to {}…", state.label)
-                                        };
                                         theme::muted(ui, theme, label);
+                                        if theme::icon_button(
+                                            ui,
+                                            theme,
+                                            "✕",
+                                            "Cancel this connection attempt",
+                                            true,
+                                        )
+                                        .clicked()
+                                        {
+                                            cancel_clicked = true;
+                                        }
                                     }
                                 });
+                                if cancel_clicked {
+                                    self.cancel_connect();
+                                }
 
                                 if connect_clicked {
                                     // Saving first keeps a failing profile out of
@@ -1625,7 +1715,7 @@ impl RustTermApp {
                 explorer.load_home(ssh);
                 activity = true;
             }
-            if theme::icon_button(ui, theme, "⬆", "Up one level", can_up && !busy).clicked() {
+            if theme::icon_button(ui, theme, "↑", "Up one level", can_up && !busy).clicked() {
                 explorer.up(ssh);
                 activity = true;
             }
@@ -1664,7 +1754,7 @@ impl RustTermApp {
                 }
                 activity = true;
             }
-            if theme::icon_button(ui, theme, "⬆", "Upload files here…", !busy).clicked() {
+            if theme::icon_button(ui, theme, "⇧", "Upload files here…", !busy).clicked() {
                 if let Some(paths) = pick_upload_files() {
                     explorer.upload_paths(ssh, paths);
                 }
@@ -1744,6 +1834,20 @@ impl RustTermApp {
             .show_inside(ui, |ui| {
                 sftp_status_bar(ui, theme, explorer);
             });
+
+        if explorer.transfer.is_some() || explorer.queued_transfers() > 0 {
+            egui::TopBottomPanel::bottom(egui::Id::new(("sftp_transfer", index)))
+                .exact_height(theme.metrics.row_height + 6.0)
+                .frame(
+                    egui::Frame::none()
+                        .fill(theme.palette.surface)
+                        .stroke(egui::Stroke::new(1.0_f32, theme.palette.border))
+                        .inner_margin(egui::Margin::symmetric(4.0, 2.0)),
+                )
+                .show_inside(ui, |ui| {
+                    sftp_transfer_bar(ui, theme, explorer);
+                });
+        }
 
         if let Some(reason) = explorer.unavailable.clone() {
             ui.add_space(theme.metrics.card_padding);
@@ -2093,8 +2197,11 @@ impl RustTermApp {
         let kind = dialog.kind.clone();
 
         let (title, subtitle): (String, Option<&str>) = match &kind {
-            SftpDialogKind::Rename { .. } => {
-                ("Rename".to_string(), Some("Give the entry a new name."))
+            // Name the entry being renamed so the heading identifies it; the
+            // name itself is in the editable field below, not repeated here.
+            SftpDialogKind::Rename { from } => {
+                let name = from.rsplit('/').next().unwrap_or(from);
+                (format!("Rename “{name}”"), None)
             }
             SftpDialogKind::NewFolder { .. } => (
                 "New folder".to_string(),
@@ -2116,22 +2223,9 @@ impl RustTermApp {
             .show(ctx, |ui| {
                 ui.set_width(theme::dialog_inner_width(theme));
                 ui.horizontal(|ui| {
-                    // Leave room for the close button so a long file name can
-                    // truncate instead of pushing it out of the dialog.
-                    let title_width = (ui.available_width() - 28.0).max(80.0);
-                    ui.add_sized(
-                        [title_width, 24.0],
-                        egui::Label::new(
-                            egui::RichText::new(&title)
-                                .size(18.0)
-                                .strong()
-                                .color(theme.palette.text),
-                        )
-                        .truncate(),
-                    )
-                    .on_hover_text(&title);
+                    theme::modal_heading(ui, theme, &title);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("×").on_hover_text("Cancel").clicked() {
+                        if theme::modal_close(ui) {
                             cancel = true;
                         }
                     });
@@ -2166,7 +2260,8 @@ impl RustTermApp {
                             submit = true;
                         }
                         ui.add_space(4.0);
-                        theme::muted(ui, theme, format!("Will be created in {parent}"));
+                        theme::muted(ui, theme, "Will be created in");
+                        theme::modal_path(ui, theme, parent);
                         if let Some(err) = &dialog.error {
                             ui.add_space(4.0);
                             ui.colored_label(theme.palette.danger, err);
@@ -2189,15 +2284,7 @@ impl RustTermApp {
                         });
                         ui.add_space(8.0);
                         theme::muted(ui, theme, "Remote path");
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(path)
-                                    .monospace()
-                                    .color(theme.palette.muted),
-                            )
-                            .truncate(),
-                        )
-                        .on_hover_text(path);
+                        theme::modal_path(ui, theme, path);
                         if let Some(err) = &dialog.error {
                             ui.add_space(4.0);
                             ui.colored_label(theme.palette.danger, err);
@@ -2266,33 +2353,16 @@ impl RustTermApp {
             .show(ctx, |ui| {
                 ui.set_width(theme::dialog_inner_width(theme));
                 ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("Open with…")
-                            .size(18.0)
-                            .strong()
-                            .color(theme.palette.text),
-                    );
+                    theme::modal_heading(ui, theme, &format!("Open “{}”", picker.entry.name));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("×").on_hover_text("Cancel").clicked() {
+                        if theme::modal_close(ui) {
                             cancel = true;
                         }
                     });
                 });
                 ui.add_space(4.0);
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(&picker.entry.name)
-                            .strong()
-                            .color(theme.palette.text),
-                    )
-                    .truncate(),
-                )
-                .on_hover_text(&picker.entry.path);
-                theme::muted(
-                    ui,
-                    theme,
-                    format!("Download and open {}", picker.entry.path),
-                );
+                theme::muted(ui, theme, "Download this file, then open it in:");
+                theme::modal_path(ui, theme, &picker.entry.path);
                 ui.add_space(10.0);
 
                 for choice in EditorChoice::ALL {
@@ -2372,15 +2442,15 @@ impl RustTermApp {
             .frame(theme::modal_frame(theme))
             .show(ctx, |ui| {
                 ui.set_width(theme::dialog_inner_width(theme));
+                let heading = if names.len() == 1 {
+                    format!("Replace “{}”", names[0])
+                } else {
+                    format!("Replace {} items", names.len())
+                };
                 ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("Items already exist")
-                            .size(18.0)
-                            .strong()
-                            .color(theme.palette.text),
-                    );
+                    theme::modal_heading(ui, theme, &heading);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("×").on_hover_text("Cancel").clicked() {
+                        if theme::modal_close(ui) {
                             choice = Some(None);
                         }
                     });
@@ -2388,18 +2458,9 @@ impl RustTermApp {
                 theme::muted(
                     ui,
                     theme,
-                    format!("{} item(s) already exist at the destination.", names.len()),
+                    format!("{label} — the transfer has not started yet."),
                 );
                 ui.add_space(theme.metrics.pad);
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(label)
-                            .strong()
-                            .color(theme.palette.text),
-                    )
-                    .truncate(),
-                )
-                .on_hover_text("The transfer has not started yet");
                 for name in names.iter().take(5) {
                     ui.add(
                         egui::Label::new(
@@ -2597,6 +2658,16 @@ impl RustTermApp {
 impl eframe::App for RustTermApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_connecting();
+        // Escape aborts a connection attempt as well as the ✕ button. While a
+        // host-key prompt is up, Esc is left to the modal.
+        if self
+            .connecting
+            .as_ref()
+            .is_some_and(|state| state.prompt.is_none())
+            && ctx.input(|input| input.key_pressed(egui::Key::Escape))
+        {
+            self.cancel_connect();
+        }
 
         // Read background tabs too: SSH flow control must keep moving even when
         // another session is visible. New output is what wakes egui, so this
@@ -2670,6 +2741,48 @@ impl eframe::App for RustTermApp {
         // wake the UI on demand and otherwise let egui sleep at zero CPU.
         if self.connecting.is_some() {
             ctx.request_repaint_after(Duration::from_millis(CONNECT_POLL_MS));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        SftpColumns, MIN_MODIFIED_WIDTH, MIN_OWNER_WIDTH, MIN_SIZE_WIDTH, NAME_MIN_WIDTH,
+        NAME_SHARE,
+    };
+
+    #[test]
+    fn wide_panels_keep_all_columns() {
+        let preferred = SftpColumns::default();
+        let fitted = preferred.fitted(600.0);
+        assert_eq!(fitted.owner, preferred.owner);
+        assert_eq!(fitted.modified, preferred.modified);
+        assert_eq!(fitted.size, preferred.size);
+        assert!(fitted.name_width(600.0) >= 600.0 * NAME_SHARE);
+    }
+
+    #[test]
+    fn narrow_panels_protect_the_name_and_hide_unreadable_columns() {
+        let preferred = SftpColumns::default();
+        for total in [520.0, 400.0, 320.0, 240.0, 180.0, 120.0] {
+            let fitted = preferred.fitted(total);
+            let name = fitted.name_width(total);
+            let target = (total * NAME_SHARE).max(NAME_MIN_WIDTH).min(total);
+            assert!(
+                name >= target - 0.5,
+                "total {total}: name {name} is below {target}"
+            );
+            for (width, min) in [
+                (fitted.owner, MIN_OWNER_WIDTH),
+                (fitted.modified, MIN_MODIFIED_WIDTH),
+                (fitted.size, MIN_SIZE_WIDTH),
+            ] {
+                assert!(
+                    width == 0.0 || width >= min - 0.01,
+                    "total {total}: column width {width} is below {min}"
+                );
+            }
         }
     }
 }

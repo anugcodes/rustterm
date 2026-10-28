@@ -651,6 +651,13 @@ $XDG_CONFIG_HOME/rustterm/settings.toml      # if XDG_CONFIG_HOME is set
 and restored at startup. The terminal's ANSI colours are intentionally
 independent of the UI theme; only the application chrome changes.
 
+Popups follow one geometry: every context/dropdown menu is 220 px wide with
+22 px rows and no vertical gaps (a long file name is truncated in the menu
+header, with the full path in a tooltip), and every modal — Rename, New folder,
+Delete, host key and **Open with…** — is 440 px wide. The tokens live in
+`src/theme.rs` (`MENU_WIDTH`, `MENU_ROW_HEIGHT`, `DIALOG_WIDTH`); new menus call
+`theme::menu_style` and `theme::menu_item` so they inherit the same look.
+
 Current themes: **Midnight** (default, cool dark blue) and **Graphite** (warm
 neutral grey).
 

@@ -636,27 +636,22 @@ impl TerminalView {
         // Right-click menu (MobaXterm-style). Actions that need the clipboard
         // or the SSH channel are recorded and carried out by `app.rs`.
         response.context_menu(|ui| {
+            crate::theme::menu_style(ui);
             let has_selection = self.selection.is_some();
-            if ui
-                .add_enabled(has_selection, egui::Button::new("Copy"))
-                .clicked()
-            {
+            if crate::theme::menu_item(ui, "Copy", has_selection, None).clicked() {
                 self.pending_action = Some(TermAction::Copy);
                 ui.close_menu();
             }
-            if ui.button("Paste").clicked() {
+            if crate::theme::menu_item(ui, "Paste", true, None).clicked() {
                 self.pending_action = Some(TermAction::Paste);
                 ui.close_menu();
             }
             ui.separator();
-            if ui.button("Select All").clicked() {
+            if crate::theme::menu_item(ui, "Select All", true, None).clicked() {
                 self.pending_action = Some(TermAction::SelectAll);
                 ui.close_menu();
             }
-            if ui
-                .add_enabled(has_selection, egui::Button::new("Clear selection"))
-                .clicked()
-            {
+            if crate::theme::menu_item(ui, "Clear selection", has_selection, None).clicked() {
                 self.pending_action = Some(TermAction::ClearSelection);
                 ui.close_menu();
             }

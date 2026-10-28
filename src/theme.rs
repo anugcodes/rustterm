@@ -73,6 +73,15 @@ pub struct Palette {
     pub input_bg: Color32,
 }
 
+/// Width shared by every context and dropdown menu. Keeping this in one place
+/// stops menus from resizing themselves around their longest label.
+pub const MENU_WIDTH: f32 = 220.0;
+/// Row height of a menu entry. Deliberately shorter than `control_height` so
+/// long menus stay compact.
+pub const MENU_ROW_HEIGHT: f32 = 22.0;
+/// Width shared by every modal dialog (rename, delete, host key, editor picker).
+pub const DIALOG_WIDTH: f32 = 440.0;
+
 /// Spacing and sizing tokens.
 #[derive(Debug, Clone, Copy)]
 pub struct Metrics {
@@ -85,6 +94,7 @@ pub struct Metrics {
     pub control_height: f32,
     pub row_height: f32,
     pub tab_min_width: f32,
+    pub dialog_width: f32,
     pub body_size: f32,
     pub small_size: f32,
     pub heading_size: f32,
@@ -105,6 +115,7 @@ const METRICS: Metrics = Metrics {
     control_height: 26.0,
     row_height: 24.0,
     tab_min_width: 168.0,
+    dialog_width: DIALOG_WIDTH,
     body_size: 13.5,
     small_size: 11.0,
     heading_size: 17.0,
@@ -307,6 +318,64 @@ pub fn modal_frame(theme: &Theme) -> egui::Frame {
         .stroke(Stroke::new(1.0_f32, theme.palette.border_strong))
         .rounding(Rounding::ZERO)
         .inner_margin(Margin::same(theme.metrics.modal_padding))
+}
+
+/// Default size for a modal window. The height of `1.0` lets the dialog size
+/// itself to its content, like every other modal in the app.
+pub fn dialog_size(theme: &Theme) -> Vec2 {
+    Vec2::new(theme.metrics.dialog_width, 1.0)
+}
+
+/// Content width inside a modal (window width minus the frame margins).
+pub fn dialog_inner_width(theme: &Theme) -> f32 {
+    theme.metrics.dialog_width - 2.0 * theme.metrics.modal_padding
+}
+
+/// Apply the shared geometry to a context or dropdown menu.
+///
+/// Call this as the first statement inside every menu closure. The global
+/// `Spacing::menu_width` is not applied to context menus by egui, so the width
+/// is set explicitly here. Vertical spacing is tightened for compact rows.
+pub fn menu_style(ui: &mut egui::Ui) {
+    ui.set_min_width(MENU_WIDTH);
+    ui.spacing_mut().item_spacing.y = 1.0;
+    ui.spacing_mut().button_padding.y = 2.0;
+    ui.spacing_mut().interact_size.y = MENU_ROW_HEIGHT;
+}
+
+/// Menu row width that fills the popup minus its margins.
+fn menu_row_width(ui: &egui::Ui) -> f32 {
+    MENU_WIDTH - 2.0 * ui.spacing().menu_margin.left
+}
+
+/// One menu entry with a fixed row width, so the hover highlight spans the
+/// whole popup and the menu never grows around a long label.
+pub fn menu_item(
+    ui: &mut egui::Ui,
+    text: impl Into<egui::RichText>,
+    enabled: bool,
+    color: Option<Color32>,
+) -> egui::Response {
+    let mut text = text.into();
+    if let Some(color) = color {
+        text = text.color(color);
+    }
+    let button = egui::Button::new(text)
+        .min_size(Vec2::new(menu_row_width(ui), MENU_ROW_HEIGHT))
+        .rounding(Rounding::ZERO);
+    ui.add_enabled(enabled, button)
+}
+
+/// A menu entry with a persistent selected state (theme picker).
+pub fn menu_selectable(
+    ui: &mut egui::Ui,
+    text: impl Into<egui::WidgetText>,
+    selected: bool,
+) -> egui::Response {
+    ui.add_sized(
+        Vec2::new(menu_row_width(ui), MENU_ROW_HEIGHT),
+        egui::SelectableLabel::new(selected, text),
+    )
 }
 
 /// Tinted frame used for warnings and other callouts inside a dialog.

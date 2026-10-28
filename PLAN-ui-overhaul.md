@@ -162,7 +162,12 @@ second pass tightened it:
   (`title_bar(false)` for the SFTP dialogs) and `.default_size(vec2(width, 1.0))`
   so they size to their content. `.auto_sized()` was tried and reverted because
   egui expands it to the whole area. The host-key prompt was restyled to match.
-- **Theme menu** — two entries, closes on selection, no developer hint.
+- **Menu →** — two entries, closes on selection, no developer hint. Every
+  context menu now shares one width (`theme::MENU_WIDTH`, 220 px) and compact
+  rows (22 px, 1 px item spacing); long file names in the row-menu header are
+  truncated with a full-path tooltip. Modals share `theme::DIALOG_WIDTH`
+  (440 px), replacing the previous 400/420/440 mix. The Delete dialog no longer
+  repeats "Delete / Please confirm this action" above "Delete \“name\”?".
 - **Icons** — SFTP rows use `🗀` / `🗋` / `🔗` at body font size.
 
 ### Verified on screen

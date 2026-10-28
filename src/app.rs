@@ -319,27 +319,34 @@ fn sftp_status_bar(ui: &mut egui::Ui, theme: &Theme, explorer: &mut SftpExplorer
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let response = ui.menu_button(egui::RichText::new("☰").size(14.0), |ui| {
+                theme::menu_style(ui);
                 ui.label(egui::RichText::new("Session messages").strong());
                 ui.add_space(2.0);
-                for entry in explorer.status.history() {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(&entry.at)
-                                .small()
-                                .color(theme.palette.muted),
-                        );
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(&entry.text)
-                                    .small()
-                                    .color(status_color(theme, entry.kind)),
-                            )
-                            .wrap(),
-                        );
+                // Cap the list so a long session cannot grow the menu past the
+                // bottom of the window.
+                egui::ScrollArea::vertical()
+                    .max_height(320.0)
+                    .show(ui, |ui| {
+                        for entry in explorer.status.history() {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new(&entry.at)
+                                        .small()
+                                        .color(theme.palette.muted),
+                                );
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(&entry.text)
+                                            .small()
+                                            .color(status_color(theme, entry.kind)),
+                                    )
+                                    .wrap(),
+                                );
+                            });
+                        }
                     });
-                }
                 ui.separator();
-                if ui.button("Clear messages").clicked() {
+                if theme::menu_item(ui, "Clear messages", true, None).clicked() {
                     explorer.status.clear();
                     ui.close_menu();
                 }
@@ -748,11 +755,11 @@ impl RustTermApp {
             .title_bar(false)
             .collapsible(false)
             .resizable(false)
-            .default_size(egui::vec2(480.0, 1.0))
+            .default_size(theme::dialog_size(theme))
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .frame(theme::modal_frame(theme))
             .show(ctx, |ui| {
-                ui.set_width(440.0);
+                ui.set_width(theme::dialog_inner_width(theme));
                 ui.horizontal(|ui| {
                     ui.label(
                         egui::RichText::new("Unknown host key")
@@ -977,8 +984,9 @@ impl RustTermApp {
     fn theme_menu_ui(&mut self, ui: &mut egui::Ui) {
         let mut chosen: Option<ThemeId> = None;
         ui.menu_button("🎨 Theme", |ui| {
+            theme::menu_style(ui);
             for id in ThemeId::ALL {
-                if ui.selectable_label(self.theme == id, id.name()).clicked() {
+                if theme::menu_selectable(ui, id.name(), self.theme == id).clicked() {
                     chosen = Some(id);
                     ui.close_menu();
                 }
@@ -1758,37 +1766,43 @@ impl RustTermApp {
                         select_row = Some(entry_index);
                     }
                     response.context_menu(|ui| {
-                        ui.label(egui::RichText::new(&entry.name));
+                        theme::menu_style(ui);
+                        // The header is the only variable-length text, so it is
+                        // truncated; fixed-width items alone would still let a
+                        // long filename widen the whole popup.
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&entry.name).color(theme.palette.text),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(&entry.path);
                         ui.separator();
                         if entry.is_dir {
-                            if ui.button("Open").clicked() {
+                            if theme::menu_item(ui, "Open", true, None).clicked() {
                                 row_action = Some(RowAction::Navigate(entry.path.clone()));
                                 ui.close_menu();
                             }
-                            if has_clipboard && ui.button("Paste into this folder").clicked() {
+                            if theme::menu_item(ui, "Paste into this folder", has_clipboard, None)
+                                .clicked()
+                            {
                                 row_action = Some(RowAction::Paste(entry.path.clone()));
                                 ui.close_menu();
                             }
-                        } else if ui.button("Open with…").clicked() {
+                        } else if theme::menu_item(ui, "Open with…", true, None).clicked() {
                             row_action = Some(RowAction::OpenWith(entry.clone()));
                             ui.close_menu();
                         }
-                        if ui.button("Rename…").clicked() {
+                        if theme::menu_item(ui, "Rename…", true, None).clicked() {
                             row_action = Some(RowAction::Rename(entry.clone()));
                             ui.close_menu();
                         }
-                        if ui.button("Copy path").clicked() {
+                        if theme::menu_item(ui, "Copy path", true, None).clicked() {
                             row_action = Some(RowAction::CopyPath(entry.clone()));
                             ui.close_menu();
                         }
                         ui.separator();
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new("Delete…").color(theme.palette.danger),
-                                )
-                                .rounding(egui::Rounding::ZERO),
-                            )
+                        if theme::menu_item(ui, "Delete…", true, Some(theme.palette.danger))
                             .clicked()
                         {
                             row_action = Some(RowAction::Delete(entry.clone()));
@@ -1858,11 +1872,14 @@ impl RustTermApp {
         let kind = dialog.kind.clone();
 
         let (title, subtitle) = match &kind {
-            SftpDialogKind::Rename { .. } => ("Rename", "Give the entry a new name."),
+            SftpDialogKind::Rename { .. } => ("Rename", Some("Give the entry a new name.")),
             SftpDialogKind::NewFolder { .. } => {
-                ("New folder", "Create a folder in this directory.")
+                ("New folder", Some("Create a folder in this directory."))
             }
-            SftpDialogKind::Delete { .. } => ("Delete", "Please confirm this action."),
+            // "Delete \"name\"?" below already says what is being confirmed;
+            // a second "Delete / Please confirm this action." header line was
+            // pure repetition.
+            SftpDialogKind::Delete { .. } => ("Delete", None),
         };
 
         egui::Window::new(title)
@@ -1870,11 +1887,11 @@ impl RustTermApp {
             .title_bar(false)
             .collapsible(false)
             .resizable(false)
-            .default_size(egui::vec2(424.0, 1.0))
+            .default_size(theme::dialog_size(theme))
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .frame(theme::modal_frame(theme))
             .show(ctx, |ui| {
-                ui.set_width(400.0);
+                ui.set_width(theme::dialog_inner_width(theme));
                 ui.horizontal(|ui| {
                     ui.label(
                         egui::RichText::new(title)
@@ -1888,7 +1905,9 @@ impl RustTermApp {
                         }
                     });
                 });
-                theme::muted(ui, theme, subtitle);
+                if let Some(subtitle) = subtitle {
+                    theme::muted(ui, theme, subtitle);
+                }
                 ui.add_space(theme.metrics.pad);
 
                 match &kind {
@@ -2017,11 +2036,11 @@ impl RustTermApp {
             .title_bar(false)
             .collapsible(false)
             .resizable(false)
-            .default_size(egui::vec2(424.0, 1.0))
+            .default_size(theme::dialog_size(theme))
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .frame(theme::modal_frame(theme))
             .show(ctx, |ui| {
-                ui.set_width(420.0);
+                ui.set_width(theme::dialog_inner_width(theme));
                 ui.horizontal(|ui| {
                     ui.label(
                         egui::RichText::new("Open with…")

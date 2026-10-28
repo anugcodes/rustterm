@@ -238,6 +238,28 @@ Use a scratch directory so nothing real is touched.
 - [ ] **N3 — profile count.** The saved-profiles heading shows the correct count;
       hovering it reveals the store path.
 
+### 2.11 File transfers
+
+- [ ] **T1 — download file.** Select a remote file, click **⬇**, choose a local
+      folder → progress bar advances, status says `Downloaded …`, and
+      `cmp` reports the local copy identical. No `.part` file remains.
+- [ ] **T2 — download folder.** Right-click a folder with sub-folders and a
+      symlink → **Download…** → the tree is recreated locally and the symlink
+      still points at the same target.
+- [ ] **T3 — upload.** Click **⬆**, pick two files → both appear in the remote
+      listing after the automatic refresh.
+- [ ] **T4 — upload into folder.** Right-click a sub-folder → **Upload folder
+      here…** → the tree appears inside that folder, not in the current one.
+- [ ] **T5 — drag & drop.** Drop a file from the file manager onto the panel →
+      it uploads into the visible directory.
+- [ ] **T6 — conflict.** Upload an existing file → the modal appears. **Replace**
+      overwrites it; **Keep both** creates `name (copy)`; **Cancel** and `Esc`
+      change nothing.
+- [ ] **T7 — queue and cancel.** Start two large downloads → the bar shows
+      `+1 queued`; press **×** during the first → `Transfer cancelled`, the
+      `.part` file is gone and the second transfer starts.
+- [ ] **T8 — cleanup.** In the terminal: `rm -rf ~/sftp-test ~/Downloads/rt-*`.
+
 ---
 
 ## 3. When something fails

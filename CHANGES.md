@@ -687,3 +687,68 @@ the UI flat, compact and predictable.
 - Headers are not clickable; the table keeps the directories-first name sort.
 - Very narrow windows (< 900 px) with the panel open were not exercised.
 - Theme switching still only affects the chrome, not terminal ANSI colours.
+
+# Step: File transfers (upload, download, queue, drag & drop)
+
+## What changed
+
+**`src/ssh.rs` — transfer backend.**
+- `ConflictPolicy { Overwrite, KeepBoth }` and `TransferProgress`: an atomic
+  handle for bytes done/total, files done/total and cancellation, so the UI can
+  render progress every frame without a second channel.
+- `SftpAction::{Upload,Download}` and the public
+  `SshSession::{sftp_upload,sftp_download}`. Both use the usual one-shot
+  `std_mpsc` reply, so completion flows through `SftpExplorer::poll` like every
+  other SFTP request.
+- Recursive pre-walks (`collect_upload`, `collect_download`) compute the byte and
+  file totals before the first chunk; this is what makes a real progress bar
+  possible. Directory trees and symlinks are recreated in both directions.
+- Files stream in 64 KiB chunks. Every file is written to `<name>.part` and
+  renamed only on success; cancellation or an error removes the partial file.
+  Uploads retry the rename once after removing the target, because not every
+  server's SFTP rename overwrites.
+- Per-item failures are collected and summarised instead of aborting the whole
+  batch; cancellation is checked between chunks and between items.
+
+**`src/sftp.rs` — queue and conflict state.**
+- `TransferRequest` / `TransferKind` describe queued work; `ActiveTransfer`
+  holds the running progress handle. One transfer runs at a time, the rest wait
+  in a `VecDeque`.
+- `download_entries`, `upload_paths` and `upload_into` detect top-level
+  destinations that already exist and raise `ConflictPrompt` before writing.
+  `resolve_conflict` applies **Replace** or **Keep both** (or cancels) and starts
+  the queue; `cancel_transfer` cancels the running job or drops the queue.
+- `poll` now drains transfer results first, refreshes the listing on success and
+  starts the next queued job. `is_busy`/`busy_label` account for transfers.
+
+**`src/app.rs` — UI.**
+- ⬇ / ⬆ toolbar buttons (selected entry → folder picker; files → upload picker).
+- Row menu: **Download…** on files and folders; folders also get **Upload files
+  here…** and **Upload folder here…**. All entries use the shared menu helpers.
+- A transfer bar above the status bar: label, byte bar, `done / total`, files
+  done/total, **×** cancel and `+N queued`. Frames are requested at 100 ms while
+  a transfer runs.
+- **Items already exist** modal (standard `theme::DIALOG_WIDTH`): lists up to
+  five names and offers **Replace / Keep both / Cancel**; `Esc` cancels.
+- Desktop drag & drop uploads dropped paths into the visible remote directory.
+- `rfd` 0.15 provides the native folder/file pickers. The `xdg-portal` feature
+  requires an async backend, so `tokio` is enabled too.
+
+**Fixed while testing:** `unique_local_path` always returned `name (copy)` even
+when the original name was free; it now tries the plain name first.
+
+## Tests
+
+- `TransferProgress`: byte/fraction arithmetic including clamping, item counts,
+  cancel flag.
+- `remote_file_name`, `summarise_failures`, and `unique_local_path` (plain,
+  `(copy)`, `(copy 2)`) using a temporary directory.
+
+## Verified
+
+- `cargo build` ✅ (default and `--no-default-features`)
+- `cargo clippy --all-targets -- -D warnings` ✅ (both feature sets)
+- `cargo test` ✅ **53 passed** (both feature sets)
+- `cargo fmt --check` ✅
+- GUI verification against a local sshd is still pending; the checklist is in
+  `USAGE.md` §17.

@@ -344,6 +344,15 @@ the far right of the tab bar.
   tab keeps its own directory. Servers without SFTP show a clear unavailable
   message; terminal I/O is never blocked by a slow listing. Symlinks are shown but
   not followed, and the panel does not follow shell `cd` (see F26).
+- **File transfers**: uploads and downloads stream in 64 KiB chunks over the
+  existing `SftpSession`, write to a sibling `.part` file and rename only on
+  success. One transfer runs per session and the rest queue; byte/file progress
+  and the cancel switch are atomics read once per frame, so the terminal stays
+  responsive. Existing destinations prompt for **Replace / Keep both / Cancel**
+  before anything is written, folder trees and symlinks are recreated in both
+  directions, drag & drop uploads into the visible directory, and the listing
+  refreshes when the transfer ends. Details and the GUI checklist are in
+  `USAGE.md` §17.
 - **Host key verification (F3)**: `known_hosts` checking via `russh-keys`. TOFU
 prompt for unknown hosts; *hard failure* (no bypass) for changed keys. Handles
 hashed `known_hosts` and missing `~/.ssh`.
@@ -645,8 +654,12 @@ through a `pty` so the byte sequences can be injected.
    dialogs, flat boxy theme with a global persisted registry (`src/theme.rs`,
    `src/settings.rs`), in-tab close buttons, and a compact New Session page with
    saved-profile management folded into the connection card.
-9. **Transfers** ← next — upload/download with progress bars, queue and drag &
-   drop; reuse the streaming read/write helpers from copy/editor download.
+9. **Transfers** ✅ done — recursive upload/download with byte and file progress,
+   a per-session queue, a cancel switch, a conflict prompt (Replace / Keep both /
+   Cancel), `.part` + rename so interrupted transfers never overwrite a good
+   file, and drag & drop. Entry points: ⬇/⬆ toolbar, row menu and the panel
+   itself. `rfd` supplies the local folder/file pickers. GUI checklist in
+   `USAGE.md` §17.
 
 ### V2
 
@@ -764,11 +777,20 @@ panel cap/hide/show, header resizing, the SFTP rename/new-folder/delete and
 **Open with…** dialogs, the host-key prompt (accept and reject) and theme
 switching/persistence. The remaining live-SFTP items are in `USAGE.md` §14.
 
-**Step 8 — Transfers.** ← next
-Upload/download over the existing `SftpSession`, with progress reporting, a
-transfer queue, and drag & drop. Reuse the streaming read/write helpers from
-copy/editor download. Runs off the terminal select loop like the existing SFTP
-requests.
+**Step 8 — Transfers.** ✅ done.
+`SftpAction::{Upload,Download}` stream in 64 KiB chunks through the session thread
+(`upload_items` / `download_items`, with recursive `collect_upload` /
+`collect_download` pre-walks for the byte total). `TransferProgress` reports
+bytes, files and cancellation through atomics. `SftpExplorer` keeps one active
+transfer plus a `VecDeque` queue, asks about conflicts before starting and polls
+the result each frame. UI: ⬇/⬆ toolbar buttons, row-menu Download / Upload here,
+a progress bar above the status bar, a conflict modal and desktop drag & drop.
+Local pickers use `rfd` (`xdg-portal` + `tokio`). Verified with 53 tests in both
+feature sets; live GUI checks are listed in `USAGE.md` §17.
+
+**Step 9 — Edit-and-auto-upload (V2).** ← next
+Watch the **folder** a temp download was opened from, not just the file, and push
+changes back over SFTP with the same transfer backend.
 
 ### Working agreement — direct repo access
 
@@ -877,7 +899,8 @@ Maintained by the assistant. Update after each successful `cargo build`.
 | SFTP panel | `sftp.rs` (new), `ssh.rs`, `app.rs`, `main.rs`, `Cargo.toml` | `SshSession::{sftp_unavailable,sftp_home,sftp_list}`, `RemoteEntry`, `SftpExplorer::{start,poll,load_home,navigate,refresh,up,selected_entry}`, `join_path`, `parent_path`, `sort_entries`, `format_size`, `format_age`, `RustTermApp::sftp_ui`, `show_sftp` | ✅ done (36 tests; transport verified against a temporary in-process russh SFTP server; GUI-unverified) |
 | SFTP follow-ups | `sftp.rs`, `ssh.rs`, `app.rs`, `Cargo.toml` | `SshSession::{sftp_reconnect,sftp_rename,sftp_delete,sftp_create_dir,sftp_copy,sftp_fetch}`, `SftpClient`, `SharedSftp`, `RemoteEntry::owner`, `SftpExplorer::{reconnect,copy_entry,paste,paste_into,begin_rename,begin_delete,begin_new_folder,begin_new_folder_in,submit_dialog,open_in_editor}`, `SftpDialog`, `EditorChoice`, `format_timestamp`, `RustTermApp::{sftp_ui,sftp_dialogs_ui}`, `chrono` | ✅ done (42 tests both feature sets; clippy/fmt/release clean; GUI-unverified) |
 | UI overhaul | `theme.rs` (new), `settings.rs` (new), `app.rs`, `sftp.rs`, `main.rs`, `Cargo.toml` | `theme::{ThemeId,Theme,Palette,Metrics,apply,body_font,panel_frame,card_frame,modal_frame,callout_frame,section_label,muted,primary_button,danger_button,icon_button,icon_toggle}`, `Settings::{load_default,load_from,save_default,save_to}`, `SftpExplorer::status`, `StatusLog`, `EditorPicker`, `SftpExplorer::{begin_open_with,submit_open_with,cancel_open_with}`, `RustTermApp::{tabs_ui,tab_button,theme_menu_ui,editor_picker_ui,text_field,form_label,sized_label,sftp_header,SftpColumns,SftpLayout}`, hand-rolled SFTP table (`ScrollArea::show_rows`), `egui_extras` removed | ✅ done (48 tests; clippy/fmt/release clean; New Session, tabs, panel, dialogs, host-key prompt and themes verified in the GUI; remaining live-SFTP items in `USAGE.md` §14) |
-| Next: transfers | `ssh.rs`, `sftp.rs`, `app.rs` | TBD — upload/download, progress, queue, drag & drop | ⏳ pending |
+| File transfers | `ssh.rs`, `sftp.rs`, `app.rs`, `Cargo.toml` | `ConflictPolicy`, `TransferProgress`, `SftpAction::{Upload,Download}` → `SshSession::{sftp_upload,sftp_download}`, `upload_items`/`download_items`, `collect_upload`/`collect_download`, `SftpExplorer::{download_entries,upload_paths,upload_into,resolve_conflict,cancel_transfer,transfer_progress,transfer_label,queued_transfers}`, `TransferRequest`, `ConflictPrompt`, `ActiveTransfer`, `RustTermApp::sftp_conflict_ui`, `sftp_transfer_bar`, `rfd` 0.15 (`xdg-portal`,`tokio`) | ✅ done (53 tests both feature sets; clippy/fmt clean; GUI-unverified — checklist in `USAGE.md` §17) |
+| Next: edit-and-auto-upload | `sftp.rs`, `ssh.rs`, `app.rs` | TBD — watch the temp download folder and re-upload on save | ⏳ pending |
 ⚙
 
 ---

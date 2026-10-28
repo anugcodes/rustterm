@@ -713,3 +713,72 @@ and scrolls when the window is short.
       explains what is missing and the button is usable again.
 - [ ] At ~700 px window width the Host/Port row and saved-profile columns still
       fit; long profile targets elide with a tooltip.
+
+## 17. File transfers — [U]
+
+**How:** uploads and downloads run over the existing SFTP channel, so they work
+whenever the panel is usable. There are four entry points:
+
+- **⬇ toolbar button** — downloads the selected row into a folder you pick.
+- **⬆ toolbar button** — uploads one or more local files into the current remote
+  directory.
+- **Row menu** — **Download…** on any file or folder; folders also offer
+  **Upload files here…** and **Upload folder here…**.
+- **Drag & drop** — drop files or folders from the desktop anywhere over the
+  SFTP panel to upload them into the visible remote directory.
+
+A transfer bar appears above the status bar while something is running. It shows
+the label (`Downloading notes.txt…`), a byte progress bar with `done / total`,
+`files done/total`, a **×** cancel button and `+N queued` when more work waits.
+One transfer runs per session; further requests are queued in order.
+
+**Behaviour**
+
+- Files are written to a sibling `.part` file and renamed only when complete, so
+  an interrupted transfer never leaves a truncated file under the real name.
+  Cancelling (or a failure) removes the `.part`.
+- Downloads recreate folders recursively and re-create symlinks with their
+  original target; uploads do the same in reverse. Empty folders are preserved.
+- When a top-level destination already exists the **Items already exist** modal
+  lists up to five names and offers **Replace**, **Keep both** or **Cancel**
+  (`Esc` cancels; the transfer has not started yet).
+  - **Replace** overwrites files and merges into existing folders.
+  - **Keep both** writes the incoming top-level item as `name (copy)`, with
+    `name (copy 2)` and so on if that is taken too. Nested items follow the
+    merge behaviour.
+- Cancel stops the running transfer at the next 64 KiB chunk. If nothing is
+  running it drops the queue instead.
+- The listing refreshes when a transfer finishes, and the status bar reports the
+  outcome (`Downloaded 3 file(s) to /home/you/Downloads`). Failures are collected
+  and reported together rather than aborting the whole batch.
+- The terminal stays responsive throughout: transfers run on the session thread
+  and only progress atomics are read per frame.
+
+**Verify**
+
+- [ ] **Download a file**: ⬇ with a file selected → choose a folder → the bar
+      fills, then the status bar names the destination and the local file exists
+      with identical contents (`cmp`).
+- [ ] **Download a folder**: right-click a non-empty folder → **Download…** →
+      the whole tree, including sub-folders and symlinks, lands in the chosen
+      folder.
+- [ ] **Upload files**: ⬆ in `/tmp` → pick two files → both appear there, and the
+      listing refreshes. Re-open the picker and cancel → nothing happens.
+- [ ] **Upload folder**: right-click a remote folder → **Upload folder here…** →
+      the local tree is created inside that folder, not the current directory.
+- [ ] **Drag & drop**: drag a file from the file manager onto the panel → it is
+      uploaded into the visible directory.
+- [ ] **Conflict → Replace**: upload a file that already exists → modal names it
+      → **Replace** overwrites it.
+- [ ] **Conflict → Keep both**: repeat with **Keep both** → `name (copy)` appears
+      and the original is untouched; repeating gives `name (copy 2)`.
+- [ ] **Conflict → Cancel / Esc**: neither the original nor a copy changes and
+      no transfer is queued.
+- [ ] **Queue**: start a large download and immediately start another → the bar
+      shows `+1 queued`, the second starts automatically when the first ends.
+- [ ] **Cancel**: start a large transfer and press **×** → the bar says
+      `cancelling…`, then `Transfer cancelled`, and no `.part` file remains.
+- [ ] **Failure**: download into a read-only local folder → the status bar shows
+      the error, the listing still works and the session stays connected.
+- [ ] **Responsiveness**: during a large transfer, type in the terminal → input
+      echoes normally.

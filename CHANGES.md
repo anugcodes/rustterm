@@ -752,3 +752,59 @@ when the original name was free; it now tries the plain name first.
 - `cargo fmt --check` ✅
 - GUI verification against a local sshd is still pending; the checklist is in
   `USAGE.md` §17.
+
+# Step: Upload stability, connection-loss handling and transfer UI
+
+## Why
+
+Uploading a PDF or a folder could end with the tab silently dead and the status
+bar saying `sender dropped`. The connection was actually being closed by the
+server: `russh 0.45.0`'s outbound zlib compressor stops as soon as `flate2`
+returns `Ok`, even if the output buffer filled before the input was consumed, so
+the tail of an incompressible packet (PDF, image, archive) was dropped. Text
+files survived because their compressed output fit. The SFTP request map then
+reported `sender dropped` when its transport died. Downloads were unaffected
+because compression happens on the server side.
+
+## What changed
+
+**`src/ssh.rs`.**
+- Advertise `compression::NONE`. The broken compressor can no longer be
+  negotiated; a unit test locks the preference in. Re-enabling compression is
+  deferred to a russh upgrade (≥ 0.65 fixes the bug; `russh-sftp` does not
+  depend on russh, so the upgrade is independent).
+- `SshSession::is_alive()` plus a `SessionGuard` that clears the flag when the
+  session thread exits or panics.
+- `CONNECTION_LOST`, `is_connection_loss()` and `normalise_transfer_error()`:
+  library strings such as `sender dropped` become one clear message, and a dead
+  transport aborts the batch instead of failing every remaining item.
+- `collect_upload` runs on `spawn_blocking`, so walking a large local tree no
+  longer stalls the session's current-thread runtime (terminal input stayed
+  frozen during the walk before).
+- Upload and download loops now close the remote handle on every path
+  (cancellation, read/write error, success), avoiding leaked server descriptors.
+
+**`src/sftp.rs`.**
+- `mark_unavailable_with()` for an explicit reason and `mark_closed()` for a
+  dead session. On connection loss the queue is dropped, the active transfer is
+  cleared and the panel stops offering ordinary recovery.
+
+**`src/app.rs`.**
+- `ActiveSession::connection_lost`, set once by `pump_sessions` when
+  `is_alive()` turns false. The bottom bar then shows
+  **Connection lost — the server closed this session** with **Close tab**;
+  scrollback is preserved until the user closes the tab.
+- Transfer progress moved into the single SFTP status bar. Fixed widgets are
+  reserved first and the label truncates into the remainder, so `+N` can no
+  longer overlap the progress text. The separate second bottom panel is gone.
+- The delete dialog heading is now `Delete “name”` (truncated with a tooltip)
+  and the duplicated body heading was removed.
+
+## Verified
+
+- `cargo build` ✅ (default and `--no-default-features`)
+- `cargo clippy --all-targets -- -D warnings` ✅
+- `cargo test` ✅ **55 passed** (both feature sets)
+- `cargo fmt --check` ✅
+- Live re-test still needed: large PDF upload, mixed folder upload, and the
+  dead-session banner. Checklists: `USAGE.md` §17, `TESTING.md` §2.11.

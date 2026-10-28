@@ -255,10 +255,20 @@ Use a scratch directory so nothing real is touched.
 - [ ] **T6 — conflict.** Upload an existing file → the modal appears. **Replace**
       overwrites it; **Keep both** creates `name (copy)`; **Cancel** and `Esc`
       change nothing.
-- [ ] **T7 — queue and cancel.** Start two large downloads → the bar shows
-      `+1 queued`; press **×** during the first → `Transfer cancelled`, the
+- [ ] **T7 — queue and cancel.** Start two large downloads → the status bar
+      shows `+1`; press **×** during the first → `Transfer cancelled`, the
       `.part` file is gone and the second transfer starts.
-- [ ] **T8 — cleanup.** In the terminal: `rm -rf ~/sftp-test ~/Downloads/rt-*`.
+- [ ] **T8 — upload a PDF.** Upload a large scanned PDF (incompressible). The
+      status bar advances, `ls -l` matches the local size, `cmp` succeeds, and
+      the session stays connected. This is the regression that used to end with
+      `sender dropped` / a silent tab.
+- [ ] **T9 — upload a mixed folder.** Upload ~100 MB of text, PDFs and images.
+      The terminal still echoes input while the folder is scanned, every file
+      arrives, and the connection survives.
+- [ ] **T10 — connection loss.** Stop sshd during an upload → the status bar
+      reports the closed connection and the tab shows **Connection lost** with
+      **Close tab**. The other tabs keep working.
+- [ ] **T11 — cleanup.** In the terminal: `rm -rf ~/sftp-test ~/Downloads/rt-*`.
 
 ---
 

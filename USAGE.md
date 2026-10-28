@@ -727,10 +727,12 @@ whenever the panel is usable. There are four entry points:
 - **Drag & drop** — drop files or folders from the desktop anywhere over the
   SFTP panel to upload them into the visible remote directory.
 
-A transfer bar appears above the status bar while something is running. It shows
+Transfer progress is shown inside the **status bar** at the bottom of the panel:
 the label (`Downloading notes.txt…`), a byte progress bar with `done / total`,
-`files done/total`, a **×** cancel button and `+N queued` when more work waits.
-One transfer runs per session; further requests are queued in order.
+`files done/total`, a **×** cancel button and `+N` when more work waits (hover
+shows the queue depth). The widgets reserve their widths and the label truncates,
+so nothing can overlap at narrow panel sizes. One transfer runs per session;
+further requests are queued in order.
 
 **Behaviour**
 
@@ -752,7 +754,16 @@ One transfer runs per session; further requests are queued in order.
   outcome (`Downloaded 3 file(s) to /home/you/Downloads`). Failures are collected
   and reported together rather than aborting the whole batch.
 - The terminal stays responsive throughout: transfers run on the session thread
-  and only progress atomics are read per frame.
+  and only progress atomics are read per frame. Walking a large local folder for
+  upload happens on a blocking worker, so terminal I/O keeps flowing.
+- The client advertises **no SSH compression**. `russh 0.45`'s outbound zlib
+  compressor truncates incompressible packets (PDFs, images, archives), which
+  made the server drop the whole connection mid-upload. Compression stays off
+  until a russh upgrade is done.
+- If the transport dies during a transfer, the queue is dropped and the status
+  bar says the connection closed instead of repeating a raw library error.
+  The tab then shows a **Connection lost** banner with **Close tab**; scrollback
+  is preserved.
 
 **Verify**
 
@@ -774,11 +785,21 @@ One transfer runs per session; further requests are queued in order.
       and the original is untouched; repeating gives `name (copy 2)`.
 - [ ] **Conflict → Cancel / Esc**: neither the original nor a copy changes and
       no transfer is queued.
-- [ ] **Queue**: start a large download and immediately start another → the bar
-      shows `+1 queued`, the second starts automatically when the first ends.
+- [ ] **Queue**: start a large download and immediately start another → the
+      status bar shows `+1`, the second starts automatically when the first ends.
+- [ ] **Upload a PDF**: upload a several-hundred-page PDF (incompressible) → the
+      bar advances, the remote size matches `ls -l`, and the session does not
+      disconnect. `cmp` the two copies.
+- [ ] **Upload a folder**: upload a tree mixing text, PDFs and images (~100 MB)
+      → every file arrives, the terminal still echoes input during the walk, and
+      the session stays connected afterwards.
 - [ ] **Cancel**: start a large transfer and press **×** → the bar says
       `cancelling…`, then `Transfer cancelled`, and no `.part` file remains.
 - [ ] **Failure**: download into a read-only local folder → the status bar shows
       the error, the listing still works and the session stays connected.
 - [ ] **Responsiveness**: during a large transfer, type in the terminal → input
       echoes normally.
+- [ ] **Connection loss**: kill the sshd side (`sudo systemctl stop ssh` or
+      `pkill -f sshd`) during an upload → the status bar reports the closed
+      connection, the tab shows **Connection lost** plus **Close tab**, and
+      closing it removes the tab without losing other sessions.

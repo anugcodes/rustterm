@@ -20,6 +20,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
@@ -121,6 +122,104 @@ pub struct RemoteEntry {
     /// the server, then the numeric UID.
     pub owner: String,
     pub modified: Option<SystemTime>,
+}
+
+/// How a transfer treats a destination that already exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictPolicy {
+    /// Replace an existing file and merge into an existing folder.
+    Overwrite,
+    /// Write next to the existing entry under a unique name (`name (copy)`).
+    KeepBoth,
+}
+
+/// Live progress of one upload or download.
+///
+/// The SSH task updates atomics per chunk and the UI reads them once per frame,
+/// so progress reporting costs no allocations and needs no channel of its own.
+/// The one-shot completion result still travels over the usual `std_mpsc`
+/// receiver, which keeps the existing `Operation` plumbing intact.
+#[derive(Debug)]
+pub struct TransferProgress {
+    label: String,
+    bytes_done: AtomicU64,
+    bytes_total: AtomicU64,
+    items_done: AtomicU32,
+    items_total: AtomicU32,
+    cancel: AtomicBool,
+}
+
+impl TransferProgress {
+    pub fn new(label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            bytes_done: AtomicU64::new(0),
+            bytes_total: AtomicU64::new(0),
+            items_done: AtomicU32::new(0),
+            items_total: AtomicU32::new(0),
+            cancel: AtomicBool::new(false),
+        }
+    }
+
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub fn set_total_bytes(&self, total: u64) {
+        self.bytes_total.store(total, Ordering::Relaxed);
+    }
+
+    pub fn add_bytes(&self, bytes: u64) {
+        self.bytes_done.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn bytes_done(&self) -> u64 {
+        self.bytes_done.load(Ordering::Relaxed)
+    }
+
+    /// `None` while the pre-walk has not finished or the transfer is empty.
+    pub fn total_bytes(&self) -> Option<u64> {
+        match self.bytes_total.load(Ordering::Relaxed) {
+            0 => None,
+            total => Some(total),
+        }
+    }
+
+    pub fn set_total_items(&self, total: u32) {
+        self.items_total.store(total, Ordering::Relaxed);
+    }
+
+    pub fn item_done(&self) {
+        self.items_done.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn items_done(&self) -> u32 {
+        self.items_done.load(Ordering::Relaxed)
+    }
+
+    pub fn total_items(&self) -> Option<u32> {
+        match self.items_total.load(Ordering::Relaxed) {
+            0 => None,
+            total => Some(total),
+        }
+    }
+
+    /// Byte-based fraction in `0.0..=1.0`, or `None` when the size is unknown.
+    pub fn fraction(&self) -> Option<f32> {
+        let total = self.total_bytes()?;
+        if total == 0 {
+            return None;
+        }
+        Some((self.bytes_done() as f32 / total as f32).clamp(0.0, 1.0))
+    }
+
+    pub fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
 }
 
 impl SshSession {
@@ -328,6 +427,57 @@ impl SshSession {
                 action: SftpAction::Fetch {
                     remote: remote.to_string(),
                     local,
+                    reply,
+                },
+                wake: self.wake.clone(),
+            })
+            .ok()?;
+        Some(rx)
+    }
+
+    /// Upload local files or folders into `remote_dir`.
+    ///
+    /// Progress is reported through `progress`; the reply arrives on the usual
+    /// receiver. The transfer itself runs off the terminal select loop.
+    pub fn sftp_upload(
+        &self,
+        local: Vec<PathBuf>,
+        remote_dir: &str,
+        policy: ConflictPolicy,
+        progress: Arc<TransferProgress>,
+    ) -> Option<std_mpsc::Receiver<Result<String, String>>> {
+        let (reply, rx) = std_mpsc::channel();
+        self.sftp_tx
+            .send(SftpRequest {
+                action: SftpAction::Upload {
+                    local,
+                    remote_dir: remote_dir.to_string(),
+                    policy,
+                    progress,
+                    reply,
+                },
+                wake: self.wake.clone(),
+            })
+            .ok()?;
+        Some(rx)
+    }
+
+    /// Download remote files or folders into `local_dir`.
+    pub fn sftp_download(
+        &self,
+        remote: Vec<String>,
+        local_dir: PathBuf,
+        policy: ConflictPolicy,
+        progress: Arc<TransferProgress>,
+    ) -> Option<std_mpsc::Receiver<Result<String, String>>> {
+        let (reply, rx) = std_mpsc::channel();
+        self.sftp_tx
+            .send(SftpRequest {
+                action: SftpAction::Download {
+                    remote,
+                    local_dir,
+                    policy,
+                    progress,
                     reply,
                 },
                 wake: self.wake.clone(),
@@ -854,6 +1004,20 @@ enum SftpAction {
         local: PathBuf,
         reply: std_mpsc::Sender<Result<String, String>>,
     },
+    Upload {
+        local: Vec<PathBuf>,
+        remote_dir: String,
+        policy: ConflictPolicy,
+        progress: Arc<TransferProgress>,
+        reply: std_mpsc::Sender<Result<String, String>>,
+    },
+    Download {
+        remote: Vec<String>,
+        local_dir: PathBuf,
+        policy: ConflictPolicy,
+        progress: Arc<TransferProgress>,
+        reply: std_mpsc::Sender<Result<String, String>>,
+    },
 }
 
 impl SftpAction {
@@ -920,6 +1084,26 @@ impl SftpAction {
                 let result = fetch_file(client, &remote, &local).await;
                 let _ = reply.send(result);
             }
+            SftpAction::Upload {
+                local,
+                remote_dir,
+                policy,
+                progress,
+                reply,
+            } => {
+                let result = upload_items(client, local, &remote_dir, policy, &progress).await;
+                let _ = reply.send(result);
+            }
+            SftpAction::Download {
+                remote,
+                local_dir,
+                policy,
+                progress,
+                reply,
+            } => {
+                let result = download_items(client, remote, &local_dir, policy, &progress).await;
+                let _ = reply.send(result);
+            }
         }
     }
 
@@ -942,7 +1126,9 @@ impl SftpAction {
             | SftpAction::Delete { reply, .. }
             | SftpAction::CreateDir { reply, .. }
             | SftpAction::Copy { reply, .. }
-            | SftpAction::Fetch { reply, .. } => send(reply),
+            | SftpAction::Fetch { reply, .. }
+            | SftpAction::Upload { reply, .. }
+            | SftpAction::Download { reply, .. } => send(reply),
         }
     }
 }
@@ -1195,6 +1381,501 @@ async fn fetch_file(client: &SftpClient, remote: &str, local: &Path) -> Result<S
     Ok(local.display().to_string())
 }
 
+/// Chunk size for streamed transfers. 64 KiB matches the SFTP read/write
+/// pipeline well without making cancellation feel unresponsive.
+const TRANSFER_CHUNK: usize = 64 * 1024;
+
+struct UploadItem {
+    local: PathBuf,
+    remote: String,
+    kind: LocalKind,
+    size: u64,
+}
+
+enum LocalKind {
+    File,
+    Dir,
+    Symlink(PathBuf),
+}
+
+/// Recursively describe a local tree before uploading it.
+///
+/// The pre-walk is what makes a progress bar possible: without it the byte
+/// total is unknown until the transfer ends.
+fn collect_upload(local: &Path, remote: &str, out: &mut Vec<UploadItem>) -> Result<(), String> {
+    let metadata = std::fs::symlink_metadata(local)
+        .map_err(|err| format!("could not inspect '{}': {err}", local.display()))?;
+    let file_type = metadata.file_type();
+
+    if file_type.is_symlink() {
+        let target = std::fs::read_link(local)
+            .map_err(|err| format!("could not read symlink '{}': {err}", local.display()))?;
+        out.push(UploadItem {
+            local: local.to_path_buf(),
+            remote: remote.to_string(),
+            kind: LocalKind::Symlink(target),
+            size: 0,
+        });
+        return Ok(());
+    }
+
+    if file_type.is_dir() {
+        out.push(UploadItem {
+            local: local.to_path_buf(),
+            remote: remote.to_string(),
+            kind: LocalKind::Dir,
+            size: 0,
+        });
+        let entries = std::fs::read_dir(local)
+            .map_err(|err| format!("could not read '{}': {err}", local.display()))?;
+        let mut children: Vec<PathBuf> = entries
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .collect();
+        children.sort();
+        for child in children {
+            let name = child
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_default();
+            collect_upload(&child, &join_remote_path(remote, &name), out)?;
+        }
+        return Ok(());
+    }
+
+    out.push(UploadItem {
+        local: local.to_path_buf(),
+        remote: remote.to_string(),
+        kind: LocalKind::File,
+        size: metadata.len(),
+    });
+    Ok(())
+}
+
+async fn ensure_remote_dir(client: &SftpClient, path: &str) -> Result<(), String> {
+    match client.session.try_exists(path).await {
+        Ok(true) => Ok(()),
+        Ok(false) => client
+            .session
+            .create_dir(path)
+            .await
+            .map_err(|err| format!("could not create folder '{path}': {err}")),
+        Err(err) => Err(format!("could not check '{path}': {err}")),
+    }
+}
+
+async fn upload_symlink(client: &SftpClient, target: &Path, remote: &str) -> Result<(), String> {
+    let target = target.to_string_lossy().to_string();
+    if client.session.try_exists(remote).await.unwrap_or(false) {
+        let _ = client.session.remove_file(remote).await;
+    }
+    // Same reversed argument order as `copy_tree`.
+    client
+        .session
+        .symlink(&target, remote)
+        .await
+        .map_err(|err| format!("could not create symlink '{remote}': {err}"))
+}
+
+async fn upload_file(
+    client: &SftpClient,
+    local: &Path,
+    remote: &str,
+    progress: &TransferProgress,
+) -> Result<(), String> {
+    let part = format!("{remote}.part");
+    let result = upload_file_inner(client, local, remote, &part, progress).await;
+    if result.is_err() {
+        let _ = client.session.remove_file(&part).await;
+    }
+    result
+}
+
+async fn upload_file_inner(
+    client: &SftpClient,
+    local: &Path,
+    remote: &str,
+    part: &str,
+    progress: &TransferProgress,
+) -> Result<(), String> {
+    let mut source = tokio::fs::File::open(local)
+        .await
+        .map_err(|err| format!("could not open '{}': {err}", local.display()))?;
+    let mut destination = client
+        .session
+        .create(part)
+        .await
+        .map_err(|err| format!("could not create '{part}': {err}"))?;
+
+    let mut buffer = vec![0u8; TRANSFER_CHUNK];
+    loop {
+        if progress.is_cancelled() {
+            let _ = destination.close().await;
+            return Err("Transfer cancelled".to_string());
+        }
+        let read = source
+            .read(&mut buffer)
+            .await
+            .map_err(|err| format!("could not read '{}': {err}", local.display()))?;
+        if read == 0 {
+            break;
+        }
+        destination
+            .write_all(&buffer[..read])
+            .await
+            .map_err(|err| format!("could not write '{remote}': {err}"))?;
+        progress.add_bytes(read as u64);
+    }
+
+    destination
+        .flush()
+        .await
+        .map_err(|err| format!("could not finish writing '{remote}': {err}"))?;
+    destination
+        .close()
+        .await
+        .map_err(|err| format!("could not close '{part}': {err}"))?;
+
+    // OpenSSH's rename overwrites, but not every server does. Retry once after
+    // removing the target so an overwrite never silently fails.
+    if let Err(err) = client.session.rename(part, remote).await {
+        if client.session.try_exists(remote).await.unwrap_or(false) {
+            let _ = client.session.remove_file(remote).await;
+            client
+                .session
+                .rename(part, remote)
+                .await
+                .map_err(|err| format!("could not finalise '{remote}': {err}"))?;
+        } else {
+            return Err(format!("could not finalise '{remote}': {err}"));
+        }
+    }
+    Ok(())
+}
+
+async fn upload_items(
+    client: &SftpClient,
+    local: Vec<PathBuf>,
+    remote_dir: &str,
+    policy: ConflictPolicy,
+    progress: &TransferProgress,
+) -> Result<String, String> {
+    let mut plan = Vec::new();
+    for path in &local {
+        let Some(name) = path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+        else {
+            return Err(format!("'{}' has no file name", path.display()));
+        };
+        let destination = join_remote_path(remote_dir, &name);
+        let destination = match policy {
+            ConflictPolicy::Overwrite => destination,
+            ConflictPolicy::KeepBoth => match client.session.try_exists(&destination).await {
+                Ok(true) => unique_copy_path(client, remote_dir, &name).await?,
+                Ok(false) => destination,
+                Err(err) => return Err(format!("could not check '{destination}': {err}")),
+            },
+        };
+        collect_upload(path, &destination, &mut plan)?;
+    }
+
+    let total_bytes: u64 = plan
+        .iter()
+        .filter(|item| matches!(&item.kind, LocalKind::File))
+        .map(|item| item.size)
+        .sum();
+    let total_files = plan
+        .iter()
+        .filter(|item| matches!(&item.kind, LocalKind::File))
+        .count();
+    progress.set_total_bytes(total_bytes);
+    progress.set_total_items(total_files as u32);
+
+    let mut failures = Vec::new();
+    let mut uploaded = 0usize;
+    for item in &plan {
+        if progress.is_cancelled() {
+            return Err("Transfer cancelled".to_string());
+        }
+        let result = match &item.kind {
+            LocalKind::Dir => ensure_remote_dir(client, &item.remote).await,
+            LocalKind::Symlink(target) => upload_symlink(client, target, &item.remote).await,
+            LocalKind::File => upload_file(client, &item.local, &item.remote, progress).await,
+        };
+        match result {
+            Ok(()) => {
+                if matches!(&item.kind, LocalKind::File) {
+                    progress.item_done();
+                    uploaded += 1;
+                }
+            }
+            Err(err) => failures.push(err),
+        }
+    }
+
+    if progress.is_cancelled() {
+        return Err("Transfer cancelled".to_string());
+    }
+    if !failures.is_empty() {
+        return Err(summarise_failures(failures));
+    }
+    Ok(format!("{uploaded} file(s) to {remote_dir}"))
+}
+
+struct DownloadItem {
+    remote: String,
+    local: PathBuf,
+    kind: RemoteKind,
+    size: u64,
+}
+
+enum RemoteKind {
+    File,
+    Dir,
+    Symlink(String),
+}
+
+async fn collect_download(
+    client: &SftpClient,
+    remote: &str,
+    local: PathBuf,
+    out: &mut Vec<DownloadItem>,
+) -> Result<(), String> {
+    let metadata = client
+        .session
+        .symlink_metadata(remote)
+        .await
+        .map_err(|err| format!("could not inspect '{remote}': {err}"))?;
+    let file_type = metadata.file_type();
+
+    if file_type.is_symlink() {
+        let target = client
+            .session
+            .read_link(remote)
+            .await
+            .map_err(|err| format!("could not read symlink '{remote}': {err}"))?;
+        out.push(DownloadItem {
+            remote: remote.to_string(),
+            local,
+            kind: RemoteKind::Symlink(target),
+            size: 0,
+        });
+        return Ok(());
+    }
+
+    if file_type.is_dir() {
+        out.push(DownloadItem {
+            remote: remote.to_string(),
+            local: local.clone(),
+            kind: RemoteKind::Dir,
+            size: 0,
+        });
+        let entries = client
+            .session
+            .read_dir(remote)
+            .await
+            .map_err(|err| format!("could not read folder '{remote}': {err}"))?;
+        let mut children: Vec<(String, String)> = entries
+            .map(|entry| (entry.file_name(), entry.path()))
+            .collect();
+        children.sort_by(|a, b| a.0.cmp(&b.0));
+        for (name, path) in children {
+            Box::pin(collect_download(client, &path, local.join(&name), out)).await?;
+        }
+        return Ok(());
+    }
+
+    out.push(DownloadItem {
+        remote: remote.to_string(),
+        local,
+        kind: RemoteKind::File,
+        size: metadata.len(),
+    });
+    Ok(())
+}
+
+fn download_symlink(target: &str, local: &Path) -> Result<(), String> {
+    if local.symlink_metadata().is_ok() {
+        let _ = std::fs::remove_file(local);
+    }
+    std::os::unix::fs::symlink(target, local).map_err(|err| {
+        format!(
+            "could not create symlink '{}' -> '{target}': {err}",
+            local.display()
+        )
+    })
+}
+
+async fn download_file(
+    client: &SftpClient,
+    remote: &str,
+    local: &Path,
+    progress: &TransferProgress,
+) -> Result<(), String> {
+    let mut part_os = local.as_os_str().to_os_string();
+    part_os.push(".part");
+    let part = PathBuf::from(part_os);
+    let result = download_file_inner(client, remote, local, &part, progress).await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&part).await;
+    }
+    result
+}
+
+async fn download_file_inner(
+    client: &SftpClient,
+    remote: &str,
+    local: &Path,
+    part: &Path,
+    progress: &TransferProgress,
+) -> Result<(), String> {
+    let mut source = client
+        .session
+        .open(remote)
+        .await
+        .map_err(|err| format!("could not open '{remote}': {err}"))?;
+    let mut destination = tokio::fs::File::create(part)
+        .await
+        .map_err(|err| format!("could not create '{}': {err}", part.display()))?;
+
+    let mut buffer = vec![0u8; TRANSFER_CHUNK];
+    loop {
+        if progress.is_cancelled() {
+            drop(destination);
+            return Err("Transfer cancelled".to_string());
+        }
+        let read = source
+            .read(&mut buffer)
+            .await
+            .map_err(|err| format!("could not read '{remote}': {err}"))?;
+        if read == 0 {
+            break;
+        }
+        destination
+            .write_all(&buffer[..read])
+            .await
+            .map_err(|err| format!("could not write '{}': {err}", part.display()))?;
+        progress.add_bytes(read as u64);
+    }
+
+    destination
+        .flush()
+        .await
+        .map_err(|err| format!("could not finish writing '{}': {err}", part.display()))?;
+    drop(destination);
+    source
+        .close()
+        .await
+        .map_err(|err| format!("could not close '{remote}': {err}"))?;
+    // `rename` replaces an existing file on Unix, so an overwrite is atomic.
+    std::fs::rename(part, local)
+        .map_err(|err| format!("could not finalise '{}': {err}", local.display()))
+}
+
+fn unique_local_path(dir: &Path, name: &str) -> PathBuf {
+    let candidate = dir.join(name);
+    if !candidate.exists() {
+        return candidate;
+    }
+    for attempt in 1..1000 {
+        let candidate_name = if attempt == 1 {
+            format!("{name} (copy)")
+        } else {
+            format!("{name} (copy {attempt})")
+        };
+        let candidate = dir.join(candidate_name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    dir.join(name)
+}
+
+fn remote_file_name(path: &str) -> &str {
+    path.rsplit('/')
+        .find(|part| !part.is_empty())
+        .unwrap_or(path)
+}
+
+fn summarise_failures(mut failures: Vec<String>) -> String {
+    if failures.len() == 1 {
+        failures.remove(0)
+    } else {
+        let first = failures.first().cloned().unwrap_or_default();
+        format!("{} items failed: {first}", failures.len())
+    }
+}
+
+async fn download_items(
+    client: &SftpClient,
+    remote: Vec<String>,
+    local_dir: &Path,
+    policy: ConflictPolicy,
+    progress: &TransferProgress,
+) -> Result<String, String> {
+    let mut plan = Vec::new();
+    for path in &remote {
+        let name = remote_file_name(path).to_string();
+        let local = local_dir.join(&name);
+        let local = match policy {
+            ConflictPolicy::Overwrite => local,
+            ConflictPolicy::KeepBoth => {
+                if local.exists() {
+                    unique_local_path(local_dir, &name)
+                } else {
+                    local
+                }
+            }
+        };
+        Box::pin(collect_download(client, path, local, &mut plan)).await?;
+    }
+
+    let total_bytes: u64 = plan
+        .iter()
+        .filter(|item| matches!(&item.kind, RemoteKind::File))
+        .map(|item| item.size)
+        .sum();
+    let total_files = plan
+        .iter()
+        .filter(|item| matches!(&item.kind, RemoteKind::File))
+        .count();
+    progress.set_total_bytes(total_bytes);
+    progress.set_total_items(total_files as u32);
+
+    let mut failures = Vec::new();
+    let mut downloaded = 0usize;
+    for item in &plan {
+        if progress.is_cancelled() {
+            return Err("Transfer cancelled".to_string());
+        }
+        let result = match &item.kind {
+            RemoteKind::Dir => tokio::fs::create_dir_all(&item.local)
+                .await
+                .map_err(|err| format!("could not create '{}': {err}", item.local.display())),
+            RemoteKind::Symlink(target) => download_symlink(target, &item.local),
+            RemoteKind::File => download_file(client, &item.remote, &item.local, progress).await,
+        };
+        match result {
+            Ok(()) => {
+                if matches!(&item.kind, RemoteKind::File) {
+                    progress.item_done();
+                    downloaded += 1;
+                }
+            }
+            Err(err) => failures.push(err),
+        }
+    }
+
+    if progress.is_cancelled() {
+        return Err("Transfer cancelled".to_string());
+    }
+    if !failures.is_empty() {
+        return Err(summarise_failures(failures));
+    }
+    Ok(format!("{downloaded} file(s) to {}", local_dir.display()))
+}
+
 async fn remove_tree(client: &SftpClient, path: &str, is_dir: bool) -> Result<(), String> {
     if !is_dir {
         return client
@@ -1426,5 +2107,74 @@ bob:x:1001:1001::/home/bob:/bin/sh
         assert_eq!(join_remote_path("/home/user/", "file"), "/home/user/file");
         assert_eq!(join_remote_path("/", "etc"), "/etc");
         assert_eq!(join_remote_path("", "etc"), "/etc");
+    }
+
+    #[test]
+    fn transfer_progress_reports_bytes_and_fraction() {
+        let progress = TransferProgress::new("Uploading notes.txt…");
+        assert_eq!(progress.label(), "Uploading notes.txt…");
+        // Before the pre-walk finishes the size is unknown, not zero.
+        assert_eq!(progress.total_bytes(), None);
+        assert_eq!(progress.fraction(), None);
+
+        progress.set_total_bytes(100);
+        progress.add_bytes(40);
+        assert_eq!(progress.bytes_done(), 40);
+        assert!((progress.fraction().unwrap() - 0.4).abs() < 1e-6);
+
+        // Progress is clamped, so an over-report never exceeds 100%.
+        progress.add_bytes(100);
+        assert_eq!(progress.fraction(), Some(1.0));
+    }
+
+    #[test]
+    fn transfer_progress_counts_items_and_cancels() {
+        let progress = TransferProgress::new("Downloading");
+        assert_eq!(progress.total_items(), None);
+        progress.set_total_items(3);
+        progress.item_done();
+        assert_eq!(progress.items_done(), 1);
+        assert_eq!(progress.total_items(), Some(3));
+
+        assert!(!progress.is_cancelled());
+        progress.cancel();
+        assert!(progress.is_cancelled());
+    }
+
+    #[test]
+    fn strips_directory_components_from_remote_paths() {
+        assert_eq!(remote_file_name("/home/alice/report.txt"), "report.txt");
+        assert_eq!(remote_file_name("/home/alice/"), "alice");
+        assert_eq!(remote_file_name("report.txt"), "report.txt");
+        assert_eq!(remote_file_name("/"), "/");
+    }
+
+    #[test]
+    fn summarises_single_and_multiple_failures() {
+        assert_eq!(summarise_failures(vec!["boom".to_string()]), "boom");
+        let summary = summarise_failures(vec!["a".to_string(), "b".into(), "c".into()]);
+        assert_eq!(summary, "3 items failed: a");
+    }
+
+    #[test]
+    fn picks_the_next_free_copy_name() {
+        let dir = std::env::temp_dir().join(format!("rustterm-copy-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Nothing exists yet, so the original name wins.
+        assert_eq!(unique_local_path(&dir, "notes.txt"), dir.join("notes.txt"));
+        std::fs::write(dir.join("notes.txt"), b"x").unwrap();
+        assert_eq!(
+            unique_local_path(&dir, "notes.txt"),
+            dir.join("notes.txt (copy)")
+        );
+        std::fs::write(dir.join("notes.txt (copy)"), b"x").unwrap();
+        assert_eq!(
+            unique_local_path(&dir, "notes.txt"),
+            dir.join("notes.txt (copy 2)")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

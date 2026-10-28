@@ -19,6 +19,7 @@
 //! thread calls `request_repaint` when output arrives, while a timer is only
 //! needed while a connection attempt is still in progress.
 
+use std::path::PathBuf;
 use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,7 +34,7 @@ use crate::sftp::{
     command_available, editor_program, format_age, format_owner, format_size, format_timestamp,
     EditorChoice, SftpDialogKind, SftpExplorer, StatusKind,
 };
-use crate::ssh::{HostKeyPrompt, RemoteEntry, SshConfig, SshSession, Wake};
+use crate::ssh::{ConflictPolicy, HostKeyPrompt, RemoteEntry, SshConfig, SshSession, Wake};
 use crate::terminal::{TermAction, TerminalView};
 use crate::theme::{self, Theme, ThemeId};
 
@@ -356,6 +357,73 @@ fn sftp_status_bar(ui: &mut egui::Ui, theme: &Theme, explorer: &mut SftpExplorer
     });
 }
 
+/// Running transfer: label, bar, byte count, queue depth and cancel.
+fn sftp_transfer_bar(ui: &mut egui::Ui, theme: &Theme, explorer: &mut SftpExplorer) {
+    let info = explorer.transfer_progress().map(|progress| {
+        (
+            progress.label().to_string(),
+            progress.fraction(),
+            progress.bytes_done(),
+            progress.total_bytes(),
+            progress.items_done(),
+            progress.total_items(),
+            progress.is_cancelled(),
+        )
+    });
+    let queued = explorer.queued_transfers();
+
+    ui.horizontal(|ui| {
+        let Some((label, fraction, done, total, items_done, items_total, cancelled)) = info else {
+            theme::muted(ui, theme, format!("{queued} transfer(s) queued"));
+            return;
+        };
+        ui.add(egui::Label::new(egui::RichText::new(label).small()).truncate());
+        if cancelled {
+            ui.label(
+                egui::RichText::new("cancelling…")
+                    .small()
+                    .color(theme.palette.warning),
+            );
+        } else if let Some(fraction) = fraction {
+            ui.add(
+                egui::ProgressBar::new(fraction)
+                    .desired_width(110.0)
+                    .desired_height(8.0)
+                    .fill(theme.palette.accent),
+            );
+            let size = match total {
+                Some(total) => format!("{} / {}", format_size(done), format_size(total)),
+                None => format_size(done),
+            };
+            ui.label(egui::RichText::new(size).small().color(theme.palette.muted));
+        } else {
+            ui.spinner();
+            ui.label(
+                egui::RichText::new(format_size(done))
+                    .small()
+                    .color(theme.palette.muted),
+            );
+        }
+        if let Some(items_total) = items_total {
+            ui.label(
+                egui::RichText::new(format!("{items_done}/{items_total} files"))
+                    .small()
+                    .color(theme.palette.muted),
+            );
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if theme::icon_button(ui, theme, "×", "Cancel this transfer", !cancelled).clicked() {
+                explorer.cancel_transfer();
+            }
+            if queued > 0 {
+                theme::muted(ui, theme, format!("+{queued} queued"));
+            }
+        });
+    });
+    // Progress is polled, not pushed: keep frames coming while a transfer runs.
+    ui.ctx().request_repaint_after(Duration::from_millis(100));
+}
+
 fn status_color(theme: &Theme, kind: StatusKind) -> egui::Color32 {
     match kind {
         StatusKind::Info => theme.palette.muted,
@@ -370,6 +438,44 @@ fn status_icon(kind: StatusKind) -> &'static str {
         StatusKind::Success => "✔",
         StatusKind::Error => "×",
     }
+}
+
+fn local_home() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"))
+}
+
+fn default_download_directory() -> PathBuf {
+    let home = local_home();
+    let downloads = home.join("Downloads");
+    if downloads.is_dir() {
+        downloads
+    } else {
+        home
+    }
+}
+
+fn pick_download_folder() -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .set_title("Download to folder")
+        .set_directory(default_download_directory())
+        .pick_folder()
+}
+
+fn pick_upload_files() -> Option<Vec<PathBuf>> {
+    rfd::FileDialog::new()
+        .set_title("Upload files")
+        .set_directory(local_home())
+        .pick_files()
+}
+
+fn pick_upload_folder() -> Option<Vec<PathBuf>> {
+    rfd::FileDialog::new()
+        .set_title("Upload folder")
+        .set_directory(local_home())
+        .pick_folder()
+        .map(|path| vec![path])
 }
 
 /// Draw the SFTP column header and its resize handles.
@@ -878,6 +984,10 @@ impl RustTermApp {
             // keeps a listing ready even if the sidebar is currently hidden.
             if session.sftp.poll(&session.ssh) {
                 activity = true;
+            }
+            if session.sftp.transfer.is_some() {
+                // The bar is polled; keep frames coming while bytes flow.
+                ctx.request_repaint_after(Duration::from_millis(100));
             }
             while budget > 0 {
                 let Some(chunk) = session.ssh.try_read() else {
@@ -1500,6 +1610,26 @@ impl RustTermApp {
                 explorer.paste(ssh);
                 activity = true;
             }
+            if theme::icon_button(
+                ui,
+                theme,
+                "⬇",
+                "Download the selected entry…",
+                selected.is_some() && !busy,
+            )
+            .clicked()
+            {
+                if let (Some(entry), Some(dir)) = (&selected, pick_download_folder()) {
+                    explorer.download_entries(ssh, std::slice::from_ref(entry), dir);
+                }
+                activity = true;
+            }
+            if theme::icon_button(ui, theme, "⬆", "Upload files here…", !busy).clicked() {
+                if let Some(paths) = pick_upload_files() {
+                    explorer.upload_paths(ssh, paths);
+                }
+                activity = true;
+            }
             if theme::icon_toggle(
                 ui,
                 theme,
@@ -1575,6 +1705,20 @@ impl RustTermApp {
                 sftp_status_bar(ui, theme, explorer);
             });
 
+        if explorer.transfer.is_some() || explorer.queued_transfers() > 0 {
+            egui::TopBottomPanel::bottom(egui::Id::new(("sftp_transfer", index)))
+                .exact_height(theme.metrics.row_height + 6.0)
+                .frame(
+                    egui::Frame::none()
+                        .fill(theme.palette.surface)
+                        .stroke(egui::Stroke::new(1.0_f32, theme.palette.border))
+                        .inner_margin(egui::Margin::symmetric(4.0, 2.0)),
+                )
+                .show_inside(ui, |ui| {
+                    sftp_transfer_bar(ui, theme, explorer);
+                });
+        }
+
         if let Some(reason) = explorer.unavailable.clone() {
             ui.add_space(theme.metrics.card_padding);
             ui.vertical_centered(|ui| {
@@ -1623,6 +1767,8 @@ impl RustTermApp {
             Delete(RemoteEntry),
             CopyPath(RemoteEntry),
             Paste(String),
+            Download(RemoteEntry),
+            UploadHere(String, bool),
         }
         let mut row_action: Option<RowAction> = None;
         let mut select_row: Option<usize> = None;
@@ -1789,9 +1935,27 @@ impl RustTermApp {
                                 row_action = Some(RowAction::Paste(entry.path.clone()));
                                 ui.close_menu();
                             }
-                        } else if theme::menu_item(ui, "Open with…", true, None).clicked() {
-                            row_action = Some(RowAction::OpenWith(entry.clone()));
-                            ui.close_menu();
+                            if theme::menu_item(ui, "Download…", true, None).clicked() {
+                                row_action = Some(RowAction::Download(entry.clone()));
+                                ui.close_menu();
+                            }
+                            if theme::menu_item(ui, "Upload files here…", true, None).clicked() {
+                                row_action = Some(RowAction::UploadHere(entry.path.clone(), false));
+                                ui.close_menu();
+                            }
+                            if theme::menu_item(ui, "Upload folder here…", true, None).clicked() {
+                                row_action = Some(RowAction::UploadHere(entry.path.clone(), true));
+                                ui.close_menu();
+                            }
+                        } else {
+                            if theme::menu_item(ui, "Open with…", true, None).clicked() {
+                                row_action = Some(RowAction::OpenWith(entry.clone()));
+                                ui.close_menu();
+                            }
+                            if theme::menu_item(ui, "Download…", true, None).clicked() {
+                                row_action = Some(RowAction::Download(entry.clone()));
+                                ui.close_menu();
+                            }
                         }
                         if theme::menu_item(ui, "Rename…", true, None).clicked() {
                             row_action = Some(RowAction::Rename(entry.clone()));
@@ -1846,8 +2010,39 @@ impl RustTermApp {
                 RowAction::Paste(path) => {
                     explorer.paste_into(ssh, path);
                 }
+                RowAction::Download(entry) => {
+                    if let Some(dir) = pick_download_folder() {
+                        explorer.download_entries(ssh, std::slice::from_ref(&entry), dir);
+                    }
+                }
+                RowAction::UploadHere(dir, folder) => {
+                    let paths = if folder {
+                        pick_upload_folder()
+                    } else {
+                        pick_upload_files()
+                    };
+                    if let Some(paths) = paths {
+                        explorer.upload_into(ssh, dir, paths);
+                    }
+                }
             }
             activity = true;
+        }
+
+        // Desktop drag & drop: dropped paths upload into the visible directory.
+        if !busy && ui.rect_contains_pointer(ui.max_rect()) {
+            let dropped: Vec<PathBuf> = ui.ctx().input(|input| {
+                input
+                    .raw
+                    .dropped_files
+                    .iter()
+                    .filter_map(|file| file.path.clone())
+                    .collect()
+            });
+            if !dropped.is_empty() {
+                explorer.upload_paths(ssh, dropped);
+                activity = true;
+            }
         }
 
         if hide {
@@ -2123,6 +2318,115 @@ impl RustTermApp {
         false
     }
 
+    /// Ask how to resolve existing destinations before a transfer starts.
+    fn sftp_conflict_ui(&mut self, ctx: &egui::Context, index: usize) -> bool {
+        let theme = self.theme.theme();
+        let Some(session) = self.sessions.get_mut(index) else {
+            return false;
+        };
+        let (ssh, explorer) = (&session.ssh, &mut session.sftp);
+        let Some(prompt) = explorer.conflict.as_ref() else {
+            return false;
+        };
+        let names = prompt.names.clone();
+        let label = prompt.label.clone();
+
+        let mut choice: Option<Option<ConflictPolicy>> = None;
+
+        egui::Window::new("Items already exist")
+            .id(egui::Id::new(("sftp_conflict", index)))
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .default_size(theme::dialog_size(theme))
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .frame(theme::modal_frame(theme))
+            .show(ctx, |ui| {
+                ui.set_width(theme::dialog_inner_width(theme));
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Items already exist")
+                            .size(18.0)
+                            .strong()
+                            .color(theme.palette.text),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("×").on_hover_text("Cancel").clicked() {
+                            choice = Some(None);
+                        }
+                    });
+                });
+                theme::muted(
+                    ui,
+                    theme,
+                    format!("{} item(s) already exist at the destination.", names.len()),
+                );
+                ui.add_space(theme.metrics.pad);
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(label)
+                            .strong()
+                            .color(theme.palette.text),
+                    )
+                    .truncate(),
+                )
+                .on_hover_text("The transfer has not started yet");
+                for name in names.iter().take(5) {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(format!("• {name}"))
+                                .small()
+                                .color(theme.palette.muted),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text(name);
+                }
+                if names.len() > 5 {
+                    theme::muted(ui, theme, format!("and {} more", names.len() - 5));
+                }
+                ui.add_space(8.0);
+                theme::callout_frame(theme, theme.palette.danger_soft).show(ui, |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(
+                                "Replace overwrites the existing files. Keep both writes the \
+                                 new copy next to them as “name (copy)”.",
+                            )
+                            .color(theme.palette.danger),
+                        )
+                        .wrap(),
+                    );
+                });
+                ui.add_space(theme.metrics.card_padding);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let replace = theme::primary_button(theme, "Replace")
+                        .min_size(egui::vec2(92.0, theme.metrics.control_height));
+                    if ui.add(replace).clicked() {
+                        choice = Some(Some(ConflictPolicy::Overwrite));
+                    }
+                    let keep = egui::Button::new("Keep both")
+                        .min_size(egui::vec2(92.0, theme.metrics.control_height));
+                    if ui.add(keep).clicked() {
+                        choice = Some(Some(ConflictPolicy::KeepBoth));
+                    }
+                    let cancel = egui::Button::new("Cancel")
+                        .min_size(egui::vec2(92.0, theme.metrics.control_height));
+                    if ui.add(cancel).clicked() {
+                        choice = Some(None);
+                    }
+                });
+            });
+
+        if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+            choice = Some(None);
+        }
+        match choice {
+            Some(policy) => explorer.resolve_conflict(ssh, policy),
+            None => false,
+        }
+    }
+
     /// Render one session.
     ///
     /// Returns `(disconnect_clicked, had_activity)` — the caller closes the tab
@@ -2286,6 +2590,7 @@ impl eframe::App for RustTermApp {
                             activity |= self.sftp_ui(ui, idx);
                         });
                     activity |= self.sftp_dialogs_ui(ctx, idx);
+                    activity |= self.sftp_conflict_ui(ctx, idx);
                     activity |= self.editor_picker_ui(ctx, idx);
                 }
             }

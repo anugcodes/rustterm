@@ -9,9 +9,10 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc as std_mpsc;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::ssh::{RemoteEntry, SshSession};
+use crate::ssh::{ConflictPolicy, RemoteEntry, SshSession, TransferProgress};
 
 /// Where a remote file should be opened locally.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -163,6 +164,45 @@ pub struct SftpDialog {
     pub error: Option<String>,
 }
 
+/// What a transfer does, independent of how conflicts are resolved.
+#[derive(Debug)]
+enum TransferKind {
+    Upload {
+        local: Vec<PathBuf>,
+        remote_dir: String,
+    },
+    Download {
+        remote: Vec<String>,
+        local_dir: PathBuf,
+    },
+}
+
+/// One transfer waiting for its turn.
+#[derive(Debug)]
+pub struct TransferRequest {
+    pub label: String,
+    kind: TransferKind,
+    policy: ConflictPolicy,
+}
+
+/// A destination conflict that needs a decision before the transfer starts.
+#[derive(Debug)]
+pub struct ConflictPrompt {
+    /// Names that already exist at the destination (top level only).
+    pub names: Vec<String>,
+    pub label: String,
+    request: TransferRequest,
+}
+
+/// The transfer currently running.
+#[derive(Debug)]
+pub struct ActiveTransfer {
+    pub label: String,
+    pub progress: Arc<TransferProgress>,
+    rx: std_mpsc::Receiver<Result<String, String>>,
+    verb: &'static str,
+}
+
 /// State for the SFTP side panel.
 #[derive(Debug, Default)]
 pub struct SftpExplorer {
@@ -192,6 +232,11 @@ pub struct SftpExplorer {
     pub status: StatusLog,
     pending: Option<Job>,
     operation: Option<Operation>,
+    /// Uploads/downloads, one running at a time.
+    pub transfer: Option<ActiveTransfer>,
+    /// A conflict question that must be answered before the transfer starts.
+    pub conflict: Option<ConflictPrompt>,
+    queue: VecDeque<TransferRequest>,
 }
 
 #[derive(Debug)]
@@ -240,7 +285,8 @@ impl SftpExplorer {
     /// Check the in-flight request or operation. Returns `true` when the UI
     /// should redraw.
     pub fn poll(&mut self, ssh: &SshSession) -> bool {
-        let activity = self.poll_operation(ssh);
+        let mut activity = self.poll_transfer(ssh);
+        activity |= self.poll_operation(ssh);
         let Some(job) = self.pending.take() else {
             return activity;
         };
@@ -440,11 +486,255 @@ impl SftpExplorer {
     }
 
     pub fn is_busy(&self) -> bool {
-        self.operation.is_some()
+        self.operation.is_some() || self.transfer.is_some() || !self.queue.is_empty()
     }
 
     pub fn busy_label(&self) -> Option<&str> {
-        self.operation.as_ref().map(|op| op.label.as_str())
+        self.operation
+            .as_ref()
+            .map(|op| op.label.as_str())
+            .or_else(|| self.transfer_label())
+    }
+
+    // ---- Transfers -------------------------------------------------------
+
+    /// Queue a download of `entries` into `local_dir`.
+    ///
+    /// Existing local files are detected synchronously; when any exist the UI
+    /// shows a conflict prompt before anything is written.
+    pub fn download_entries(
+        &mut self,
+        ssh: &SshSession,
+        entries: &[RemoteEntry],
+        local_dir: PathBuf,
+    ) -> bool {
+        if entries.is_empty() {
+            self.status.error("Select a file or folder first");
+            return true;
+        }
+        let conflicts: Vec<String> = entries
+            .iter()
+            .map(|entry| entry.name.clone())
+            .filter(|name| local_dir.join(name).exists())
+            .collect();
+        let label = if entries.len() == 1 {
+            format!("Downloading {}…", entries[0].name)
+        } else {
+            format!("Downloading {} items…", entries.len())
+        };
+        let request = TransferRequest {
+            label,
+            kind: TransferKind::Download {
+                remote: entries.iter().map(|entry| entry.path.clone()).collect(),
+                local_dir,
+            },
+            policy: ConflictPolicy::Overwrite,
+        };
+        self.enqueue_or_ask(ssh, request, conflicts);
+        true
+    }
+
+    /// Queue an upload of local `paths` into the current remote directory.
+    pub fn upload_paths(&mut self, ssh: &SshSession, paths: Vec<PathBuf>) -> bool {
+        let remote_dir = if self.current.is_empty() {
+            self.listed_path.clone()
+        } else {
+            self.current.clone()
+        };
+        self.upload_into(ssh, remote_dir, paths)
+    }
+
+    /// Queue an upload into a specific directory (row menu "Upload here…").
+    pub fn upload_into(
+        &mut self,
+        ssh: &SshSession,
+        remote_dir: String,
+        paths: Vec<PathBuf>,
+    ) -> bool {
+        if paths.is_empty() {
+            return true;
+        }
+        if remote_dir.is_empty() {
+            self.status.error("Open a remote folder first");
+            return true;
+        }
+        let names: Vec<String> = paths
+            .iter()
+            .filter_map(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+            })
+            .collect();
+        // The current listing is a reliable-enough conflict source for the
+        // top-level items; nested conflicts are handled by the policy.
+        let conflicts: Vec<String> = if remote_dir == self.current {
+            names
+                .iter()
+                .filter(|name| self.entries.iter().any(|entry| &entry.name == *name))
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let label = if paths.len() == 1 {
+            format!(
+                "Uploading {}…",
+                names.first().cloned().unwrap_or_else(|| "item".to_string())
+            )
+        } else {
+            format!("Uploading {} items…", paths.len())
+        };
+        let request = TransferRequest {
+            label,
+            kind: TransferKind::Upload {
+                local: paths,
+                remote_dir,
+            },
+            policy: ConflictPolicy::Overwrite,
+        };
+        self.enqueue_or_ask(ssh, request, conflicts);
+        true
+    }
+
+    /// Answer the conflict prompt. `None` cancels the pending transfer.
+    pub fn resolve_conflict(&mut self, ssh: &SshSession, policy: Option<ConflictPolicy>) -> bool {
+        let Some(prompt) = self.conflict.take() else {
+            return false;
+        };
+        match policy {
+            Some(policy) => {
+                let mut request = prompt.request;
+                request.policy = policy;
+                self.queue.push_back(request);
+                self.start_next_transfer(ssh);
+            }
+            None => self.status.info("Transfer cancelled"),
+        }
+        true
+    }
+
+    /// Cancel the running transfer or drop everything still queued.
+    pub fn cancel_transfer(&mut self) -> bool {
+        if let Some(transfer) = &self.transfer {
+            transfer.progress.cancel();
+            return true;
+        }
+        let queued = self.queue.len();
+        if queued > 0 {
+            self.queue.clear();
+            self.status
+                .info(format!("Cancelled {queued} queued transfer(s)"));
+            return true;
+        }
+        false
+    }
+
+    pub fn transfer_progress(&self) -> Option<&TransferProgress> {
+        self.transfer
+            .as_ref()
+            .map(|transfer| transfer.progress.as_ref())
+    }
+
+    pub fn transfer_label(&self) -> Option<&str> {
+        self.transfer
+            .as_ref()
+            .map(|transfer| transfer.label.as_str())
+    }
+
+    pub fn queued_transfers(&self) -> usize {
+        self.queue.len()
+    }
+
+    fn enqueue_or_ask(
+        &mut self,
+        ssh: &SshSession,
+        request: TransferRequest,
+        conflicts: Vec<String>,
+    ) {
+        if conflicts.is_empty() {
+            self.queue.push_back(request);
+            self.start_next_transfer(ssh);
+        } else {
+            self.conflict = Some(ConflictPrompt {
+                names: conflicts,
+                label: request.label.clone(),
+                request,
+            });
+        }
+    }
+
+    fn start_next_transfer(&mut self, ssh: &SshSession) -> bool {
+        if self.transfer.is_some() {
+            return false;
+        }
+        let Some(request) = self.queue.pop_front() else {
+            return false;
+        };
+        let progress = Arc::new(TransferProgress::new(request.label.clone()));
+        let (verb, receiver) = match &request.kind {
+            TransferKind::Upload { local, remote_dir } => (
+                "Uploaded",
+                ssh.sftp_upload(
+                    local.clone(),
+                    remote_dir,
+                    request.policy,
+                    Arc::clone(&progress),
+                ),
+            ),
+            TransferKind::Download { remote, local_dir } => (
+                "Downloaded",
+                ssh.sftp_download(
+                    remote.clone(),
+                    local_dir.clone(),
+                    request.policy,
+                    Arc::clone(&progress),
+                ),
+            ),
+        };
+        let Some(rx) = receiver else {
+            self.mark_unavailable(ssh);
+            return false;
+        };
+        self.transfer = Some(ActiveTransfer {
+            label: request.label,
+            progress,
+            rx,
+            verb,
+        });
+        true
+    }
+
+    fn poll_transfer(&mut self, ssh: &SshSession) -> bool {
+        let Some(active) = self.transfer.take() else {
+            return false;
+        };
+        match active.rx.try_recv() {
+            Ok(Ok(detail)) => {
+                self.status.success(format!("{} {detail}", active.verb));
+                self.refresh(ssh);
+                self.start_next_transfer(ssh);
+                true
+            }
+            Ok(Err(err)) => {
+                if err == "Transfer cancelled" {
+                    self.status.info("Transfer cancelled");
+                } else {
+                    self.status.error(err);
+                }
+                self.start_next_transfer(ssh);
+                true
+            }
+            Err(std_mpsc::TryRecvError::Empty) => {
+                self.transfer = Some(active);
+                false
+            }
+            Err(std_mpsc::TryRecvError::Disconnected) => {
+                self.status
+                    .error("the SFTP session closed during the transfer");
+                self.start_next_transfer(ssh);
+                true
+            }
+        }
     }
 
     /// Remember a remote entry for a later "Paste".

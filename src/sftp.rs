@@ -718,10 +718,16 @@ impl SftpExplorer {
             Ok(Err(err)) => {
                 if err == "Transfer cancelled" {
                     self.status.info("Transfer cancelled");
+                    self.start_next_transfer(ssh);
+                } else if err == crate::ssh::CONNECTION_LOST {
+                    // The transport is gone: every queued transfer would fail
+                    // the same way, and Reconnect SFTP is the only recovery.
+                    self.queue.clear();
+                    self.mark_unavailable_with(err);
                 } else {
                     self.status.error(err);
+                    self.start_next_transfer(ssh);
                 }
-                self.start_next_transfer(ssh);
                 true
             }
             Err(std_mpsc::TryRecvError::Empty) => {
@@ -729,9 +735,10 @@ impl SftpExplorer {
                 false
             }
             Err(std_mpsc::TryRecvError::Disconnected) => {
-                self.status
-                    .error("the SFTP session closed during the transfer");
-                self.start_next_transfer(ssh);
+                self.queue.clear();
+                self.mark_unavailable_with(
+                    "the SSH connection closed during the transfer — reconnect and retry",
+                );
                 true
             }
         }
@@ -1037,8 +1044,24 @@ impl SftpExplorer {
             .sftp_unavailable()
             .map(str::to_string)
             .unwrap_or_else(|| "the SFTP session is no longer available".to_string());
+        self.mark_unavailable_with(message);
+    }
+
+    /// Mark the panel unusable with an explicit reason (transport failure).
+    pub fn mark_unavailable_with(&mut self, message: impl Into<String>) {
+        self.loading = false;
+        let message = message.into();
         self.unavailable = Some(message.clone());
         self.status.error(message);
+    }
+
+    /// The whole SSH session is gone: drop transfers and stop offering Reconnect.
+    pub fn mark_closed(&mut self) {
+        self.transfer = None;
+        self.queue.clear();
+        self.conflict = None;
+        self.pending = None;
+        self.mark_unavailable_with("the SSH connection is closed");
     }
 
     fn fail(&mut self, message: impl Into<String>) {

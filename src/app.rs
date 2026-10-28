@@ -292,18 +292,112 @@ impl SftpLayout {
     }
 }
 
-/// Latest SFTP message, operation state and message history.
+/// Latest SFTP message, transfer progress and message history.
+///
+/// Transfers share this row instead of a second bottom panel: one fixed-height
+/// row cannot overlap itself, and it removes the duplicated "Downloading …"
+/// label the old two-bar layout showed.
 fn sftp_status_bar(ui: &mut egui::Ui, theme: &Theme, explorer: &mut SftpExplorer) {
-    let busy = explorer.busy_label().map(str::to_string);
+    let transfer = explorer.transfer_progress().map(|progress| {
+        (
+            progress.label().to_string(),
+            progress.fraction(),
+            progress.bytes_done(),
+            progress.total_bytes(),
+            progress.items_done(),
+            progress.total_items(),
+            progress.is_cancelled(),
+        )
+    });
+    let queued = explorer.queued_transfers();
     let current = explorer.status.current().cloned();
 
     ui.horizontal(|ui| {
-        if let Some(label) = busy {
-            ui.spinner();
-            ui.add(
-                egui::Label::new(egui::RichText::new(label).small().color(theme.palette.text))
+        if let Some((label, fraction, done, total, items_done, items_total, cancelled)) = transfer {
+            // Reserve the fixed widgets first; the label truncates into
+            // whatever is left, so nothing can overlap at any panel width.
+            let available = ui.available_width();
+            let wide = available >= 400.0;
+            let mut reserved = 30.0 /* history */ + 26.0 /* cancel */ + 28.0 /* gaps */;
+            reserved += if fraction.is_some() { 144.0 } else { 72.0 };
+            if wide {
+                reserved += 58.0;
+            }
+            if queued > 0 {
+                reserved += 46.0;
+            }
+            let label_width = (available - reserved).max(48.0);
+
+            ui.add_sized(
+                [label_width, 16.0],
+                egui::Label::new(
+                    egui::RichText::new(&label)
+                        .small()
+                        .color(theme.palette.text),
+                )
+                .truncate(),
+            )
+            .on_hover_text(&label);
+
+            if cancelled {
+                ui.label(
+                    egui::RichText::new("cancelling…")
+                        .small()
+                        .color(theme.palette.warning),
+                );
+            } else if let Some(fraction) = fraction {
+                let text = match total {
+                    Some(total) => format!("{} / {}", format_size(done), format_size(total)),
+                    None => format_size(done),
+                };
+                ui.add(
+                    egui::ProgressBar::new(fraction)
+                        .desired_width(140.0)
+                        .desired_height(12.0)
+                        .fill(theme.palette.accent)
+                        .text(egui::RichText::new(text).small()),
+                );
+            } else {
+                ui.spinner();
+                ui.label(
+                    egui::RichText::new(format_size(done))
+                        .small()
+                        .color(theme.palette.muted),
+                );
+            }
+
+            if wide {
+                if let Some(items_total) = items_total {
+                    ui.add_sized(
+                        [56.0, 16.0],
+                        egui::Label::new(
+                            egui::RichText::new(format!("{items_done}/{items_total}"))
+                                .small()
+                                .color(theme.palette.muted),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text("files transferred");
+                }
+            }
+            if queued > 0 {
+                ui.add_sized(
+                    [44.0, 16.0],
+                    egui::Label::new(
+                        egui::RichText::new(format!("+{queued}"))
+                            .small()
+                            .color(theme.palette.muted),
+                    )
                     .truncate(),
-            );
+                )
+                .on_hover_text(format!("{queued} transfer(s) queued"));
+            }
+            if theme::icon_button(ui, theme, "×", "Cancel this transfer", !cancelled).clicked() {
+                explorer.cancel_transfer();
+            }
+            // Progress is polled, not pushed: keep frames coming while a
+            // transfer runs.
+            ui.ctx().request_repaint_after(Duration::from_millis(100));
         } else {
             let (color, icon, text) = match &current {
                 Some(entry) => (
@@ -355,73 +449,6 @@ fn sftp_status_bar(ui: &mut egui::Ui, theme: &Theme, explorer: &mut SftpExplorer
             response.response.on_hover_text("Message history");
         });
     });
-}
-
-/// Running transfer: label, bar, byte count, queue depth and cancel.
-fn sftp_transfer_bar(ui: &mut egui::Ui, theme: &Theme, explorer: &mut SftpExplorer) {
-    let info = explorer.transfer_progress().map(|progress| {
-        (
-            progress.label().to_string(),
-            progress.fraction(),
-            progress.bytes_done(),
-            progress.total_bytes(),
-            progress.items_done(),
-            progress.total_items(),
-            progress.is_cancelled(),
-        )
-    });
-    let queued = explorer.queued_transfers();
-
-    ui.horizontal(|ui| {
-        let Some((label, fraction, done, total, items_done, items_total, cancelled)) = info else {
-            theme::muted(ui, theme, format!("{queued} transfer(s) queued"));
-            return;
-        };
-        ui.add(egui::Label::new(egui::RichText::new(label).small()).truncate());
-        if cancelled {
-            ui.label(
-                egui::RichText::new("cancelling…")
-                    .small()
-                    .color(theme.palette.warning),
-            );
-        } else if let Some(fraction) = fraction {
-            ui.add(
-                egui::ProgressBar::new(fraction)
-                    .desired_width(110.0)
-                    .desired_height(8.0)
-                    .fill(theme.palette.accent),
-            );
-            let size = match total {
-                Some(total) => format!("{} / {}", format_size(done), format_size(total)),
-                None => format_size(done),
-            };
-            ui.label(egui::RichText::new(size).small().color(theme.palette.muted));
-        } else {
-            ui.spinner();
-            ui.label(
-                egui::RichText::new(format_size(done))
-                    .small()
-                    .color(theme.palette.muted),
-            );
-        }
-        if let Some(items_total) = items_total {
-            ui.label(
-                egui::RichText::new(format!("{items_done}/{items_total} files"))
-                    .small()
-                    .color(theme.palette.muted),
-            );
-        }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if theme::icon_button(ui, theme, "×", "Cancel this transfer", !cancelled).clicked() {
-                explorer.cancel_transfer();
-            }
-            if queued > 0 {
-                theme::muted(ui, theme, format!("+{queued} queued"));
-            }
-        });
-    });
-    // Progress is polled, not pushed: keep frames coming while a transfer runs.
-    ui.ctx().request_repaint_after(Duration::from_millis(100));
 }
 
 fn status_color(theme: &Theme, kind: StatusKind) -> egui::Color32 {
@@ -625,6 +652,9 @@ struct ActiveSession {
     sftp_columns: SftpColumns,
     /// Set once so the terminal takes focus on first appearance.
     focus_requested: bool,
+    /// Set when the session thread exits; the tab then shows a closed banner
+    /// instead of a stale, unresponsive terminal.
+    connection_lost: bool,
 }
 
 struct ConnectingState {
@@ -826,6 +856,7 @@ impl RustTermApp {
                     sftp,
                     sftp_columns: SftpColumns::default(),
                     focus_requested: false,
+                    connection_lost: false,
                 });
                 // New session is the last tab; make it active.
                 self.active = self.sessions.len();
@@ -980,14 +1011,23 @@ impl RustTermApp {
         let mut budget = MAX_OUTPUT_PER_FRAME;
 
         for session in &mut self.sessions {
-            // SFTP replies arrive asynchronously; polling them for every tab
-            // keeps a listing ready even if the sidebar is currently hidden.
-            if session.sftp.poll(&session.ssh) {
+            // A dead thread used to be invisible: reads returned `None`, input
+            // vanished and the tab looked alive forever. Detect it once here.
+            if !session.connection_lost && !session.ssh.is_alive() {
+                session.connection_lost = true;
+                session.sftp.mark_closed();
                 activity = true;
             }
-            if session.sftp.transfer.is_some() {
-                // The bar is polled; keep frames coming while bytes flow.
-                ctx.request_repaint_after(Duration::from_millis(100));
+            // SFTP replies arrive asynchronously; polling them for every tab
+            // keeps a listing ready even if the sidebar is currently hidden.
+            if !session.connection_lost {
+                if session.sftp.poll(&session.ssh) {
+                    activity = true;
+                }
+                if session.sftp.transfer.is_some() {
+                    // The bar is polled; keep frames coming while bytes flow.
+                    ctx.request_repaint_after(Duration::from_millis(100));
+                }
             }
             while budget > 0 {
                 let Some(chunk) = session.ssh.try_read() else {
@@ -1705,20 +1745,6 @@ impl RustTermApp {
                 sftp_status_bar(ui, theme, explorer);
             });
 
-        if explorer.transfer.is_some() || explorer.queued_transfers() > 0 {
-            egui::TopBottomPanel::bottom(egui::Id::new(("sftp_transfer", index)))
-                .exact_height(theme.metrics.row_height + 6.0)
-                .frame(
-                    egui::Frame::none()
-                        .fill(theme.palette.surface)
-                        .stroke(egui::Stroke::new(1.0_f32, theme.palette.border))
-                        .inner_margin(egui::Margin::symmetric(4.0, 2.0)),
-                )
-                .show_inside(ui, |ui| {
-                    sftp_transfer_bar(ui, theme, explorer);
-                });
-        }
-
         if let Some(reason) = explorer.unavailable.clone() {
             ui.add_space(theme.metrics.card_padding);
             ui.vertical_centered(|ui| {
@@ -2066,18 +2092,20 @@ impl RustTermApp {
         let mut cancel = false;
         let kind = dialog.kind.clone();
 
-        let (title, subtitle) = match &kind {
-            SftpDialogKind::Rename { .. } => ("Rename", Some("Give the entry a new name.")),
-            SftpDialogKind::NewFolder { .. } => {
-                ("New folder", Some("Create a folder in this directory."))
+        let (title, subtitle): (String, Option<&str>) = match &kind {
+            SftpDialogKind::Rename { .. } => {
+                ("Rename".to_string(), Some("Give the entry a new name."))
             }
-            // "Delete \"name\"?" below already says what is being confirmed;
-            // a second "Delete / Please confirm this action." header line was
-            // pure repetition.
-            SftpDialogKind::Delete { .. } => ("Delete", None),
+            SftpDialogKind::NewFolder { .. } => (
+                "New folder".to_string(),
+                Some("Create a folder in this directory."),
+            ),
+            // The heading names the entry, so the body does not repeat
+            // "Delete \"name\"?" a second time.
+            SftpDialogKind::Delete { name, .. } => (format!("Delete “{name}”"), None),
         };
 
-        egui::Window::new(title)
+        egui::Window::new(&title)
             .id(egui::Id::new(("sftp_dialog", index)))
             .title_bar(false)
             .collapsible(false)
@@ -2088,12 +2116,20 @@ impl RustTermApp {
             .show(ctx, |ui| {
                 ui.set_width(theme::dialog_inner_width(theme));
                 ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(title)
-                            .size(18.0)
-                            .strong()
-                            .color(theme.palette.text),
-                    );
+                    // Leave room for the close button so a long file name can
+                    // truncate instead of pushing it out of the dialog.
+                    let title_width = (ui.available_width() - 28.0).max(80.0);
+                    ui.add_sized(
+                        [title_width, 24.0],
+                        egui::Label::new(
+                            egui::RichText::new(&title)
+                                .size(18.0)
+                                .strong()
+                                .color(theme.palette.text),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text(&title);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.small_button("×").on_hover_text("Cancel").clicked() {
                             cancel = true;
@@ -2136,14 +2172,7 @@ impl RustTermApp {
                             ui.colored_label(theme.palette.danger, err);
                         }
                     }
-                    SftpDialogKind::Delete { path, name, is_dir } => {
-                        ui.label(
-                            egui::RichText::new(format!("Delete “{name}”?"))
-                                .size(16.0)
-                                .strong()
-                                .color(theme.palette.text),
-                        );
-                        ui.add_space(8.0);
+                    SftpDialogKind::Delete { path, is_dir, .. } => {
                         theme::callout_frame(theme, theme.palette.danger_soft).show(ui, |ui| {
                             let warning = if *is_dir {
                                 "This folder and everything inside it will be permanently deleted. This cannot be undone."
@@ -2453,7 +2482,16 @@ impl RustTermApp {
                     .inner_margin(egui::Margin::symmetric(4.0, 4.0)),
             )
             .show_inside(ui, |ui| {
-                if ui.button("Disconnect").clicked() {
+                if session.connection_lost {
+                    ui.label(
+                        egui::RichText::new("Connection lost — the server closed this session")
+                            .small()
+                            .color(theme.palette.danger),
+                    );
+                    if ui.button("Close tab").clicked() {
+                        disconnect_clicked = true;
+                    }
+                } else if ui.button("Disconnect").clicked() {
                     disconnect_clicked = true;
                 }
             });

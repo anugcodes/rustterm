@@ -31,6 +31,14 @@ Click a tab label to switch; `×` closes the tab and disconnects its SSH cleanly
 **Verify**
 
 - [ ] Connect twice → two tabs, each with independent output.
+- [ ] Start a connect to a blackholed host (e.g. `10.255.255.1`) → press **✕**
+      next to *Connecting to…* → the form returns immediately with
+      *Connection cancelled*.
+- [ ] Wrong password → the form says *Login failed — the server rejected this
+      username or password.*
+- [ ] Wrong port (e.g. `2222`) → *Connection refused — nothing is listening on
+      that host and port.*
+- [ ] Unknown hostname → *Host not found — check the hostname.*
 - [ ] Close one → its socket drops: `ss -tnp | grep ':22'`.
 - [ ] Idle CPU stays ~0% (repaint gating) — check with `top`.
 
@@ -492,8 +500,11 @@ too. Each tab keeps its own width, directory and selection.
 - Entries are sorted **directories first**, then case-insensitive name. The
   font-safe icons are `🗀` for a directory, `🗋` for a regular file and `🔗` for a
   symlink (displayed but not followed yet).
-- Rows are striped and stay on one line; long names/owners/times are elided.
-  The header uses the same font size as the rows and nothing is bold.
+- Rows are striped and stay on one line. The **Name** column keeps at least 55 %
+  of the table width; **Owner**, **Modified** and **Size** shrink first and are
+  hidden (Size, then Modified, then Owner) when they would be too narrow to
+  read. Only then does a long file name elide.
+- The header uses the same font size as the rows and nothing is bold.
 - Column dividers exist only in the header. Drag one to resize the column to its
   right; file rows never show resize handles.
 - Hover a row for its full path, type, size, owner, exact timestamp and relative
@@ -505,13 +516,14 @@ too. Each tab keeps its own width, directory and selection.
   folder** (when something has been copied), **Rename…**, **Copy path**,
   **Delete…**.
 - The icon toolbar (hover for a tooltip) provides 🏠 **Home** (login directory),
-  ⬆ **Up**, 🔄 **Refresh**, ➕ **New folder**, 🗐 **Copy**, 📋 **Paste**,
+  ↑ **Up**, 🔄 **Refresh**, ➕ **New folder**, 🗐 **Copy**, 📋 **Paste**,
   👁 **Hidden** (dotfiles, per tab), ⚡ **Reconnect** and × **Hide**.
 - **Status bar:** the bottom of the panel always shows the latest message with a
   colour-coded icon. While a listing or file operation runs it shows a spinner
-  and the operation label instead. The ☰ button opens the last 50 messages with
-  timestamps, plus **Clear messages**. There is no selected-file footer; row
-  tooltips carry the details.
+  and the operation label; a transfer's queue depth is appended there as
+  `(+N queued)`. The ☰ button opens the last 50 messages with timestamps, plus
+  **Clear messages**. There is no selected-file footer; row tooltips carry the
+  details.
 - Type a remote path in the **Path** box and press **Enter** (or click ➡).
   Relative paths are resolved by the server against the login directory.
 - **Hidden** shows or hides dotfiles (default hidden). The setting is per tab and
@@ -529,10 +541,11 @@ too. Each tab keeps its own width, directory and selection.
   is downloaded to a unique `rustterm-edit-<pid>-<nanos>` temp directory and
   launched asynchronously.
 - **Rename/Delete** use the same compact, auto-sized modal with right-aligned
-  Cancel plus the primary action. Delete names the entry, shows the remote path
-  and warns that the action cannot be undone (tinted red, and worded for
-  recursive folder removal). `Esc` cancels. Rename accepts a single path
-  component (no `/`).
+  Cancel plus the primary action. The heading names the entry
+  (`Rename “old.name”`, `Delete “old.name”`); delete shows the remote path
+  (wrapped, not truncated) and warns that the action cannot be undone (tinted
+  red, and worded for recursive folder removal). `Esc` cancels. Rename accepts
+  a single path component (no `/`).
 - If the SSH server has no SFTP subsystem, the panel says **SFTP is unavailable**
   with the reason in the status bar and offers **Reconnect SFTP**. Only the SFTP
   channel is retried; the terminal is unaffected.
@@ -555,7 +568,8 @@ so delete/copy tests cannot touch real data.
       Owner and local `YYYY-MM-DD HH:MM` match `stat -c '%U %y' file`; folders
       show an em dash for size. Drag a divider in the header to resize the column
       to its right (dividers are not drawn on file rows) and narrow the panel to
-      ~340 px: text elides instead of wrapping, and the header remains readable.
+      ~340 px: **Name stays readable**, Owner/Modified/Size shrink and disappear
+      first, and the header remains readable.
 - [ ] **Sorting**: directories come first; names are case-insensitive
       alphabetical within each group.
 - [ ] **Select vs open**: one click highlights a row without navigating; double
@@ -583,8 +597,12 @@ so delete/copy tests cannot touch real data.
 - [ ] **New folder**: use ➕ → enter a name → folder appears after the automatic
       refresh. Try a name containing `/`, empty, `.` and `..` → the dialog keeps
       an inline error.
-- [ ] **Rename**: right-click a file → **Rename…** → new name appears; the old
-      name is gone. Renaming to the same name is rejected. `Esc` cancels.
+- [ ] **Rename**: right-click a file → **Rename…** → the heading reads
+      `Rename “old.name”`; type a new name → it appears and the old name is
+      gone. Renaming to the same name is rejected. `Esc` cancels.
+- [ ] **Popup layout**: every modal heading is the smaller 15 px style; a very
+      long entry name truncates with a tooltip while the path/destination below
+      wraps onto multiple lines instead of being cut off.
 - [ ] **Copy/paste file**: right-click a file → **Copy** (toolbar) → paste in the
       same folder → `file (copy)` appears with the same contents (`cmp`). Paste
       again → `file (copy 2)`.
@@ -720,19 +738,19 @@ and scrolls when the window is short.
 whenever the panel is usable. There are four entry points:
 
 - **⬇ toolbar button** — downloads the selected row into a folder you pick.
-- **⬆ toolbar button** — uploads one or more local files into the current remote
-  directory.
+- **⇧ toolbar button** — uploads one or more local files into the current remote
+  directory. (**↑** is the separate "up one level" button.)
 - **Row menu** — **Download…** on any file or folder; folders also offer
   **Upload files here…** and **Upload folder here…**.
 - **Drag & drop** — drop files or folders from the desktop anywhere over the
   SFTP panel to upload them into the visible remote directory.
 
-Transfer progress is shown inside the **status bar** at the bottom of the panel:
-the label (`Downloading notes.txt…`), a byte progress bar with `done / total`,
-`files done/total`, a **×** cancel button and `+N` when more work waits (hover
-shows the queue depth). The widgets reserve their widths and the label truncates,
-so nothing can overlap at narrow panel sizes. One transfer runs per session;
-further requests are queued in order.
+Progress is shown in a compact transfer row above the status bar: a byte bar
+with `done / total`, `files done/total` and a **×** cancel button. The status bar
+above it names the transfer (`Downloading notes.txt…`) and appends the queue
+depth as `(+1 queued)`, so the text truncates safely and cannot overlap the
+progress widgets. One transfer runs per session; further requests are queued in
+order.
 
 **Behaviour**
 
@@ -741,7 +759,7 @@ further requests are queued in order.
   Cancelling (or a failure) removes the `.part`.
 - Downloads recreate folders recursively and re-create symlinks with their
   original target; uploads do the same in reverse. Empty folders are preserved.
-- When a top-level destination already exists the **Items already exist** modal
+- When a top-level destination already exists the **Replace “name”** modal
   lists up to five names and offers **Replace**, **Keep both** or **Cancel**
   (`Esc` cancels; the transfer has not started yet).
   - **Replace** overwrites files and merges into existing folders.
@@ -763,7 +781,11 @@ further requests are queued in order.
 - If the transport dies during a transfer, the queue is dropped and the status
   bar says the connection closed instead of repeating a raw library error.
   The tab then shows a **Connection lost** banner with **Close tab**; scrollback
-  is preserved.
+  is preserved. Keepalives (15 s, three misses) make this appear within about
+  45 s instead of leaving the tab frozen forever.
+- SFTP requests time out after 30 s (network mounts can be slow to answer a cold
+  `stat`). A timeout marks the panel unavailable with a **Reconnect SFTP** hint
+  rather than a per-file error; the terminal stays connected.
 
 **Verify**
 
@@ -786,7 +808,8 @@ further requests are queued in order.
 - [ ] **Conflict → Cancel / Esc**: neither the original nor a copy changes and
       no transfer is queued.
 - [ ] **Queue**: start a large download and immediately start another → the
-      status bar shows `+1`, the second starts automatically when the first ends.
+      status bar shows `(+1 queued)`, the second starts automatically when the
+      first ends.
 - [ ] **Upload a PDF**: upload a several-hundred-page PDF (incompressible) → the
       bar advances, the remote size matches `ls -l`, and the session does not
       disconnect. `cmp` the two copies.

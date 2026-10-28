@@ -808,3 +808,54 @@ because compression happens on the server side.
 - `cargo fmt --check` ✅
 - Live re-test still needed: large PDF upload, mixed folder upload, and the
   dead-session banner. Checklists: `USAGE.md` §17, `TESTING.md` §2.11.
+
+# Step: Cancel connections, actionable errors, popup layout and responsive columns
+
+## What changed
+
+**Connect screen (`src/ssh.rs`, `src/app.rs`).**
+- `SshSession::connect` accepts an optional cancellation receiver and races it
+  against the handshake. The ✕ beside *Connecting to…* (and `Esc`) aborts the
+  attempt at its next await point; the form returns immediately with
+  *Connection cancelled* and Connect is usable again.
+- A 15 s timeout wraps the TCP connect, so an unroutable host reports
+  *Connection timed out* instead of hanging for the OS default (up to ~2 min).
+- `ssh::explain_connect_error` turns chained library text into one actionable
+  sentence: wrong username/password, connection refused, unknown host, timeout
+  and network unreachable. A changed host key keeps its full warning. Unit
+  tested.
+- Keepalives (15 s × 3) and a `SessionGuard` that wakes egui when the session
+  thread exits: a wedged transport now shows the **Connection lost** banner
+  within ~45 s instead of freezing silently.
+
+**Dialogs (`src/theme.rs`, `src/app.rs`).**
+- Shared `modal_heading` (15 px, truncating with tooltip), `modal_path`
+  (wrapping, monospace) and `modal_close` helpers for every modal.
+- Headings name the object: `Rename “old.name”`, `Delete “name”`,
+  `Open “name”`, `Replace “name”` / `Replace N items`; duplicated body headings
+  were removed.
+- Paths and fingerprints wrap; only headings truncate.
+
+**SFTP panel (`src/app.rs`, `src/sftp.rs`, `src/ssh.rs`).**
+- File table columns are responsive: `Name` keeps ≥ 55 % of the width while
+  `Owner`/`Modified`/`Size` shrink and are hidden (least informative first)
+  once unreadable. Long file names therefore elide last, not first.
+- Up-one-level uses the text arrow `↑`; upload uses `⇧`. They previously shared
+  the same emoji glyph, which rendered as an overlapping box.
+- Transfer UI is back to the previous two-row layout (progress row + status
+  bar). Queue depth moved into the status text as `(+N queued)`, so it cannot
+  overlap the progress widgets. The progress row no longer repeats the label.
+- Downloads reuse the listing's file attributes, dropping the extra `stat` that
+  timed out on a slow network mount (`/remote/...`). Recursive walks use READDIR
+  attributes too.
+- SFTP request timeout raised to 30 s for network mounts. A timeout now marks
+  the panel unavailable with **Reconnect SFTP** instead of a per-item
+  `Timeout` error; the terminal stays connected.
+
+## Verified
+
+- `cargo build` ✅ (default and `--no-default-features`)
+- `cargo clippy --all-targets -- -D warnings` ✅
+- `cargo test` ✅ **60 passed** (both feature sets)
+- `cargo fmt --check` ✅
+- GUI checks pending: `USAGE.md` §1/§14/§17, `TESTING.md` §2.1/§2.7/§2.11.

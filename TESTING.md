@@ -91,16 +91,24 @@ If any smoke item fails, stop and report before running the full pass.
 ### 2.1 Connection errors
 
 - [ ] **C1 — refused port.** Host `localhost`, Port `1`, User `sshuser`, Connect.
-      Expect an inline red error in the card, the button usable again, and no tab
-      opened. Complete within ~5 s; no freeze.
+      Expect *Connection refused — nothing is listening on that host and port.*,
+      the button usable again, and no tab opened. Complete within ~5 s.
 - [ ] **C2 — bad password.** Duplicate the profile under a new name, clear the
       password box, type a wrong password, untick keyring storage, Connect.
-      Expect an inline auth error, no tab. Delete that profile afterwards.
+      Expect *Login failed — the server rejected this username or password.* and
+      no tab. Delete that profile afterwards.
 - [ ] **C3 — empty fields.** Clear Host and User, Connect. Expect a specific
       inline message naming the missing field; no connection attempt.
-- [ ] **C4 — one attempt at a time.** Connect to an unroutable host
+- [ ] **C4 — cancel an attempt.** Connect to an unroutable host
       (`10.255.255.1`, port 22). While it is trying, the Connect button is
-      disabled/spinning. No second tab appears.
+      disabled and an **✕** sits next to *Connecting to…*. Click it: the form
+      returns at once with *Connection cancelled*, Connect is usable again and
+      no tab appears. Repeat and press **Esc** instead — same result.
+- [ ] **C5 — timeout.** Connect to an address that silently drops packets
+      (firewall `DROP`). Without pressing ✕, the error should arrive in ~15 s
+      with *Connection timed out — the host did not answer…*.
+- [ ] **C6 — unknown host.** Use a name that does not resolve → *Host not found
+      — check the hostname.*
 
 ### 2.2 Profiles and keyring
 
@@ -195,8 +203,8 @@ Use a scratch directory so nothing real is touched.
       `sftp-test`, then double-click it to enter.
 - [ ] **F5 — refresh.** In the terminal run `touch a.txt b.txt`, then click
       **🔄 Refresh**; both files appear.
-- [ ] **F6 — rename.** Right-click `a.txt` → **Rename…** → `c.txt`. The row
-      updates; `/` in the name is rejected.
+- [ ] **F6 — rename.** Right-click `a.txt` → **Rename…**; the heading reads
+      `Rename “a.txt”`. Rename to `c.txt`; the row updates; `/` is rejected.
 - [ ] **F7 — copy/paste.** Select `c.txt`, **🗐 Copy**, then **📋 Paste**.
       A `c (copy).txt` appears; a second paste gives `c (copy 2).txt`.
 - [ ] **F8 — delete.** Right-click `b.txt` → **Delete…**; `Esc` cancels. Repeat
@@ -204,9 +212,12 @@ Use a scratch directory so nothing real is touched.
       it cannot be undone.
 - [ ] **F9 — sizing.** Drag a header divider to resize a column; drag the panel
       edge (clamped to 340 px…55 %, max 720 px). The terminal stays visible.
-      Switch tabs → each tab keeps its own width and directory.
-- [ ] **F10 — open with.** Double-click a file → the **Open with…** modal lists
-      editors; entries not on `PATH` are disabled. Cancel.
+      Narrow the panel: Name keeps its width and Owner/Modified/Size shrink and
+      then disappear before any file name elides. Switch tabs → each tab keeps
+      its own width and directory.
+- [ ] **F10 — open with.** Double-click a file → the **Open “file”** modal lists
+      editors; entries not on `PATH` are disabled. Its heading is the smaller
+      modal style and a long path wraps. Cancel.
 - [ ] **F11 — messages.** The ☰ button shows the last 50 messages with
       timestamps; **Clear messages** empties it.
 - [ ] **F12 — hide/show.** **Files** in the tab bar and the panel's `×` hide it;
@@ -246,7 +257,7 @@ Use a scratch directory so nothing real is touched.
 - [ ] **T2 — download folder.** Right-click a folder with sub-folders and a
       symlink → **Download…** → the tree is recreated locally and the symlink
       still points at the same target.
-- [ ] **T3 — upload.** Click **⬆**, pick two files → both appear in the remote
+- [ ] **T3 — upload.** Click **⇧**, pick two files → both appear in the remote
       listing after the automatic refresh.
 - [ ] **T4 — upload into folder.** Right-click a sub-folder → **Upload folder
       here…** → the tree appears inside that folder, not in the current one.
@@ -256,19 +267,24 @@ Use a scratch directory so nothing real is touched.
       overwrites it; **Keep both** creates `name (copy)`; **Cancel** and `Esc`
       change nothing.
 - [ ] **T7 — queue and cancel.** Start two large downloads → the status bar
-      shows `+1`; press **×** during the first → `Transfer cancelled`, the
-      `.part` file is gone and the second transfer starts.
-- [ ] **T8 — upload a PDF.** Upload a large scanned PDF (incompressible). The
+      shows `(+1 queued)`; press **×** in the transfer row during the first →
+      `Transfer cancelled`, the `.part` file is gone and the second transfer
+      starts.
+- [ ] **T8 — slow mount.** Download a large file from a network mount
+      (`/remote/...`) → the first click starts within 30 s without a redundant
+      `stat`; if the server really does not answer, the panel offers
+      **Reconnect SFTP** instead of a bare `Timeout` error.
+- [ ] **T9 — upload a PDF.** Upload a large scanned PDF (incompressible). The
       status bar advances, `ls -l` matches the local size, `cmp` succeeds, and
       the session stays connected. This is the regression that used to end with
       `sender dropped` / a silent tab.
-- [ ] **T9 — upload a mixed folder.** Upload ~100 MB of text, PDFs and images.
+- [ ] **T10 — upload a mixed folder.** Upload ~100 MB of text, PDFs and images.
       The terminal still echoes input while the folder is scanned, every file
       arrives, and the connection survives.
-- [ ] **T10 — connection loss.** Stop sshd during an upload → the status bar
+- [ ] **T11 — connection loss.** Stop sshd during an upload → the status bar
       reports the closed connection and the tab shows **Connection lost** with
       **Close tab**. The other tabs keep working.
-- [ ] **T11 — cleanup.** In the terminal: `rm -rf ~/sftp-test ~/Downloads/rt-*`.
+- [ ] **T12 — cleanup.** In the terminal: `rm -rf ~/sftp-test ~/Downloads/rt-*`.
 
 ---
 

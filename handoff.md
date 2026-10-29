@@ -8,7 +8,7 @@
 > filtering, copy/paste, open-in-local-editor and owner/modified rows. File
 > transfers are next. Read section 12 before writing any code.
 
-Last updated: 2026-10-25
+Last updated: 2026-10-30
 Repo: `~/Desktop/VsTerm` (local) — remote may be `rustterm` on GitHub
 Owner: anurag (Linux Mint 22)
 
@@ -34,9 +34,9 @@ open protocols.
 | 1 | SSH terminal with colors, resize, copy/paste | **Done** — colors, resize, scrollback, bg colors, copy/paste. |
 | 2 | Multiple SSH sessions in tabs | **Done** |
 | 3 | Saved profiles, key auth, keyring passwords | **Done** — profiles, optional keyring passwords, key file + ssh-agent auth. |
-| 4 | SFTP side panel following the active session's path | **Done except shell-cd following** — per-tab browsing, resizable Name/Owner/Modified/Size table, reconnect, right-click menu, hidden toggle, copy/paste, status bar with history. The panel does not follow shell `cd` (no OSC 7), and symlinks are not navigated. |
-| 5 | Upload/download, drag & drop, progress | **Next** — copy/editor downloads already stream file contents; general transfers, progress and drag & drop are not implemented. |
-| 6 | Open remote file in local editor, auto-upload on save | **Partial** — the **Open with…** picker downloads to a temp file and launches `$VISUAL`/`$EDITOR`, Zed, gvim, VS Code, the desktop default or a custom command. Automatic upload-on-save is V2. |
+| 4 | SFTP side panel following the active session's path | **Done except shell-cd following** — per-tab browsing, Name/Modified/Size/Owner table with proportional, stepped columns, reconnect, right-click menu, hidden toggle, copy/paste, status bar with history. The panel does not follow shell `cd` (no OSC 7), and symlinks are not navigated. |
+| 5 | Upload/download, drag & drop, progress | **Done** — file/folder upload and download with a serialised queue, conflict prompts, `.part`+rename safety, progress bar, drag & drop and cancel. |
+| 6 | Open remote file in local editor, auto-upload on save | **Done** — the **Open with…** picker downloads to a temp file, launches `$VISUAL`/`$EDITOR`, Zed, gvim, VS Code, the desktop default or a custom command, and uploads the file back to the same remote path on every save (opt-out checkbox). |
 | 7 | GUI tools via X11 forwarding (`ssh -X`) or VNC-over-tunnel | Not started |
 
 ---
@@ -437,7 +437,7 @@ Hardcoded `80x24` until the first `ui()` frame. Produces a small reflow on conne
 Read once per frame rather than per event.
 
 **F18 — Tests (B)**
-`terminal.rs` has unit tests for `bg_runs`, the colour mapping and the mouse encoding; `input.rs` has tests for the key encoding incl. DECCKM; `sessions.rs` covers persistence, validation and profile defaults; `sftp.rs` covers path join/parent, sorting, formatting, name validation, copy guard and editor resolution; `ssh.rs` covers `/etc/passwd` parsing, remote path joining, the no-compression config, connection-loss classification, connect-error explanations and keepalive settings. **60 tests**, run with `cargo test`. Still missing: automated network tests for public-key auth and the SFTP transport (both were verified with temporary russh-server probes, not committed tests).
+`terminal.rs` has unit tests for `bg_runs`, the colour mapping and the mouse encoding; `input.rs` has tests for the key encoding incl. DECCKM; `sessions.rs` covers persistence, validation and profile defaults; `sftp.rs` covers path join/parent, sorting, formatting, name validation, copy guard and editor resolution; `ssh.rs` covers `/etc/passwd` parsing, remote path joining, the no-compression config, connection-loss classification, connect-error explanations and keepalive settings. `theme.rs` asserts that every toolbar icon has a real glyph in the bundled fonts. `sftp.rs` covers editor-save detection. **69 tests**, run with `cargo test`. Still missing: automated network tests for public-key auth and the SFTP transport (both were verified with temporary russh-server probes, not committed tests).
 
 **F19 — Password storage / memory hygiene (B, mostly resolved)**
 Passwords are never written to `sessions.toml`. Opt-in keyring storage is
@@ -904,7 +904,7 @@ Maintained by the assistant. Update after each successful `cargo build`.
 | File transfers | `ssh.rs`, `sftp.rs`, `app.rs`, `Cargo.toml` | `ConflictPolicy`, `TransferProgress`, `SftpAction::{Upload,Download}` → `SshSession::{sftp_upload,sftp_download}`, `upload_items`/`download_items`, `collect_upload`/`collect_download`, `SftpExplorer::{download_entries,upload_paths,upload_into,resolve_conflict,cancel_transfer,transfer_progress,transfer_label,queued_transfers}`, `TransferRequest`, `ConflictPrompt`, `ActiveTransfer`, `RustTermApp::sftp_conflict_ui`, `sftp_transfer_bar`, `rfd` 0.15 (`xdg-portal`,`tokio`) | ✅ done (53 tests both feature sets; clippy/fmt clean; GUI-unverified — checklist in `USAGE.md` §17) |
 | Transfer hardening | `ssh.rs`, `sftp.rs`, `app.rs` | `SshSession::{is_alive,alive}`, `SessionGuard`, `compression::NONE`, `CONNECTION_LOST`, `is_connection_loss`, `normalise_transfer_error`, `collect_upload` via `spawn_blocking`, always-close loops, `SftpExplorer::{mark_unavailable_with,mark_closed}`, `ActiveSession::connection_lost`, status-bar progress, `Delete “name”` heading | ✅ done (55 tests both feature sets; clippy/fmt clean; needs live re-test of PDF/folder upload) |
 | Connect/UI polish | `ssh.rs`, `app.rs`, `sftp.rs`, `theme.rs` | `SshSession::connect(..., cancel)`, `ConnectingState::cancel_tx`, `RustTermApp::cancel_connect`, `explain_connect_error`, TCP `timeout`, keepalive, `SessionGuard::wake`, `theme::{modal_heading,modal_path,modal_close,DIALOG_HEADING_SIZE}`, `SftpColumns::fitted`, `NAME_SHARE`, status-bar `(+N queued)`, `↑`/`⇧` icons, `collect_download` reuses listing metadata, `SFTP_TIMEOUT` | ✅ done (60 tests both feature sets; clippy/fmt clean; GUI-unverified) |
-| Next: edit-and-auto-upload | `sftp.rs`, `ssh.rs`, `app.rs` | TBD — watch the temp download folder and re-upload on save | ⏳ pending |
+| Table/icons polish + edit-and-auto-upload | `theme.rs`, `app.rs`, `sftp.rs`, `ssh.rs` | `theme::icons` (📂/📥/📤/×) + `icons_have_glyphs`, `SftpColumns` proportional shares (`name` 50 %, `COLUMN_STEP` snapping, `drag_divider`), `SftpLayout` rects for Name/Modified/Size/Owner, `EditWatch`/`FileStamp`, `SftpExplorer::{poll_edits,watches_edits}`, `TransferKind::UploadOne`, `SshSession::sftp_upload_one`, `SftpAction::UploadOne`, `EditorPicker::auto_upload` | ✅ done (69 tests both feature sets, including a headless egui header render; clippy/fmt clean; GUI-unverified — `USAGE.md` §14/§18, `TESTING.md` §2.7/§2.12) |
 ⚙
 
 ---

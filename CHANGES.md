@@ -859,3 +859,51 @@ because compression happens on the server side.
 - `cargo test` ✅ **60 passed** (both feature sets)
 - `cargo fmt --check` ✅
 - GUI checks pending: `USAGE.md` §1/§14/§17, `TESTING.md` §2.1/§2.7/§2.11.
+
+# Step: Readable icons, proportional stepped columns, edit-and-upload
+
+## What changed
+
+**Icons (`src/theme.rs`, `src/app.rs`).**
+- `↑` (U+2191), `⇧` (U+21E7) and `✕` (U+2715) are not in any font egui loads, so
+  they rendered as hollow boxes — the connect-screen cancel and both SFTP
+  arrows. All toolbar/dialog glyphs now live in `theme::icons`: **📂 Up one
+  level**, **📥 Download**, **📤 Upload**, **×** cancel/close.
+- `theme::tests::icons_have_glyphs` asks egui's font stack whether every icon
+  has a glyph, so a missing one fails the test suite instead of shipping as a
+  box.
+
+**SFTP table (`src/app.rs`).**
+- Column order is now **Name, Modified, Size, Owner**.
+- Columns store a *share* of the table instead of pixel widths: Name starts at
+  50 % and the proportions survive a panel resize.
+- Dragging a divider snaps to **12 px steps**, keeps both neighbours readable
+  and leaves the other columns untouched. Hidden columns have no handle.
+- The column that no longer fits is hidden in order **Owner → Size → Modified**
+  and its share goes to Name, so filenames elide last.
+- Tests cover the 50 % default, proportional resizing, the hide order, step
+  snapping, minimum clamps and the no-drag-when-hidden rule, plus a headless
+  egui render of the header at five panel widths (no panics on hidden cells).
+
+**Edit and auto-upload (`src/sftp.rs`, `src/ssh.rs`, `src/app.rs`).**
+- The **Open “file”** picker has an **Upload changes automatically when the file
+  is saved** checkbox (default on, remembered per session).
+- Opening a file records an `EditWatch` (local temp path, remote path, name and
+  a size+mtime stamp). `SftpExplorer::poll_edits` compares the stamp every
+  600 ms; a difference queues one upload.
+- Uploads go through the existing transfer queue via the new
+  `SftpAction::UploadOne` / `SshSession::sftp_upload_one`, which writes
+  `name.part` and renames on success, then refreshes the listing.
+- The UI keeps a slow repaint timer alive only while a file is watched. A dead
+  session drops its watchers (`mark_closed`).
+- Unit tests cover change detection (including same-size saves and atomic
+  replace) and the watch lifecycle.
+
+## Verified
+
+- `cargo build` ✅
+- `cargo clippy --all-targets -- -D warnings` ✅
+- `cargo test` ✅ **69 passed** (default and `--no-default-features`)
+- `cargo fmt --check` ✅
+- GUI checks: `USAGE.md` §14/§17/§18, `TESTING.md` §2.7 (F9/F10/F11a) and the
+  new §2.12.

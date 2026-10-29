@@ -493,20 +493,24 @@ Setup: a local sshd with `PubkeyAuthentication yes`, plus
 left. It opens at 450 px, can be dragged between 340 px and 55% of the window
 (capped at 720 px), so the terminal always stays visible. It starts at the remote
 login directory (`canonicalize(".")`, usually `$HOME`) and lists entries in a
-table with a fixed header: **Name**, **Owner**, **Modified** and **Size**. The
+table with a fixed header: **Name**, **Modified**, **Size** and **Owner**. The
 **Files** toggle in the tab bar shows/hides it, and the panel's **×** hides it
 too. Each tab keeps its own width, directory and selection.
 
 - Entries are sorted **directories first**, then case-insensitive name. The
   font-safe icons are `🗀` for a directory, `🗋` for a regular file and `🔗` for a
   symlink (displayed but not followed yet).
-- Rows are striped and stay on one line. The **Name** column keeps at least 55 %
-  of the table width; **Owner**, **Modified** and **Size** shrink first and are
-  hidden (Size, then Modified, then Owner) when they would be too narrow to
-  read. Only then does a long file name elide.
+- Rows are striped and stay on one line. **Name** starts at exactly half the
+  table width and keeps that share when the panel is resized. **Modified**,
+  **Size** and **Owner** share the other half and are hidden — Owner first,
+  then Size, then Modified — when they would be too narrow to read; their share
+  goes to the name. Only then does a long file name elide.
 - The header uses the same font size as the rows and nothing is bold.
-- Column dividers exist only in the header. Drag one to resize the column to its
-  right; file rows never show resize handles.
+- Column dividers exist only in the header. Drag one to resize the two columns
+  around it; the divider snaps to **12 px steps**, so it moves one notch at a
+  time instead of following the pointer freely. A column cannot be dragged
+  below its minimum readable width, and hidden columns have no handle. File
+  rows never show resize handles.
 - Hover a row for its full path, type, size, owner, exact timestamp and relative
   age.
 - **Single click** selects a row. **Double click** opens it: folders navigate,
@@ -516,8 +520,11 @@ too. Each tab keeps its own width, directory and selection.
   folder** (when something has been copied), **Rename…**, **Copy path**,
   **Delete…**.
 - The icon toolbar (hover for a tooltip) provides 🏠 **Home** (login directory),
-  ↑ **Up**, 🔄 **Refresh**, ➕ **New folder**, 🗐 **Copy**, 📋 **Paste**,
-  👁 **Hidden** (dotfiles, per tab), ⚡ **Reconnect** and × **Hide**.
+  📂 **Up one level**, 🔄 **Refresh**, ➕ **New folder**, 🗐 **Copy**,
+  📋 **Paste**, 📥 **Download**, 📤 **Upload**, 👁 **Hidden** (dotfiles, per
+  tab), ⚡ **Reconnect** and × **Hide**. Every icon is checked against the
+  bundled fonts by `theme::tests::icons_have_glyphs`, so a missing glyph cannot
+  come back as an empty box.
 - **Status bar:** the bottom of the panel always shows the latest message with a
   colour-coded icon. While a listing or file operation runs it shows a spinner
   and the operation label; a transfer's queue depth is appended there as
@@ -539,7 +546,9 @@ too. Each tab keeps its own width, directory and selection.
   or a **Custom command** such as `kate --new`. Editors that are not on `PATH`
   are shown disabled. The last choice is preselected for the session. The file
   is downloaded to a unique `rustterm-edit-<pid>-<nanos>` temp directory and
-  launched asynchronously.
+  launched asynchronously. The **Upload changes automatically when the file is
+  saved** checkbox (on by default, remembered per session) turns the download
+  into a two-way edit — see §18.
 - **Rename/Delete** use the same compact, auto-sized modal with right-aligned
   Cancel plus the primary action. The heading names the entry
   (`Rename “old.name”`, `Delete “old.name”`); delete shows the remote path
@@ -550,10 +559,8 @@ too. Each tab keeps its own width, directory and selection.
   with the reason in the status bar and offers **Reconnect SFTP**. Only the SFTP
   channel is retried; the terminal is unaffected.
 - **Limitations:** the panel does **not** follow `cd` in the shell yet (handoff
-  F26). Use **Refresh**/the path box to change directory. General upload/
-  download, drag & drop and progress bars are still on the transfers step.
-  Symlinks are shown/copied but double-clicking one does not navigate. Editor
-  changes are not watched or uploaded.
+  F26). Use **Refresh**/the path box to change directory. Symlinks are
+  shown/copied but double-clicking one does not navigate.
 
 **Verify**
 
@@ -563,13 +570,14 @@ so delete/copy tests cannot touch real data.
 
 - [ ] **Appears**: connect → the left panel lists the login directory; compare
       with `pwd` / `ls -la` in the terminal.
-- [ ] **Columns**: the header reads **Name / Owner / Modified / Size**, uses the
+- [ ] **Columns**: the header reads **Name / Modified / Size / Owner**, uses the
       same font size as the rows, is not bold and stays visible while scrolling.
-      Owner and local `YYYY-MM-DD HH:MM` match `stat -c '%U %y' file`; folders
-      show an em dash for size. Drag a divider in the header to resize the column
-      to its right (dividers are not drawn on file rows) and narrow the panel to
-      ~340 px: **Name stays readable**, Owner/Modified/Size shrink and disappear
-      first, and the header remains readable.
+      Name is about half the table. Owner and local `YYYY-MM-DD HH:MM` match
+      `stat -c '%U %y' file`; folders show an em dash for size. Drag a divider
+      in the header: it moves in ~12 px steps and only the two neighbouring
+      columns change (dividers are not drawn on file rows). Narrow the panel to
+      ~340 px: **Name stays readable and grows**, Owner/Size/Modified disappear
+      in that order, and the header remains readable.
 - [ ] **Sorting**: directories come first; names are case-insensitive
       alphabetical within each group.
 - [ ] **Select vs open**: one click highlights a row without navigating; double
@@ -579,9 +587,10 @@ so delete/copy tests cannot touch real data.
       Delete…; right-click a folder → Open, Rename…, Copy path, Delete…, plus
       Paste into this folder after copying an entry. A left click does not open
       this menu. **Copy**, **New folder…** and **Refresh** are absent by design.
-- [ ] **Toolbar**: every icon shows a tooltip; Home/Up/Refresh/New folder/Copy/
-      Paste/Hidden/Reconnect/Hide all work. Up, Copy and Paste are disabled when
-      they cannot run.
+- [ ] **Toolbar**: every icon draws a real glyph (no empty boxes) and shows a
+      tooltip; 🏠 Home / 📂 Up / 🔄 Refresh / ➕ New folder / 🗐 Copy / 📋 Paste /
+      📥 Download / 📤 Upload / 👁 Hidden / ⚡ Reconnect / × Hide all work. Up,
+      Copy and Paste are disabled when they cannot run.
 - [ ] **Path box**: type `/tmp` + **Enter** → `/tmp` is listed; repeat with ➡.
       Type a bogus path → an error in the status bar, previous listing stays.
 - [ ] **Refresh**: `touch /tmp/rt-new-file` in the terminal, press 🔄 in `/tmp`
@@ -619,12 +628,14 @@ so delete/copy tests cannot touch real data.
       tinted and says the whole tree is removed; cancel leaves everything
       intact. `Esc` cancels.
 - [ ] **Open with…**: double-click a small text file → modal lists Default
-      editor, Zed, gvim, VS Code, Desktop default and Custom command. Editors
-      that are not installed are disabled. Choose one → an editor opens with the
-      file contents and the status bar names the temp download path. Reopen the
-      picker → the same choice is preselected. Choose **Custom command** with an
-      empty field → inline error; with `kate --new` → Kate opens. Close the
-      editor; the app remains responsive.
+      editor, Zed, gvim, VS Code, Desktop default and Custom command, plus the
+      ticked **Upload changes automatically when the file is saved** checkbox.
+      Editors that are not installed are disabled. Choose one → an editor opens
+      with the file contents and the status bar says the file will be uploaded
+      on save. Reopen the picker → the same choice is preselected. Choose
+      **Custom command** with an empty field → inline error; with `kate --new` →
+      Kate opens. Close the editor; the app remains responsive. Save-to-upload
+      behaviour is covered in §18.
 - [ ] **Reconnect**: click ⚡ → the SFTP listing reopens at the login directory;
       the terminal scrollback and running shell are untouched. Repeat while a
       command is streaming output in the terminal.
@@ -737,9 +748,9 @@ and scrolls when the window is short.
 **How:** uploads and downloads run over the existing SFTP channel, so they work
 whenever the panel is usable. There are four entry points:
 
-- **⬇ toolbar button** — downloads the selected row into a folder you pick.
-- **⇧ toolbar button** — uploads one or more local files into the current remote
-  directory. (**↑** is the separate "up one level" button.)
+- **📥 toolbar button** — downloads the selected row into a folder you pick.
+- **📤 toolbar button** — uploads one or more local files into the current remote
+  directory. (**📂** is the separate "up one level" button.)
 - **Row menu** — **Download…** on any file or folder; folders also offer
   **Upload files here…** and **Upload folder here…**.
 - **Drag & drop** — drop files or folders from the desktop anywhere over the
@@ -789,13 +800,13 @@ order.
 
 **Verify**
 
-- [ ] **Download a file**: ⬇ with a file selected → choose a folder → the bar
+- [ ] **Download a file**: 📥 with a file selected → choose a folder → the bar
       fills, then the status bar names the destination and the local file exists
       with identical contents (`cmp`).
 - [ ] **Download a folder**: right-click a non-empty folder → **Download…** →
       the whole tree, including sub-folders and symlinks, lands in the chosen
       folder.
-- [ ] **Upload files**: ⬆ in `/tmp` → pick two files → both appear there, and the
+- [ ] **Upload files**: 📤 in `/tmp` → pick two files → both appear there, and the
       listing refreshes. Re-open the picker and cancel → nothing happens.
 - [ ] **Upload folder**: right-click a remote folder → **Upload folder here…** →
       the local tree is created inside that folder, not the current directory.
@@ -826,3 +837,46 @@ order.
       `pkill -f sshd`) during an upload → the status bar reports the closed
       connection, the tab shows **Connection lost** plus **Close tab**, and
       closing it removes the tab without losing other sessions.
+## 18. Edit a remote file and upload on save — [U]
+
+**How:** double-click a remote file (or right-click → **Open with…**), pick an
+editor and leave **Upload changes automatically when the file is saved** ticked
+(it is on by default and remembered per session). The file is downloaded once to
+a temp folder and opened; every save in the editor is uploaded back to the same
+remote path.
+
+**Behaviour**
+
+- The editor starts only after the download finishes; the status bar says
+  `Opened notes.txt in Zed — saving uploads it back`.
+- Saves are detected by comparing the local copy's size and modification time
+  every 600 ms. This needs no file-watching dependency and also catches editors
+  that save by writing a temp file and renaming it.
+- The upload uses the normal transfer queue: the transfer row shows
+  `Uploading notes.txt…`, the status bar ends with `Uploaded …/notes.txt`, and
+  the listing refreshes.
+- The upload writes `notes.txt.part` on the server and renames it on success, so
+  a failed upload never leaves a truncated remote file.
+- Saving twice in a row queues both uploads; the queue runs them in order, so
+  the newest content wins.
+- Unticking the checkbox opens the file without watching it, and the status bar
+  names the temp copy instead.
+- If the connection is lost, editing continues locally and the tab shows the
+  **Connection lost** banner; the watcher is dropped with the session.
+
+**Verify**
+
+- [ ] **Edit and save**: open `notes.txt` in gvim, append a line, `:w` → within
+      about a second the status bar says `Uploaded /…/notes.txt` and
+      `cat` in the terminal shows the new line.
+- [ ] **Rapid saves**: change and save twice quickly → both uploads appear in
+      order and the remote copy ends with the second version.
+- [ ] **Same-size save**: replace one word with a word of the same length, save
+      → the upload still happens (the timestamp changed).
+- [ ] **No auto-upload**: untick the checkbox, edit and save → no upload; the
+      remote file is unchanged and the status bar only names the local copy.
+- [ ] **Failed upload**: remove write permission on the remote file
+      (`chmod 444`) and save → the status bar shows the error, the remote file
+      is untouched (no `.part` left) and the session stays connected.
+- [ ] **Connection lost while editing**: stop sshd, save again → no hang; the
+      tab shows the banner and **Close tab**.

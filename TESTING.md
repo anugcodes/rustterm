@@ -210,15 +210,25 @@ Use a scratch directory so nothing real is touched.
 - [ ] **F8 — delete.** Right-click `b.txt` → **Delete…**; `Esc` cancels. Repeat
       and confirm; the file disappears. The modal names the file and warns that
       it cannot be undone.
-- [ ] **F9 — sizing.** Drag a header divider to resize a column; drag the panel
-      edge (clamped to 340 px…55 %, max 720 px). The terminal stays visible.
-      Narrow the panel: Name keeps its width and Owner/Modified/Size shrink and
-      then disappear before any file name elides. Switch tabs → each tab keeps
-      its own width and directory.
+- [ ] **F9 — column order and sizing.** The header reads **Name · Modified ·
+      Size · Owner**, and Name occupies about half the table. Drag a divider:
+      it moves in ~12 px notches, never continuously, and only the two columns
+      around it change width. Drag Name/Modified far right → Modified stops at
+      its minimum. Drag the panel edge (clamped to 340 px…55 %, max 720 px):
+      the proportions are kept and the terminal stays visible. Narrow the
+      panel: Owner disappears first, then Size, then Modified, and the name
+      grows instead of eliding. Switch tabs → each tab keeps its own width and
+      directory.
 - [ ] **F10 — open with.** Double-click a file → the **Open “file”** modal lists
       editors; entries not on `PATH` are disabled. Its heading is the smaller
-      modal style and a long path wraps. Cancel.
-- [ ] **F11 — messages.** The ☰ button shows the last 50 messages with
+      modal style and a long path wraps. It has an
+      **Upload changes automatically when the file is saved** checkbox, ticked
+      by default. Cancel without opening anything.
+- [ ] **F11a — toolbar icons.** Every button in the SFTP toolbar draws a real
+      icon — no empty/hollow boxes, no two buttons sharing one glyph. **Up one
+      level** is 📂, **Download** is 📥 and **Upload** is 📤; hover each for its
+      tooltip.
+- [ ] **F11b — messages.** The ☰ button shows the last 50 messages with
       timestamps; **Clear messages** empties it.
 - [ ] **F12 — hide/show.** **Files** in the tab bar and the panel's `×` hide it;
       the terminal reflows. Showing it restores the previous directory.
@@ -251,13 +261,13 @@ Use a scratch directory so nothing real is touched.
 
 ### 2.11 File transfers
 
-- [ ] **T1 — download file.** Select a remote file, click **⬇**, choose a local
+- [ ] **T1 — download file.** Select a remote file, click **📥**, choose a local
       folder → progress bar advances, status says `Downloaded …`, and
       `cmp` reports the local copy identical. No `.part` file remains.
 - [ ] **T2 — download folder.** Right-click a folder with sub-folders and a
       symlink → **Download…** → the tree is recreated locally and the symlink
       still points at the same target.
-- [ ] **T3 — upload.** Click **⇧**, pick two files → both appear in the remote
+- [ ] **T3 — upload.** Click **📤**, pick two files → both appear in the remote
       listing after the automatic refresh.
 - [ ] **T4 — upload into folder.** Right-click a sub-folder → **Upload folder
       here…** → the tree appears inside that folder, not in the current one.
@@ -285,6 +295,32 @@ Use a scratch directory so nothing real is touched.
       reports the closed connection and the tab shows **Connection lost** with
       **Close tab**. The other tabs keep working.
 - [ ] **T12 — cleanup.** In the terminal: `rm -rf ~/sftp-test ~/Downloads/rt-*`.
+
+### 2.12 Edit and upload on save
+
+Use a scratch file, e.g. `~/sftp-test/notes.txt`.
+
+- [ ] **E1 — open and watch.** Right-click `notes.txt` → **Open with…** → gvim →
+      there is a short download, the editor opens, and the status bar says
+      `Opened notes.txt in gvim — saving uploads it back`.
+- [ ] **E2 — save uploads.** Append a line in gvim and `:w`. Within ~1 s the
+      transfer row shows `Uploading notes.txt…`, then the status bar says
+      `Uploaded …/notes.txt`. In the terminal, `cat notes.txt` shows the new
+      line without pressing Refresh.
+- [ ] **E3 — same-length edit.** Replace a word with one of equal length, save →
+      the upload still runs (mtime changed).
+- [ ] **E4 — rapid saves.** Save three times in a row → the uploads run in
+      order and the remote file matches the last save (`cmp`).
+- [ ] **E5 — opt out.** Untick **Upload changes automatically…** in the picker,
+      open, edit and save → nothing is uploaded; the remote file keeps its old
+      contents and only the local temp copy changed.
+- [ ] **E6 — failed save-upload.** `chmod 444 notes.txt` on the server, then save
+      in the editor → the status bar shows the permission error, the remote file
+      is unchanged, no `notes.txt.part` remains, and the session stays
+      connected. `chmod 644` afterwards.
+- [ ] **E7 — connection loss while editing.** Stop sshd, save in the editor → the
+      UI does not freeze; the tab shows **Connection lost** + **Close tab**.
+      Other tabs keep working.
 
 ---
 

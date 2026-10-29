@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::ssh::{ConflictPolicy, RemoteEntry, SshSession, TransferProgress};
 
@@ -56,6 +56,8 @@ pub struct EditorPicker {
     pub entry: RemoteEntry,
     pub choice: EditorChoice,
     pub custom: String,
+    /// Re-upload the local copy whenever the editor saves it.
+    pub auto_upload: bool,
     pub error: Option<String>,
 }
 
@@ -175,6 +177,8 @@ enum TransferKind {
         remote: Vec<RemoteEntry>,
         local_dir: PathBuf,
     },
+    /// One local file to an exact remote path (editor save).
+    UploadOne { local: PathBuf, remote: String },
 }
 
 /// One transfer waiting for its turn.
@@ -202,6 +206,85 @@ pub struct ActiveTransfer {
     verb: &'static str,
 }
 
+/// How often the local copies opened in an editor are checked for a save.
+const EDIT_CHECK_INTERVAL: Duration = Duration::from_millis(600);
+
+/// Size and modification time of a local file. Cheap to read and enough to
+/// notice a save from any editor (including atomic write-and-rename).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    modified: Option<SystemTime>,
+    len: u64,
+}
+
+impl FileStamp {
+    fn of(path: &Path) -> Option<Self> {
+        let metadata = std::fs::metadata(path).ok()?;
+        Some(Self {
+            modified: metadata.modified().ok(),
+            len: metadata.len(),
+        })
+    }
+}
+
+/// What one check of a watched file found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchState {
+    Unchanged,
+    /// The file changed and should be uploaded.
+    Changed,
+    /// The local copy has been gone long enough to stop watching it.
+    Gone,
+}
+
+/// A local copy of a remote file that is open in an editor.
+#[derive(Debug)]
+struct EditWatch {
+    local: PathBuf,
+    remote: String,
+    name: String,
+    /// State at the last upload (or at launch), to detect the next save.
+    stamp: Option<FileStamp>,
+    /// Consecutive checks that found no local file.
+    missing: u32,
+}
+
+/// How many checks (at `EDIT_CHECK_INTERVAL`) a missing local file is
+/// tolerated. Editors that save by writing and renaming are briefly absent.
+const WATCH_GONE_CHECKS: u32 = 20;
+
+impl EditWatch {
+    fn new(local: PathBuf, remote: String, name: String) -> Self {
+        let stamp = FileStamp::of(&local);
+        Self {
+            local,
+            remote,
+            name,
+            stamp,
+            missing: 0,
+        }
+    }
+
+    fn check(&mut self) -> WatchState {
+        let Some(stamp) = FileStamp::of(&self.local) else {
+            // A file that momentarily disappears (atomic save) is not an
+            // error and is not uploaded; the next check sees the replacement.
+            self.missing += 1;
+            return if self.missing >= WATCH_GONE_CHECKS {
+                WatchState::Gone
+            } else {
+                WatchState::Unchanged
+            };
+        };
+        self.missing = 0;
+        if Some(stamp) == self.stamp {
+            return WatchState::Unchanged;
+        }
+        self.stamp = Some(stamp);
+        WatchState::Changed
+    }
+}
+
 /// State for the SFTP side panel.
 #[derive(Debug, Default)]
 pub struct SftpExplorer {
@@ -227,6 +310,12 @@ pub struct SftpExplorer {
     pub editor_picker: Option<EditorPicker>,
     /// Last editor chosen for this session; preselected next time.
     last_editor: EditorChoice,
+    /// Last "upload on save" answer; preselected next time.
+    last_auto_upload: bool,
+    /// Local copies opened in an editor, watched for saves.
+    edits: Vec<EditWatch>,
+    /// Rate limit for the save watch: statting on every frame is wasteful.
+    last_edit_check: Option<Instant>,
     /// Latest message and recent history, shown at the bottom of the panel.
     pub status: StatusLog,
     pending: Option<Job>,
@@ -264,14 +353,19 @@ enum OnSuccess {
         editor: EditorChoice,
         custom: Option<String>,
         local: PathBuf,
+        remote: String,
         name: String,
+        auto_upload: bool,
     },
 }
 
 impl SftpExplorer {
     /// Create the panel state and start resolving the remote home directory.
     pub fn start(ssh: &SshSession) -> Self {
-        let mut explorer = Self::default();
+        let mut explorer = Self {
+            last_auto_upload: true,
+            ..Self::default()
+        };
         if let Some(reason) = ssh.sftp_unavailable() {
             explorer.unavailable = Some(reason.to_string());
             explorer.status.error(reason);
@@ -286,6 +380,7 @@ impl SftpExplorer {
     pub fn poll(&mut self, ssh: &SshSession) -> bool {
         let mut activity = self.poll_transfer(ssh);
         activity |= self.poll_operation(ssh);
+        activity |= self.poll_edits(ssh);
         let Some(job) = self.pending.take() else {
             return activity;
         };
@@ -414,14 +509,33 @@ impl SftpExplorer {
                 editor,
                 custom,
                 local,
+                remote,
                 name,
+                auto_upload,
             } => match launch_editor(editor, custom.as_deref(), &local) {
                 Ok(()) => {
-                    self.status.success(format!(
-                        "Opened {name} in {} (downloaded to {})",
-                        editor_label(editor, custom.as_deref()),
-                        local.display()
-                    ));
+                    if auto_upload {
+                        // Watch from the state right after launch, so an
+                        // editor that touches the file on open does not
+                        // trigger an immediate re-upload. Opening the same
+                        // copy twice replaces the earlier watch instead of
+                        // uploading the file twice per save.
+                        let watch = EditWatch::new(local.clone(), remote, name.clone());
+                        match self.edits.iter_mut().find(|seen| seen.local == local) {
+                            Some(seen) => *seen = watch,
+                            None => self.edits.push(watch),
+                        }
+                        self.status.success(format!(
+                            "Opened {name} in {} — saving uploads it back",
+                            editor_label(editor, custom.as_deref())
+                        ));
+                    } else {
+                        self.status.success(format!(
+                            "Opened {name} in {} (downloaded to {})",
+                            editor_label(editor, custom.as_deref()),
+                            local.display()
+                        ));
+                    }
                 }
                 Err(err) => {
                     self.status
@@ -692,6 +806,10 @@ impl SftpExplorer {
                     Arc::clone(&progress),
                 ),
             ),
+            TransferKind::UploadOne { local, remote } => (
+                "Uploaded",
+                ssh.sftp_upload_one(local.clone(), remote.clone(), Arc::clone(&progress)),
+            ),
         };
         let Some(rx) = receiver else {
             self.mark_unavailable(ssh);
@@ -742,6 +860,65 @@ impl SftpExplorer {
                 true
             }
         }
+    }
+
+    /// Whether any opened file is being watched for saves.
+    ///
+    /// The UI keeps a slow repaint timer alive while this is true; without it a
+    /// save in the editor would not be noticed until the next mouse move.
+    pub fn watches_edits(&self) -> bool {
+        !self.edits.is_empty()
+    }
+
+    /// Check the local copies of files opened in an editor and queue an upload
+    /// for every save. Returns `true` when the UI should redraw.
+    fn poll_edits(&mut self, ssh: &SshSession) -> bool {
+        if self.edits.is_empty() {
+            return false;
+        }
+        let now = Instant::now();
+        if self
+            .last_edit_check
+            .is_some_and(|last| now.duration_since(last) < EDIT_CHECK_INTERVAL)
+        {
+            return false;
+        }
+        self.last_edit_check = Some(now);
+
+        // An editor may save several times in a row; each change found here is
+        // queued in order, so the last save always wins.
+        let mut changed: Vec<(PathBuf, String, String)> = Vec::new();
+        let mut gone: Vec<PathBuf> = Vec::new();
+        for watch in &mut self.edits {
+            match watch.check() {
+                WatchState::Changed => {
+                    changed.push((
+                        watch.local.clone(),
+                        watch.remote.clone(),
+                        watch.name.clone(),
+                    ));
+                }
+                WatchState::Gone => gone.push(watch.local.clone()),
+                WatchState::Unchanged => {}
+            }
+        }
+        // Deleting the temp copy (or closing an editor that removes it) ends
+        // the watch, so the UI can stop its polling timer.
+        self.edits.retain(|watch| !gone.contains(&watch.local));
+
+        let mut activity = !changed.is_empty();
+        for (local, remote, name) in changed {
+            self.status
+                .info(format!("Uploading {name} (saved in the editor)…"));
+            let request = TransferRequest {
+                label: format!("Uploading {name}…"),
+                kind: TransferKind::UploadOne { local, remote },
+                policy: ConflictPolicy::Overwrite,
+            };
+            self.enqueue_or_ask(ssh, request, Vec::new());
+            activity = true;
+        }
+        activity
     }
 
     /// Remember a remote entry for a later "Paste".
@@ -936,6 +1113,7 @@ impl SftpExplorer {
             entry: entry.clone(),
             choice: self.last_editor,
             custom: String::new(),
+            auto_upload: self.last_auto_upload,
             error: None,
         });
         true
@@ -956,8 +1134,15 @@ impl SftpExplorer {
             return true;
         }
         self.last_editor = picker.choice;
+        self.last_auto_upload = picker.auto_upload;
         let custom = (picker.choice == EditorChoice::Custom).then(|| picker.custom.clone());
-        self.open_in_editor(ssh, &picker.entry, picker.choice, custom);
+        self.open_in_editor(
+            ssh,
+            &picker.entry,
+            picker.choice,
+            custom,
+            picker.auto_upload,
+        );
         true
     }
 
@@ -968,6 +1153,7 @@ impl SftpExplorer {
         entry: &RemoteEntry,
         editor: EditorChoice,
         custom: Option<String>,
+        auto_upload: bool,
     ) -> bool {
         if entry.is_dir {
             self.status
@@ -994,7 +1180,9 @@ impl SftpExplorer {
                 editor,
                 custom,
                 local,
+                remote: entry.path.clone(),
                 name: entry.name.clone(),
+                auto_upload,
             },
             rx,
         );
@@ -1061,6 +1249,9 @@ impl SftpExplorer {
         self.queue.clear();
         self.conflict = None;
         self.pending = None;
+        // Nothing can be uploaded any more, and polling local files would
+        // only queue transfers that are guaranteed to fail.
+        self.edits.clear();
         self.mark_unavailable_with("the SSH connection is closed");
     }
 
@@ -1453,6 +1644,70 @@ mod tests {
             (String::new(), Vec::new())
         );
         assert!(!command_available("rustterm-editor-that-does-not-exist"));
+    }
+
+    /// Small RAII temp directory so the watch tests do not need a new crate.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!("rustterm-{tag}-{unique}"));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn watch_for(dir: &TempDir, name: &str) -> EditWatch {
+        let local = dir.0.join(name);
+        EditWatch::new(local, format!("/remote/{name}"), name.to_string())
+    }
+
+    #[test]
+    fn edit_watch_reports_each_save_once() {
+        let dir = TempDir::new("edit-watch");
+        std::fs::write(dir.0.join("notes.txt"), "one").unwrap();
+        let mut watch = watch_for(&dir, "notes.txt");
+
+        assert_eq!(watch.check(), WatchState::Unchanged, "no save yet");
+
+        std::fs::write(dir.0.join("notes.txt"), "two").unwrap();
+        assert_eq!(watch.check(), WatchState::Changed, "the write is a save");
+        assert_eq!(watch.check(), WatchState::Unchanged, "uploaded once");
+
+        // Editors that write and rename (or touch the file) change the stamp
+        // without changing the length.
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(dir.0.join("notes.txt"), "TWO!").unwrap();
+        assert_eq!(watch.check(), WatchState::Changed, "a second save");
+
+        // A vanished file is tolerated for a moment (atomic save)...
+        std::fs::remove_file(dir.0.join("notes.txt")).unwrap();
+        assert_eq!(watch.check(), WatchState::Unchanged);
+        // ...and the watch is dropped once it stays gone.
+        for _ in 0..WATCH_GONE_CHECKS {
+            watch.check();
+        }
+        assert_eq!(watch.check(), WatchState::Gone);
+    }
+
+    #[test]
+    fn watchers_are_tracked_until_the_session_ends() {
+        let dir = TempDir::new("edit-list");
+        std::fs::write(dir.0.join("a.txt"), "a").unwrap();
+        let mut explorer = SftpExplorer::default();
+        assert!(!explorer.watches_edits());
+        explorer.edits.push(watch_for(&dir, "a.txt"));
+        assert!(explorer.watches_edits());
     }
 
     #[test]

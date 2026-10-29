@@ -46,6 +46,11 @@ const DEFAULT_ROWS: usize = 24;
 /// connected, the SSH thread wakes the UI itself when output arrives.
 const CONNECT_POLL_MS: u64 = 8;
 
+/// Delay between checks of files opened in a local editor. Saving in the
+/// editor is detected by polling, so the UI keeps a slow timer alive while a
+/// file is watched for auto-upload.
+const EDIT_WATCH_POLL_MS: u64 = 600;
+
 /// Upper bound on remote bytes decoded in a single frame. This keeps a large
 /// burst from stalling the UI while still allowing tens of MiB/s sustained.
 const MAX_OUTPUT_PER_FRAME: usize = 256 * 1024;
@@ -243,125 +248,162 @@ fn tab_button(
     (response, close_clicked)
 }
 
-/// Column widths of the SFTP table, persisted per session.
+/// Column layout of the SFTP table, persisted per session.
 ///
-/// `Name` takes whatever is left, so only the three metadata columns need to
-/// be stored.
+/// Columns are ordered **Name, Modified, Size, Owner**. Each one owns a share
+/// of the table width instead of a fixed pixel width, so the proportions
+/// survive a panel resize and `Name` stays at half the table. Dividers move in
+/// whole `COLUMN_STEP` pixels rather than following the pointer freely.
 #[derive(Debug, Clone, Copy)]
 struct SftpColumns {
-    owner: f32,
+    name: f32,
     modified: f32,
     size: f32,
+    owner: f32,
 }
 
 impl Default for SftpColumns {
     fn default() -> Self {
+        // `Name` gets half the table; the metadata columns share the rest.
         Self {
-            owner: 64.0,
-            modified: 122.0,
-            size: 52.0,
+            name: 0.50,
+            modified: 0.22,
+            size: 0.10,
+            owner: 0.18,
         }
     }
 }
 
-const NAME_MIN_WIDTH: f32 = 80.0;
-/// Share of the table the `Name` column keeps before metadata columns shrink.
-const NAME_SHARE: f32 = 0.55;
-const MIN_OWNER_WIDTH: f32 = 44.0;
+const NAME_MIN_WIDTH: f32 = 90.0;
 const MIN_MODIFIED_WIDTH: f32 = 64.0;
 const MIN_SIZE_WIDTH: f32 = 36.0;
+const MIN_OWNER_WIDTH: f32 = 44.0;
+/// A divider only ever sits on a multiple of this many pixels.
+const COLUMN_STEP: f32 = 12.0;
 
 impl SftpColumns {
-    fn name_width(self, total: f32) -> f32 {
-        (total - self.owner - self.modified - self.size).max(NAME_MIN_WIDTH)
+    /// Shares normalised to sum to 1.
+    fn shares(self) -> [f32; 4] {
+        let raw = [self.name, self.modified, self.size, self.owner].map(|w| w.max(0.0));
+        let sum: f32 = raw.iter().sum();
+        if sum <= 0.0 {
+            return [0.50, 0.22, 0.10, 0.18];
+        }
+        raw.map(|share| share / sum)
     }
 
-    /// Widths to actually paint at `total`, keeping the name readable.
-    ///
-    /// The stored widths are the user's preference. On a narrow panel they are
-    /// scaled down as a group; a column that becomes too narrow to read is
-    /// hidden (least informative first: Size, then Modified, then Owner) and
-    /// the freed space goes to `Name`.
-    fn fitted(self, total: f32) -> Self {
-        let total = total.max(0.0);
-        let name_target = (total * NAME_SHARE).max(NAME_MIN_WIDTH).min(total);
-        let budget = (total - name_target).max(0.0);
-        let mins = [MIN_OWNER_WIDTH, MIN_MODIFIED_WIDTH, MIN_SIZE_WIDTH];
-        let preferred = [
-            self.owner.max(0.0),
-            self.modified.max(0.0),
-            self.size.max(0.0),
-        ];
-        let mut visible = [true, true, true];
-
-        // Hide unreadable columns (least informative first) until the rest fit
-        // in the metadata budget. Shrinking is always computed from the user's
-        // preferred widths, so hiding one column does not distort the others.
-        loop {
-            let meta: f32 = (0..3)
-                .filter(|&column| visible[column])
-                .map(|column| preferred[column])
-                .sum();
-            if meta <= budget || meta <= 0.0 {
-                break;
-            }
-            let scale = budget / meta;
-            let unreadable = (0..3)
-                .rev()
-                .find(|&column| visible[column] && preferred[column] * scale < mins[column]);
-            match unreadable {
-                Some(column) => visible[column] = false,
-                None => break,
-            }
+    fn from_shares(shares: [f32; 4]) -> Self {
+        Self {
+            name: shares[0],
+            modified: shares[1],
+            size: shares[2],
+            owner: shares[3],
         }
+    }
 
-        let meta: f32 = (0..3)
-            .filter(|&column| visible[column])
-            .map(|column| preferred[column])
-            .sum();
-        let scale = if meta > budget && meta > 0.0 {
-            budget / meta
-        } else {
-            1.0
+    /// Pixel widths to paint at `total`, in column order.
+    ///
+    /// A column that would be too narrow to read is hidden — Owner first,
+    /// then Size, then Modified — and its share is handed to `Name`, which is
+    /// the column that must stay readable.
+    fn fitted(self, total: f32) -> [f32; 4] {
+        let total = total.max(0.0);
+        let mut shares = self.shares();
+        let mut visible = [true; 4];
+        let mins = [
+            NAME_MIN_WIDTH,
+            MIN_MODIFIED_WIDTH,
+            MIN_SIZE_WIDTH,
+            MIN_OWNER_WIDTH,
+        ];
+
+        let widths = |shares: &[f32; 4], visible: &[bool; 4]| {
+            let shown: f32 = (0..4).filter(|&i| visible[i]).map(|i| shares[i]).sum();
+            let shown = if shown > 0.0 { shown } else { 1.0 };
+            let mut out = [0.0_f32; 4];
+            for (i, width) in out.iter_mut().enumerate() {
+                if visible[i] {
+                    *width = shares[i] / shown * total;
+                }
+            }
+            out
         };
 
-        Self {
-            owner: if visible[0] {
-                preferred[0] * scale
-            } else {
-                0.0
-            },
-            modified: if visible[1] {
-                preferred[1] * scale
-            } else {
-                0.0
-            },
-            size: if visible[2] {
-                preferred[2] * scale
-            } else {
-                0.0
-            },
+        for column in [3, 2, 1] {
+            let current = widths(&shares, &visible);
+            if current[column] > 0.0 && current[column] < mins[column] {
+                visible[column] = false;
+                shares[0] += shares[column];
+                shares[column] = 0.0;
+            }
         }
+        widths(&shares, &visible)
+    }
+
+    /// Move the divider left of column `boundary` to `offset` pixels from the
+    /// table's left edge.
+    ///
+    /// The divider only ever lands on a multiple of `COLUMN_STEP`, and only the
+    /// two neighbours change, so every other column keeps its width. Hidden
+    /// columns are not draggable.
+    fn drag_divider(&mut self, total: f32, boundary: usize, offset: f32) {
+        if !(1..4).contains(&boundary) || total <= 0.0 {
+            return;
+        }
+        let widths = self.fitted(total);
+        let (left, right) = (boundary - 1, boundary);
+        if widths[left] <= 0.0 || widths[right] <= 0.0 {
+            return;
+        }
+        let mins = [
+            NAME_MIN_WIDTH,
+            MIN_MODIFIED_WIDTH,
+            MIN_SIZE_WIDTH,
+            MIN_OWNER_WIDTH,
+        ];
+        let current: f32 = widths[..boundary].iter().sum();
+        // Work in pixels: how far the divider may travel before either
+        // neighbour drops below its minimum.
+        let left_slack = (widths[left] - mins[left]).max(0.0);
+        let right_slack = (widths[right] - mins[right]).max(0.0);
+        let min_pos = ((current - left_slack) / COLUMN_STEP).ceil() * COLUMN_STEP;
+        let max_pos = ((current + right_slack) / COLUMN_STEP).floor() * COLUMN_STEP;
+        if min_pos > max_pos {
+            // No whole step fits between the two minimum widths.
+            return;
+        }
+        let target =
+            ((offset.max(0.0) / COLUMN_STEP).round() * COLUMN_STEP).clamp(min_pos, max_pos);
+        let delta = (target - current) / total;
+        let mut shares = self.shares();
+        shares[left] += delta;
+        shares[right] -= delta;
+        *self = Self::from_shares(shares);
     }
 }
 
-/// Rectangle of every column in one table row.
+/// Rectangles of the four columns in one table row, in column order.
 struct SftpLayout {
-    owner: egui::Rect,
+    name: egui::Rect,
     modified: egui::Rect,
     size: egui::Rect,
+    owner: egui::Rect,
 }
 
 impl SftpLayout {
     fn new(rect: egui::Rect, columns: SftpColumns) -> Self {
-        let columns = columns.fitted(rect.width());
-        let owner_x = rect.left() + columns.name_width(rect.width());
-        let modified_x = owner_x + columns.owner;
-        let size_x = modified_x + columns.modified;
+        let widths = columns.fitted(rect.width());
+        let mut x = rect.left();
+        let mut cell = |width: f32| {
+            let column = egui::Rect::from_x_y_ranges(x..=(x + width), rect.y_range());
+            x += width;
+            column
+        };
         Self {
-            owner: egui::Rect::from_x_y_ranges(owner_x..=modified_x, rect.y_range()),
-            modified: egui::Rect::from_x_y_ranges(modified_x..=size_x, rect.y_range()),
-            size: egui::Rect::from_x_y_ranges(size_x..=rect.right(), rect.y_range()),
+            name: cell(widths[0]),
+            modified: cell(widths[1]),
+            size: cell(widths[2]),
+            owner: cell(widths[3]),
         }
     }
 }
@@ -494,7 +536,15 @@ fn sftp_transfer_bar(ui: &mut egui::Ui, theme: &Theme, explorer: &mut SftpExplor
             );
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if theme::icon_button(ui, theme, "×", "Cancel this transfer", !cancelled).clicked() {
+            if theme::icon_button(
+                ui,
+                theme,
+                theme::icons::CLOSE,
+                "Cancel this transfer",
+                !cancelled,
+            )
+            .clicked()
+            {
                 explorer.cancel_transfer();
             }
         });
@@ -578,7 +628,7 @@ fn sftp_header(
 
     let name_rect = egui::Rect::from_min_max(
         egui::pos2(rect.left() + 22.0, rect.top()),
-        egui::pos2(layout.owner.left() - 2.0, rect.bottom()),
+        egui::pos2(layout.name.right() - 2.0, rect.bottom()),
     );
     paint_cell(
         ui,
@@ -588,47 +638,53 @@ fn sftp_header(
         theme.palette.muted,
         egui::Align::Min,
     );
-    paint_cell(
-        ui,
-        layout.owner.shrink2(egui::vec2(4.0, 0.0)),
-        "Owner",
-        font.clone(),
-        theme.palette.muted,
-        egui::Align::Min,
-    );
-    paint_cell(
-        ui,
-        layout.modified.shrink2(egui::vec2(4.0, 0.0)),
-        "Modified",
-        font.clone(),
-        theme.palette.muted,
-        egui::Align::Min,
-    );
-    paint_cell(
-        ui,
-        layout.size.shrink2(egui::vec2(4.0, 0.0)),
-        "Size",
-        font,
-        theme.palette.muted,
-        egui::Align::Max,
-    );
-
-    let mut separators: Vec<(&str, f32)> = Vec::new();
-    if layout.owner.width() > 0.0 {
-        separators.push(("owner", layout.owner.left()));
-    }
     if layout.modified.width() > 0.0 {
-        separators.push(("modified", layout.modified.left()));
+        paint_cell(
+            ui,
+            layout.modified.shrink2(egui::vec2(4.0, 0.0)),
+            "Modified",
+            font.clone(),
+            theme.palette.muted,
+            egui::Align::Min,
+        );
     }
     if layout.size.width() > 0.0 {
-        separators.push(("size", layout.size.left()));
-    }
-    for (_, x) in &separators {
-        painter.vline(
-            *x,
-            rect.y_range(),
-            egui::Stroke::new(1.0_f32, theme.palette.border),
+        paint_cell(
+            ui,
+            layout.size.shrink2(egui::vec2(4.0, 0.0)),
+            "Size",
+            font.clone(),
+            theme.palette.muted,
+            egui::Align::Max,
         );
+    }
+    if layout.owner.width() > 0.0 {
+        paint_cell(
+            ui,
+            layout.owner.shrink2(egui::vec2(4.0, 0.0)),
+            "Owner",
+            font,
+            theme.palette.muted,
+            egui::Align::Min,
+        );
+    }
+
+    // A divider is only drawn — and only draggable — in front of a column that
+    // is currently visible. `boundary` is the column index it starts.
+    let mut separators: Vec<(usize, f32)> = Vec::new();
+    for (boundary, column) in [
+        (1_usize, layout.modified),
+        (2, layout.size),
+        (3, layout.owner),
+    ] {
+        if column.width() > 0.0 {
+            separators.push((boundary, column.left()));
+            painter.vline(
+                column.left(),
+                rect.y_range(),
+                egui::Stroke::new(1.0_f32, theme.palette.border),
+            );
+        }
     }
     painter.hline(
         rect.x_range(),
@@ -637,14 +693,14 @@ fn sftp_header(
     );
 
     let total = rect.width();
-    for (which, x) in separators {
+    for (boundary, x) in separators {
         let handle = egui::Rect::from_min_max(
             egui::pos2(x - 3.0, rect.top()),
             egui::pos2(x + 3.0, rect.bottom()),
         );
         let response = ui.interact(
             handle,
-            egui::Id::new(("sftp_col_resize", index, which)),
+            egui::Id::new(("sftp_col_resize", index, boundary)),
             egui::Sense::click_and_drag(),
         );
         if response.hovered() || response.dragged() {
@@ -656,20 +712,8 @@ fn sftp_header(
         let Some(pointer) = response.interact_pointer_pos() else {
             continue;
         };
-        match which {
-            "owner" => {
-                let max = (total - NAME_MIN_WIDTH - columns.modified - columns.size).max(56.0);
-                columns.owner =
-                    (rect.right() - pointer.x - columns.modified - columns.size).clamp(56.0, max);
-            }
-            "modified" => {
-                let max = (total - NAME_MIN_WIDTH - columns.owner - columns.size).max(74.0);
-                columns.modified = (rect.right() - pointer.x - columns.size).clamp(74.0, max);
-            }
-            _ => {
-                columns.size = (rect.right() - pointer.x).clamp(44.0, 140.0);
-            }
-        }
+        // Snapshots to fixed steps, so the divider jumps one notch at a time.
+        columns.drag_divider(total, boundary, pointer.x - rect.left());
     }
 }
 
@@ -1101,6 +1145,11 @@ impl RustTermApp {
                     // The bar is polled; keep frames coming while bytes flow.
                     ctx.request_repaint_after(Duration::from_millis(100));
                 }
+                if session.sftp.watches_edits() {
+                    // A save in the editor only changes a local file, so
+                    // nothing pushes a repaint; poll it on a slow timer.
+                    ctx.request_repaint_after(Duration::from_millis(EDIT_WATCH_POLL_MS));
+                }
             }
             while budget > 0 {
                 let Some(chunk) = session.ssh.try_read() else {
@@ -1437,7 +1486,14 @@ impl RustTermApp {
                         sized_label(ui, theme, &target, target_width, theme.palette.muted)
                             .on_hover_text(&target);
 
-                        if theme::icon_button(ui, theme, "×", "Delete this profile", true).clicked()
+                        if theme::icon_button(
+                            ui,
+                            theme,
+                            theme::icons::CLOSE,
+                            "Delete this profile",
+                            true,
+                        )
+                        .clicked()
                         {
                             delete = Some(index);
                         }
@@ -1632,7 +1688,7 @@ impl RustTermApp {
                                         if theme::icon_button(
                                             ui,
                                             theme,
-                                            "✕",
+                                            theme::icons::CLOSE,
                                             "Cancel this connection attempt",
                                             true,
                                         )
@@ -1711,31 +1767,70 @@ impl RustTermApp {
         let can_paste = explorer.clipboard.is_some() && !busy;
 
         ui.horizontal(|ui| {
-            if theme::icon_button(ui, theme, "🏠", "Go to the login directory", !busy).clicked() {
+            if theme::icon_button(
+                ui,
+                theme,
+                theme::icons::HOME,
+                "Go to the login directory",
+                !busy,
+            )
+            .clicked()
+            {
                 explorer.load_home(ssh);
                 activity = true;
             }
-            if theme::icon_button(ui, theme, "↑", "Up one level", can_up && !busy).clicked() {
+            if theme::icon_button(ui, theme, theme::icons::UP, "Up one level", can_up && !busy)
+                .clicked()
+            {
                 explorer.up(ssh);
                 activity = true;
             }
-            if theme::icon_button(ui, theme, "🔄", "Refresh this directory", !busy).clicked() {
+            if theme::icon_button(
+                ui,
+                theme,
+                theme::icons::REFRESH,
+                "Refresh this directory",
+                !busy,
+            )
+            .clicked()
+            {
                 explorer.refresh(ssh);
                 activity = true;
             }
-            if theme::icon_button(ui, theme, "➕", "Create a folder here", !busy).clicked() {
+            if theme::icon_button(
+                ui,
+                theme,
+                theme::icons::NEW_FOLDER,
+                "Create a folder here",
+                !busy,
+            )
+            .clicked()
+            {
                 explorer.begin_new_folder();
                 activity = true;
             }
-            if theme::icon_button(ui, theme, "🗐", "Copy the selected entry", can_copy).clicked()
+            if theme::icon_button(
+                ui,
+                theme,
+                theme::icons::COPY,
+                "Copy the selected entry",
+                can_copy,
+            )
+            .clicked()
             {
                 if let Some(entry) = &selected {
                     explorer.copy_entry(entry);
                 }
                 activity = true;
             }
-            if theme::icon_button(ui, theme, "📋", "Paste the copied entry here", can_paste)
-                .clicked()
+            if theme::icon_button(
+                ui,
+                theme,
+                theme::icons::PASTE,
+                "Paste the copied entry here",
+                can_paste,
+            )
+            .clicked()
             {
                 explorer.paste(ssh);
                 activity = true;
@@ -1743,7 +1838,7 @@ impl RustTermApp {
             if theme::icon_button(
                 ui,
                 theme,
-                "⬇",
+                theme::icons::DOWNLOAD,
                 "Download the selected entry…",
                 selected.is_some() && !busy,
             )
@@ -1754,7 +1849,9 @@ impl RustTermApp {
                 }
                 activity = true;
             }
-            if theme::icon_button(ui, theme, "⇧", "Upload files here…", !busy).clicked() {
+            if theme::icon_button(ui, theme, theme::icons::UPLOAD, "Upload files here…", !busy)
+                .clicked()
+            {
                 if let Some(paths) = pick_upload_files() {
                     explorer.upload_paths(ssh, paths);
                 }
@@ -1763,7 +1860,7 @@ impl RustTermApp {
             if theme::icon_toggle(
                 ui,
                 theme,
-                "👁",
+                theme::icons::HIDDEN,
                 "Show or hide dotfiles",
                 explorer.show_hidden,
             )
@@ -1782,7 +1879,7 @@ impl RustTermApp {
             if theme::icon_button(
                 ui,
                 theme,
-                "⚡",
+                theme::icons::RECONNECT,
                 "Reconnect SFTP without dropping the terminal",
                 !busy,
             )
@@ -1796,7 +1893,9 @@ impl RustTermApp {
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if theme::icon_button(ui, theme, "×", "Hide the file panel", true).clicked() {
+                if theme::icon_button(ui, theme, theme::icons::CLOSE, "Hide the file panel", true)
+                    .clicked()
+                {
                     hide = true;
                 }
             });
@@ -1814,7 +1913,7 @@ impl RustTermApp {
                 explorer.navigate(ssh, path);
                 activity = true;
             }
-            if theme::icon_button(ui, theme, "➡", "Open this path", true).clicked() {
+            if theme::icon_button(ui, theme, theme::icons::GO, "Open this path", true).clicked() {
                 let path = explorer.path_edit.clone();
                 explorer.navigate(ssh, path);
                 activity = true;
@@ -1969,7 +2068,7 @@ impl RustTermApp {
                     );
                     let name_rect = egui::Rect::from_min_max(
                         egui::pos2(rect.left() + 22.0, rect.top()),
-                        egui::pos2(layout.owner.left() - 2.0, rect.bottom()),
+                        egui::pos2(layout.name.right() - 2.0, rect.bottom()),
                     );
                     paint_cell(
                         ui,
@@ -1979,35 +2078,41 @@ impl RustTermApp {
                         theme.palette.text,
                         egui::Align::Min,
                     );
-                    paint_cell(
-                        ui,
-                        layout.owner.shrink2(egui::vec2(4.0, 0.0)),
-                        format_owner(entry),
-                        font.clone(),
-                        theme.palette.muted,
-                        egui::Align::Min,
-                    );
-                    paint_cell(
-                        ui,
-                        layout.modified.shrink2(egui::vec2(4.0, 0.0)),
-                        &format_timestamp(entry.modified),
-                        font.clone(),
-                        theme.palette.muted,
-                        egui::Align::Min,
-                    );
-                    let size = if entry.is_dir {
-                        "—".to_string()
-                    } else {
-                        format_size(entry.size)
-                    };
-                    paint_cell(
-                        ui,
-                        layout.size.shrink2(egui::vec2(4.0, 0.0)),
-                        &size,
-                        font,
-                        theme.palette.muted,
-                        egui::Align::Max,
-                    );
+                    if layout.modified.width() > 0.0 {
+                        paint_cell(
+                            ui,
+                            layout.modified.shrink2(egui::vec2(4.0, 0.0)),
+                            &format_timestamp(entry.modified),
+                            font.clone(),
+                            theme.palette.muted,
+                            egui::Align::Min,
+                        );
+                    }
+                    if layout.size.width() > 0.0 {
+                        let size = if entry.is_dir {
+                            "—".to_string()
+                        } else {
+                            format_size(entry.size)
+                        };
+                        paint_cell(
+                            ui,
+                            layout.size.shrink2(egui::vec2(4.0, 0.0)),
+                            &size,
+                            font.clone(),
+                            theme.palette.muted,
+                            egui::Align::Max,
+                        );
+                    }
+                    if layout.owner.width() > 0.0 {
+                        paint_cell(
+                            ui,
+                            layout.owner.shrink2(egui::vec2(4.0, 0.0)),
+                            format_owner(entry),
+                            font,
+                            theme.palette.muted,
+                            egui::Align::Min,
+                        );
+                    }
 
                     let mut details = entry.path.clone();
                     if entry.is_dir {
@@ -2385,6 +2490,12 @@ impl RustTermApp {
                         .hint_text("e.g. kate, nvim, /usr/local/bin/editor")
                         .desired_width(ui.available_width()),
                 );
+                ui.add_space(6.0);
+                ui.checkbox(
+                    &mut picker.auto_upload,
+                    "Upload changes automatically when the file is saved",
+                );
+
                 if let Some(err) = &picker.error {
                     ui.add_space(4.0);
                     ui.colored_label(theme.palette.danger, err);
@@ -2748,41 +2859,147 @@ impl eframe::App for RustTermApp {
 #[cfg(test)]
 mod tests {
     use super::{
-        SftpColumns, MIN_MODIFIED_WIDTH, MIN_OWNER_WIDTH, MIN_SIZE_WIDTH, NAME_MIN_WIDTH,
-        NAME_SHARE,
+        sftp_header, SftpColumns, SftpLayout, COLUMN_STEP, MIN_MODIFIED_WIDTH, MIN_OWNER_WIDTH,
+        MIN_SIZE_WIDTH, NAME_MIN_WIDTH,
     };
+    use crate::theme::ThemeId;
 
     #[test]
-    fn wide_panels_keep_all_columns() {
-        let preferred = SftpColumns::default();
-        let fitted = preferred.fitted(600.0);
-        assert_eq!(fitted.owner, preferred.owner);
-        assert_eq!(fitted.modified, preferred.modified);
-        assert_eq!(fitted.size, preferred.size);
-        assert!(fitted.name_width(600.0) >= 600.0 * NAME_SHARE);
+    fn layout_orders_the_columns_left_to_right() {
+        let rect = egui::Rect::from_min_size(egui::pos2(10.0, 0.0), egui::vec2(600.0, 20.0));
+        let layout = SftpLayout::new(rect, SftpColumns::default());
+        assert!((layout.name.left() - 10.0).abs() < 0.01);
+        assert!((layout.name.right() - layout.modified.left()).abs() < 0.01);
+        assert!((layout.modified.right() - layout.size.left()).abs() < 0.01);
+        assert!((layout.size.right() - layout.owner.left()).abs() < 0.01);
+        assert!((layout.owner.right() - rect.right()).abs() < 0.01);
+    }
+
+    /// Paints the real header through egui at several widths, so inverted or
+    /// zero-width cell rects (hidden columns) cannot panic.
+    #[test]
+    fn header_paints_at_every_panel_width() {
+        let theme = ThemeId::Midnight.theme();
+        let mut columns = SftpColumns::default();
+        let ctx = egui::Context::default();
+        for width in [90.0, 160.0, 320.0, 480.0, 720.0] {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let rect =
+                        egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(width, 24.0));
+                    sftp_header(ui, theme, &mut columns, 0, rect, width);
+                });
+            });
+        }
+    }
+
+    /// Column widths in table order: Name, Modified, Size, Owner.
+    fn widths(columns: SftpColumns, total: f32) -> [f32; 4] {
+        columns.fitted(total)
     }
 
     #[test]
-    fn narrow_panels_protect_the_name_and_hide_unreadable_columns() {
-        let preferred = SftpColumns::default();
-        for total in [520.0, 400.0, 320.0, 240.0, 180.0, 120.0] {
-            let fitted = preferred.fitted(total);
-            let name = fitted.name_width(total);
-            let target = (total * NAME_SHARE).max(NAME_MIN_WIDTH).min(total);
+    fn default_layout_gives_the_name_half_the_table() {
+        let w = widths(SftpColumns::default(), 640.0);
+        assert!((w[0] - 320.0).abs() < 0.01, "name {}", w[0]);
+        assert!(w[1] >= MIN_MODIFIED_WIDTH);
+        assert!(w[2] >= MIN_SIZE_WIDTH);
+        assert!(w[3] >= MIN_OWNER_WIDTH);
+        assert!((w.iter().sum::<f32>() - 640.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn proportions_survive_a_panel_resize() {
+        let columns = SftpColumns::default();
+        for total in [400.0, 520.0, 900.0] {
+            let w = widths(columns, total);
             assert!(
-                name >= target - 0.5,
-                "total {total}: name {name} is below {target}"
+                (w[0] - total / 2.0).abs() < 0.5,
+                "total {total}: name {} is not half",
+                w[0]
             );
-            for (width, min) in [
-                (fitted.owner, MIN_OWNER_WIDTH),
-                (fitted.modified, MIN_MODIFIED_WIDTH),
-                (fitted.size, MIN_SIZE_WIDTH),
+        }
+    }
+
+    #[test]
+    fn narrow_panels_hide_metadata_before_the_name() {
+        let columns = SftpColumns::default();
+        // Owner disappears first, then Size, then Modified.
+        let mut expected_visible = [true; 4];
+        for total in [640.0, 420.0, 360.0, 300.0, 240.0, 180.0, 120.0] {
+            let w = widths(columns, total);
+            for (column, min) in [
+                (1, MIN_MODIFIED_WIDTH),
+                (2, MIN_SIZE_WIDTH),
+                (3, MIN_OWNER_WIDTH),
             ] {
                 assert!(
-                    width == 0.0 || width >= min - 0.01,
-                    "total {total}: column width {width} is below {min}"
+                    w[column] == 0.0 || w[column] >= min - 0.01,
+                    "total {total}: column {column} width {} is below {min}",
+                    w[column]
                 );
             }
+            // Hidden columns stay hidden as the panel shrinks, and once hidden
+            // their share goes to the name.
+            for column in 1..4 {
+                if !expected_visible[column] {
+                    assert_eq!(w[column], 0.0, "total {total}: column {column}");
+                }
+                if w[column] == 0.0 {
+                    expected_visible[column] = false;
+                }
+            }
+            assert!(w[0] >= NAME_MIN_WIDTH.min(total));
         }
+    }
+
+    #[test]
+    fn dividers_move_in_fixed_steps() {
+        let total = 600.0;
+        let mut columns = SftpColumns::default();
+        let before = widths(columns, total);
+        // Dragging the Name/Modified divider 23 px right lands on 24 px.
+        columns.drag_divider(total, 1, before[0] + 23.0);
+        let after = widths(columns, total);
+        assert!(
+            (after[0] - before[0] - 24.0).abs() < 0.01,
+            "name moved by {}",
+            after[0] - before[0]
+        );
+        // Every move is a whole step, never an arbitrary pixel.
+        for offset in [137.0, 251.0, 333.0, 401.0] {
+            let mut probe = columns;
+            let prior = widths(probe, total);
+            probe.drag_divider(total, 1, offset);
+            let moved = (widths(probe, total)[0] - prior[0]) / COLUMN_STEP;
+            assert!(
+                (moved - moved.round()).abs() < 0.01,
+                "offset {offset}: moved {moved} steps"
+            );
+        }
+    }
+
+    #[test]
+    fn dividers_stop_at_the_column_minimum() {
+        let total = 600.0;
+        let mut columns = SftpColumns::default();
+        // Drag the Name/Modified divider far right: Modified cannot collapse.
+        columns.drag_divider(total, 1, total);
+        let w = widths(columns, total);
+        assert!(w[1] >= MIN_MODIFIED_WIDTH - 0.01, "modified {}", w[1]);
+        // And far left: the name keeps a readable width.
+        columns.drag_divider(total, 1, 0.0);
+        let w = widths(columns, total);
+        assert!(w[0] >= NAME_MIN_WIDTH - 0.01, "name {}", w[0]);
+    }
+
+    #[test]
+    fn hidden_columns_are_not_draggable() {
+        let total = 300.0;
+        let mut columns = SftpColumns::default();
+        let before = widths(columns, total);
+        // The Owner column is hidden at this width, so its divider is a no-op.
+        columns.drag_divider(total, 3, 120.0);
+        assert_eq!(widths(columns, total), before);
     }
 }

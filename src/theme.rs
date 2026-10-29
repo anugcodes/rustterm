@@ -499,6 +499,33 @@ pub fn icon_toggle(
     ui.add(button).on_hover_text(tooltip)
 }
 
+/// Glyphs used for toolbar and dialog icons.
+///
+/// Every one must exist in the bundled fonts. epaint draws a hollow box for a
+/// missing glyph, which is exactly what `↑` (U+2191) and `⇧` (U+21E7) did on
+/// the SFTP toolbar. `icons_have_glyphs` fails the build if a new icon is not
+/// covered, so this cannot regress silently.
+pub mod icons {
+    pub const HOME: &str = "🏠";
+    pub const UP: &str = "📂";
+    pub const REFRESH: &str = "🔄";
+    pub const NEW_FOLDER: &str = "➕";
+    pub const COPY: &str = "🗐";
+    pub const PASTE: &str = "📋";
+    pub const DOWNLOAD: &str = "📥";
+    pub const UPLOAD: &str = "📤";
+    pub const HIDDEN: &str = "👁";
+    pub const RECONNECT: &str = "⚡";
+    pub const GO: &str = "➡";
+    pub const CLOSE: &str = "×";
+
+    /// Every icon above, for the font-coverage test.
+    #[cfg(test)]
+    pub const ALL: &[&str] = &[
+        HOME, UP, REFRESH, NEW_FOLDER, COPY, PASTE, DOWNLOAD, UPLOAD, HIDDEN, RECONNECT, GO, CLOSE,
+    ];
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -519,5 +546,21 @@ mod tests {
             assert_ne!(theme.palette.text, theme.palette.surface);
             assert_ne!(theme.palette.panel, theme.palette.surface);
         }
+    }
+
+    /// A missing glyph renders as a hollow box, not an icon. Check the whole
+    /// toolbar against the fonts egui actually loads.
+    #[test]
+    fn icons_have_glyphs() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            let font = egui::FontId::proportional(13.0);
+            let missing: Vec<&str> = icons::ALL
+                .iter()
+                .copied()
+                .filter(|icon| !ctx.fonts(|fonts| fonts.has_glyphs(&font, icon)))
+                .collect();
+            assert!(missing.is_empty(), "icons without a glyph: {missing:?}");
+        });
     }
 }

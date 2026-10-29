@@ -481,6 +481,32 @@ impl SshSession {
         Some(rx)
     }
 
+    /// Upload one local file to exactly `remote`.
+    ///
+    /// The editor download keeps a randomised local name, so its destination
+    /// cannot be derived from the file name the way [`Self::sftp_upload`]
+    /// does. Used by the "upload on save" watcher.
+    pub fn sftp_upload_one(
+        &self,
+        local: PathBuf,
+        remote: String,
+        progress: Arc<TransferProgress>,
+    ) -> Option<std_mpsc::Receiver<Result<String, String>>> {
+        let (reply, rx) = std_mpsc::channel();
+        self.sftp_tx
+            .send(SftpRequest {
+                action: SftpAction::UploadOne {
+                    local,
+                    remote,
+                    progress,
+                    reply,
+                },
+                wake: self.wake.clone(),
+            })
+            .ok()?;
+        Some(rx)
+    }
+
     /// Upload local files or folders into `remote_dir`.
     ///
     /// Progress is reported through `progress`; the reply arrives on the usual
@@ -1079,6 +1105,12 @@ enum SftpAction {
         progress: Arc<TransferProgress>,
         reply: std_mpsc::Sender<Result<String, String>>,
     },
+    UploadOne {
+        local: PathBuf,
+        remote: String,
+        progress: Arc<TransferProgress>,
+        reply: std_mpsc::Sender<Result<String, String>>,
+    },
     Download {
         /// Known entries from the listing, so the first request is not delayed
         /// by a redundant `stat` on a slow network mount.
@@ -1166,6 +1198,25 @@ impl SftpAction {
                     .map_err(normalise_transfer_error);
                 let _ = reply.send(result);
             }
+            SftpAction::UploadOne {
+                local,
+                remote,
+                progress,
+                reply,
+            } => {
+                // A single-file upload (editor save) has no pre-walk to size
+                // it, so read the length here for a real progress bar. This
+                // must not move into `upload_file`, which also serves folder
+                // uploads that already set an aggregate total.
+                if let Ok(metadata) = tokio::fs::metadata(&local).await {
+                    progress.set_total_bytes(metadata.len());
+                }
+                let result = upload_file(client, &local, &remote, &progress)
+                    .await
+                    .map(|()| remote)
+                    .map_err(normalise_transfer_error);
+                let _ = reply.send(result);
+            }
             SftpAction::Download {
                 remote,
                 local_dir,
@@ -1202,6 +1253,7 @@ impl SftpAction {
             | SftpAction::Copy { reply, .. }
             | SftpAction::Fetch { reply, .. }
             | SftpAction::Upload { reply, .. }
+            | SftpAction::UploadOne { reply, .. }
             | SftpAction::Download { reply, .. } => send(reply),
         }
     }

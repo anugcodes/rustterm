@@ -35,10 +35,10 @@ open protocols.
 | 1 | SSH terminal with colors, resize, copy/paste | **Done** — colors, resize, scrollback, bg colors, copy/paste. |
 | 2 | Multiple SSH sessions in tabs | **Done** |
 | 3 | Saved profiles, key auth, keyring passwords | **Done** — profiles, optional keyring passwords, key file + ssh-agent auth. |
-| 4 | SFTP side panel following the active session's path | **Done** — per-tab browsing, fixed-width Name/Modified/Size/Owner table (panel is a viewport, sortable headers, 24 px stepped columns), selection details strip, reconnect, right-click menu, hidden toggle, copy/paste, status bar with history. Follows the shell's `cd` via OSC 7 (default on, paused by manual navigation), with ‹/› history, symlink following and a reversible shell hook for bash/zsh. |
+| 4 | SFTP side panel following the active session's path | **Done** — per-tab browsing, fixed-width Name/Modified/Size/Owner table (panel is a viewport, sortable headers, 24 px stepped columns), selection details strip, reconnect, right-click menu, hidden toggle, copy/paste, status bar with history. Follows the shell's `cd` via OSC 7 (default on, paused by manual navigation), with ‹/› history behind a setting, symlink following and a reversible shell hook for bash, zsh, csh and tcsh. |
 | 5 | Upload/download, drag & drop, progress | **Done** — file/folder upload and download with a serialised queue, conflict prompts, `.part`+rename safety, progress bar, drag & drop and cancel. |
 | 6 | Open remote file in local editor, auto-upload on save | **Done** — the **Open with…** picker downloads to a temp file, launches `$VISUAL`/`$EDITOR`, Zed, gvim, VS Code, the desktop default or a custom command, and uploads the file back to the same remote path on every save (opt-out checkbox). Saves arrive as debounced inotify events; unsynced copies survive a drop for 15 minutes and sync on reconnect or in a new session for the same profile. |
-| 7 | GUI tools via X11 forwarding (`ssh -X`) or VNC-over-tunnel | Not started |
+| 7 | GUI tools via X11 forwarding (`ssh -X`) or VNC-over-tunnel | **Done** — untrusted X11 forwarding requested before the shell starts, server-opened channels proxied to the local X server with the local `xauth` cookie; VNC detected over `/bin/sh` (`ss`/`netstat`), tunneled with `direct-tcpip` to an external viewer, with an editable fallback address and Ask/Prefer behaviour. Both are off by default. |
 
 ---
 
@@ -352,10 +352,17 @@ the far right of the tab bar.
   double-click or via **Follow link**: folder targets are listed through the link
   path, file targets open the picker.
 - **Shell hook**: after 3 s without an OSC 7 report the panel offers
-  **Enable now** (types an idempotent one-liner into the live shell) and
-  **Install…** (a consent modal that writes a marked block to `~/.bashrc` or
-  `~/.zshrc`, with a one-time `.rustterm-backup`, and can remove it again).
-  bash and zsh only.
+  **Enable now** (detects the login shell, then types an idempotent one-liner
+  into the live shell) and **Install…** (a consent modal that writes a marked
+  block to `~/.bashrc`, `~/.zshrc`, `~/.cshrc`, or an existing `~/.tcshrc`, with
+  a one-time `.rustterm-backup`, and can remove it again). csh/tcsh use
+  `cwdcmd`; the dialog warns that the single alias is replaced and offers
+  **Copy snippet**.
+- **Settings and remote display**: a dedicated **Settings** window holds the
+  theme, the optional Back/Forward buttons, and X11/VNC (both off by default).
+  X11 is requested before the shell and proxied to the local server; VNC is
+  detected in the server's shell, tunneled with `direct-tcpip`, and opened in an
+  external viewer. See `USAGE.md` §19.
 - **File transfers**: uploads and downloads stream in 64 KiB chunks over the
   existing `SftpSession`, write to a sibling `.part` file and rename only on
   success. One transfer runs per session and the rest queue; byte/file progress
@@ -371,8 +378,9 @@ hashed `known_hosts` and missing `~/.ssh`.
 - **Synchronous connect (F1)**: `SshSession::connect()` blocks through TCP + host
 key + auth. The connect form correctly reports failures (dead `Ok(Err)` branch is
 gone).
-- **Explicit disconnect (F2)**: Tab close and the Disconnect button both signal
-`disconnect_tx` so the SSH connection does not leak.
+- **Explicit disconnect (F2)**: Tab close signals `disconnect_tx` so the SSH
+connection does not leak; the permanent Disconnect button was removed because it
+duplicated that action.
 - **Real font metrics (F5)**: Measures the advance width by shaping `"MMMMMMMMMM"`
 and dividing by 10, so the cursor aligns exactly with the shaped text.
 - **Batched rendering (F4)**: One `LayoutJob` per row (not per character).
@@ -420,7 +428,7 @@ Severity: **A** = must fix before MVP, **B** = should fix, **C** = polish/later.
 **F22** — Application cursor keys (DECCKM) ✅ `?1h` is honoured: cursor/Home/End are sent as SS3 (`ESC O A`) when the app enables application cursor keys, CSI (`ESC [ A`) otherwise. ncurses programs (htop, vim, mc) enable `?1h` via terminfo's `smkx` and only understand the SS3 form — sending CSI makes them see a stray Escape plus literal characters.
 **F27** — Uploads silently killed the SSH connection ✅ Root cause was **not** the SFTP crate: `russh 0.45.0`'s outbound zlib compressor reserves `input.len() + 10` bytes and breaks its loop as soon as `flate2` returns `Ok`, even when the output buffer filled and input remains. The tail of an incompressible packet (PDF, PNG, zip) was dropped, the server saw a malformed packet and closed the transport; the SFTP request map then produced `sender dropped`. Text uploads only worked because their compressed output fit. Upstream fixed this later (russh ≥ 0.65, test `incompressible_packets_round_trip`). The client now advertises `compression::NONE` (unit test `client_config_advertises_no_compression`). **Tech debt:** once russh is upgraded, compression can be re-enabled; `russh-sftp 3.0.1` is transport-agnostic, so the upgrade is independent of the SFTP crate. Dead sessions are now detected via `SshSession::is_alive()` and the tab shows a **Connection lost** banner + **Close tab**.
 **F28** — Connect attempts could not be cancelled and failures were cryptic ✅ `SshSession::connect` takes an optional `oneshot` cancellation receiver and races it against the handshake, so the ✕ next to *Connecting to…* (or `Esc`) drops the socket immediately. A 15 s TCP connect timeout turns blackholed hosts into *Connection timed out*. `ssh::explain_connect_error` maps the chained library text to *Login failed*, *Connection refused*, *Host not found*, etc., and is unit-tested. Keepalives (15 s, max 3) plus the wake-on-exit `SessionGuard` make a wedged session surface as the dead-tab banner instead of freezing silently. SFTP request timeout raised to 30 s for slow network mounts; a timeout now offers **Reconnect SFTP**.
-**F26** — SFTP panel did not follow the shell's `cd` ✅ `terminal.rs` scans the VTE byte stream for OSC 7 itself (alacritty_terminal 0.24 exposes no `current_directory`), tolerating split chunks, BEL/ST and percent-encoded UTF-8. The explorer follows by default, remembers the latest report, and pauses on any manual move until the **Follow** chip is clicked. Navigation is recorded in a 100-entry, browser-style history that commits only after a successful listing; `NavIntent` distinguishes user/follow/refresh/back/forward. Symlinks are followed on demand (folder → listing through the link path, file → picker). A hint offers a per-session one-liner or a reversible marked block in `~/.bashrc`/`~/.zshrc` (backup kept, remove supported); bash and zsh only.
+**F26** — SFTP panel did not follow the shell's `cd` ✅ `terminal.rs` scans the VTE byte stream for OSC 7 itself (alacritty_terminal 0.24 exposes no `current_directory`), tolerating split chunks, BEL/ST and percent-encoded UTF-8. The explorer follows by default, remembers the latest report, and pauses on any manual move until the **Follow** chip is clicked. Navigation is recorded in a 100-entry, browser-style history (shown only when enabled in Settings) that commits only after a successful listing; `NavIntent` distinguishes user/follow/refresh/back/forward. Symlinks are followed on demand (folder → listing through the link path, file → picker). A hint offers a per-session one-liner or a reversible marked block in `~/.bashrc`/`~/.zshrc`/`~/.cshrc`/`~/.tcshrc` (backup kept, remove supported); bash, zsh, csh and tcsh are supported.
 
 ### Active
 
@@ -627,7 +635,8 @@ through a `pty` so the byte sequences can be injected.
 5. **Key auth** ✅ done — key files + ssh-agent before the password.
 6. **SFTP panel** ✅ done — `russh-sftp` on a second channel, per-tab directory
    listing, Home/Up/Refresh + editable path. Shell-cwd following (F26) is done:
-   OSC 7 scanner, 100-entry history, symlink following and a bash/zsh hook.
+   OSC 7 scanner, 100-entry history (behind a setting), symlink following and a
+   bash/zsh/csh/tcsh hook.
 7. **SFTP panel follow-ups** ✅ done.
    - **Reconnect** — toolbar and unavailable-state buttons reopen only the
      SFTP channel/subsystem on the existing SSH connection. The terminal is never
@@ -668,8 +677,15 @@ through a `pty` so the byte sequences can be injected.
 
 10. Edit-and-auto-upload. ✅ done — inotify folder watch, debounced saves,
     15-minute reconnect journal.
-11. X11 forwarding via system `ssh -X`.
-12. VNC over SSH tunnel + external viewer.
+11. X11 forwarding via system `ssh -X`. ✅ done — `x11-req` before the shell,
+    server channels proxied with the local `xauth` cookie; status in the bottom
+    bar.
+12. VNC over SSH tunnel + external viewer. ✅ done — probe via
+    `ss`/`netstat` through `/bin/sh`, `direct-tcpip` tunnel, viewer discovery,
+    editable fallback and Ask/Prefer X11/VNC.
+13. Settings window, decluttered tab/SFTP/terminal bars. ✅ done — theme moved
+    into the window, Back/Forward behind a setting, SFTP `×` and the terminal
+    Disconnect bar removed.
 
 ---
 

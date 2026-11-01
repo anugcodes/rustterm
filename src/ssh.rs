@@ -31,13 +31,14 @@ use russh::client::{self, Handle, Msg as ClientMsg};
 // `PublicKey` lives in the `key` submodule; the known-hosts helpers are at the
 // `keys` root. `HashAlg` does not exist in russh 0.45 — `fingerprint()` takes
 // no arguments and hashes with SHA-256 internally.
+use crate::x11;
 use russh::keys::agent::client::AgentClient;
 use russh::keys::key::PublicKey;
 use russh::keys::{check_known_hosts, known_host_keys, learn_known_hosts, load_secret_key};
 use russh::{compression, Channel, ChannelMsg};
 use russh_sftp::client::{Config as SftpConfig, SftpSession};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, OnceCell};
 
 /// Wakes the egui thread when asynchronous SSH data arrives.
@@ -57,6 +58,8 @@ pub struct SshConfig {
     pub key_path: String,
     /// Offer identities from `$SSH_AUTH_SOCK`.
     pub use_agent: bool,
+    /// Request X11 forwarding before the shell starts (`ssh -X`).
+    pub x11: bool,
 }
 
 /// A pending trust-on-first-use decision.
@@ -104,12 +107,16 @@ pub struct SshSession {
     /// Requests for the SFTP subsystem. Always present, even when SFTP failed
     /// to open, so callers can still get a meaningful error.
     sftp_tx: mpsc::UnboundedSender<SftpRequest>,
+    /// Remote-display requests (VNC probe/tunnel).
+    display_tx: mpsc::UnboundedSender<DisplayRequest>,
     /// Why SFTP could not be opened, if it could not.
     sftp_unavailable: Option<String>,
     /// Wakes egui when an SFTP reply is ready.
     wake: Option<Wake>,
     /// False once the session thread has finished (normal exit or panic).
     alive: Arc<AtomicBool>,
+    /// X11 forwarding state, shared with the handler and the proxies.
+    x11: Arc<X11Shared>,
 }
 
 /// Flips `alive` to false and wakes egui when the session thread ends,
@@ -128,7 +135,133 @@ impl Drop for SessionGuard {
     }
 }
 
-/// One entry returned by the remote directory listing.
+/// A VNC server reachable from the SSH server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VncTarget {
+    pub host: String,
+    pub port: u16,
+}
+
+impl VncTarget {
+    pub fn label(&self) -> String {
+        format!("{}:{}", self.host, self.port)
+    }
+
+    /// Parse the editable setting: `host`, `host:port`, or blank.
+    pub fn parse(value: &str, default_port: u16) -> Option<Self> {
+        let value = value.trim();
+        if value.is_empty() {
+            return None;
+        }
+        match value.rsplit_once(':') {
+            Some((host, port)) if !host.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => {
+                Some(Self {
+                    host: host.to_string(),
+                    port: port.parse().ok().filter(|port| *port > 0)?,
+                })
+            }
+            _ => Some(Self {
+                host: value.to_string(),
+                port: default_port,
+            }),
+        }
+    }
+}
+
+/// What the UI asks the session thread to do for remote display.
+enum DisplayAction {
+    /// Find a VNC listener in the server's shell.
+    Probe {
+        reply: std_mpsc::Sender<Result<Option<VncTarget>, String>>,
+    },
+    /// Open a local TCP listener tunneled to `host:port`.
+    Open {
+        host: String,
+        port: u16,
+        reply: std_mpsc::Sender<Result<u16, String>>,
+    },
+    /// Close the tunnel and its listener.
+    Close { reply: std_mpsc::Sender<()> },
+}
+
+struct DisplayRequest {
+    action: DisplayAction,
+    wake: Option<Wake>,
+}
+
+/// Live state of X11 forwarding for one session.
+#[derive(Debug, Clone, Default)]
+pub struct X11Status {
+    /// The server accepted the `x11-req`; remote programs get a `DISPLAY`.
+    pub forwarding: bool,
+    /// Server-opened X11 channels currently being proxied.
+    pub active: usize,
+    /// Why forwarding could not start, or the last proxy failure.
+    pub error: Option<String>,
+}
+
+/// State shared between the session thread, the SSH handler and the UI.
+#[derive(Default)]
+struct X11Shared {
+    config: Mutex<Option<x11::X11Config>>,
+    status: Mutex<X11Status>,
+    wake: Option<Wake>,
+}
+
+impl X11Shared {
+    fn new(wake: Option<Wake>) -> Arc<Self> {
+        Arc::new(Self {
+            wake,
+            ..Self::default()
+        })
+    }
+
+    fn config(&self) -> Option<x11::X11Config> {
+        self.config.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    fn set_config(&self, config: Option<x11::X11Config>) {
+        if let Ok(mut slot) = self.config.lock() {
+            *slot = config;
+        }
+    }
+
+    fn status(&self) -> X11Status {
+        self.status.lock().map(|s| s.clone()).unwrap_or_default()
+    }
+
+    fn mark_forwarding(&self, forwarding: bool, error: Option<String>) {
+        if let Ok(mut status) = self.status.lock() {
+            status.forwarding = forwarding;
+            status.error = error;
+        }
+        self.wake_now();
+    }
+
+    fn opened(&self) {
+        if let Ok(mut status) = self.status.lock() {
+            status.active += 1;
+        }
+        self.wake_now();
+    }
+
+    fn closed(&self, error: Option<String>) {
+        if let Ok(mut status) = self.status.lock() {
+            status.active = status.active.saturating_sub(1);
+            if error.is_some() {
+                status.error = error;
+            }
+        }
+        self.wake_now();
+    }
+
+    fn wake_now(&self) {
+        if let Some(wake) = &self.wake {
+            wake();
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RemoteEntry {
     pub name: String,
@@ -160,6 +293,74 @@ pub struct HookResult {
     pub backup: Option<String>,
     /// False when the file already had the requested state.
     pub changed: bool,
+}
+
+/// Shell families that can report their working directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellKind {
+    Bash,
+    Zsh,
+    Csh,
+    Tcsh,
+}
+
+impl ShellKind {
+    /// Map a login-shell path to a supported family.
+    pub fn from_shell(shell: &str) -> Option<Self> {
+        match shell.rsplit('/').next().unwrap_or(shell) {
+            "bash" => Some(Self::Bash),
+            "zsh" => Some(Self::Zsh),
+            "csh" => Some(Self::Csh),
+            "tcsh" => Some(Self::Tcsh),
+            _ => None,
+        }
+    }
+
+    /// Family name for messages.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Bash => "bash",
+            Self::Zsh => "zsh",
+            Self::Csh => "csh",
+            Self::Tcsh => "tcsh",
+        }
+    }
+
+    /// Whether installing replaces the single `cwdcmd` alias csh provides.
+    pub fn shares_cwdcmd(self) -> bool {
+        matches!(self, Self::Csh | Self::Tcsh)
+    }
+
+    /// One-line version typed into a live shell by **Enable now**.
+    ///
+    /// It must stay on a single line so Enter runs the whole thing, and it is
+    /// idempotent so a second click does not stack entries.
+    pub fn session_hook(self) -> &'static str {
+        match self {
+            Self::Bash | Self::Zsh => concat!(
+                "__rustterm_cwd() { printf '\\033]7;file://%s%s\\033\\\\' \"${HOSTNAME:-localhost}\" \"$PWD\"; }; ",
+                "if [ -n \"$ZSH_VERSION\" ]; then ",
+                "eval 'typeset -ga precmd_functions; (( ${precmd_functions[(Ie)__rustterm_cwd]} )) || precmd_functions+=(__rustterm_cwd)'; ",
+                "else case \"$PROMPT_COMMAND\" in *__rustterm_cwd*) ;; *) ",
+                "PROMPT_COMMAND=\"__rustterm_cwd${PROMPT_COMMAND:+;$PROMPT_COMMAND}\" ;; esac; fi"
+            ),
+            // csh has no prompt hook: `cwdcmd` runs after every directory
+            // change. `$?prompt` keeps this quiet in non-interactive shells.
+            Self::Csh | Self::Tcsh => {
+                r#"if ( $?prompt ) alias cwdcmd 'printf "\033]7;file://%s\a" "$cwd"'; printf "\033]7;file://%s\a" "$cwd""#
+            }
+        }
+    }
+}
+
+/// Login shell plus the startup file that will receive the hook.
+#[derive(Debug, Clone)]
+pub struct ShellInfo {
+    /// Shell path from `/etc/passwd`, as reported.
+    pub shell: String,
+    pub kind: ShellKind,
+    /// Startup file the hook belongs in, chosen on the server.
+    pub rc: String,
 }
 
 /// How a transfer treats a destination that already exists.
@@ -286,15 +487,16 @@ impl SshSession {
                 Some(cancel) => {
                     tokio::select! {
                         _ = cancel => Err(anyhow!("connection cancelled")),
-                        result = connect_and_auth(&config, prompt_tx) => result,
+                        result = connect_and_auth(&config, prompt_tx, wake.clone()) => result,
                     }
                 }
-                None => connect_and_auth(&config, prompt_tx).await,
+                None => connect_and_auth(&config, prompt_tx, wake.clone()).await,
             }
         };
-        let (session, channel, sftp, sftp_error) = rt.block_on(attempt).with_context(|| {
-            format!("connect to {}@{}:{}", config.user, config.host, config.port)
-        })?;
+        let (session, channel, sftp, sftp_error, x11) =
+            rt.block_on(attempt).with_context(|| {
+                format!("connect to {}@{}:{}", config.user, config.host, config.port)
+            })?;
         // The handle is shared so the SFTP reconnect task can open a channel
         // while the session loop keeps ownership for terminal I/O.
         let session = Arc::new(session);
@@ -304,6 +506,7 @@ impl SshSession {
         let (disconnect_tx, disconnect_rx) = mpsc::unbounded_channel::<()>();
         let (output_tx, output_rx) = std_mpsc::channel::<Vec<u8>>();
         let (sftp_tx, sftp_rx) = mpsc::unbounded_channel::<SftpRequest>();
+        let (display_tx, display_rx) = mpsc::unbounded_channel::<DisplayRequest>();
         let session_wake = wake.clone();
         let alive = Arc::new(AtomicBool::new(true));
         let alive_thread = Arc::clone(&alive);
@@ -325,6 +528,7 @@ impl SshSession {
                         resize_rx,
                         disconnect_rx,
                         sftp_rx,
+                        display_rx,
                         output_tx,
                     },
                     wake,
@@ -338,9 +542,11 @@ impl SshSession {
             disconnect_tx,
             output_rx,
             sftp_tx,
+            display_tx,
             sftp_unavailable: sftp_error,
             wake: session_wake,
             alive,
+            x11,
         })
     }
 
@@ -354,6 +560,53 @@ impl SshSession {
     /// Why SFTP is unavailable for this connection, if it is.
     pub fn sftp_unavailable(&self) -> Option<&str> {
         self.sftp_unavailable.as_deref()
+    }
+
+    /// Current X11 forwarding state (accepted, active channels, last error).
+    pub fn x11_status(&self) -> X11Status {
+        self.x11.status()
+    }
+
+    /// Look for a VNC listener on the server.
+    pub fn vnc_probe(&self) -> Option<std_mpsc::Receiver<Result<Option<VncTarget>, String>>> {
+        let (reply, rx) = std_mpsc::channel();
+        self.display_tx
+            .send(DisplayRequest {
+                action: DisplayAction::Probe { reply },
+                wake: self.wake.clone(),
+            })
+            .ok()?;
+        Some(rx)
+    }
+
+    /// Open a local listener whose connections are tunneled to `target`.
+    ///
+    /// Returns the local port the viewer should connect to.
+    pub fn vnc_open(&self, target: &VncTarget) -> Option<std_mpsc::Receiver<Result<u16, String>>> {
+        let (reply, rx) = std_mpsc::channel();
+        self.display_tx
+            .send(DisplayRequest {
+                action: DisplayAction::Open {
+                    host: target.host.clone(),
+                    port: target.port,
+                    reply,
+                },
+                wake: self.wake.clone(),
+            })
+            .ok()?;
+        Some(rx)
+    }
+
+    /// Stop the VNC tunnel and close its local listener.
+    pub fn vnc_close(&self) -> Option<std_mpsc::Receiver<()>> {
+        let (reply, rx) = std_mpsc::channel();
+        self.display_tx
+            .send(DisplayRequest {
+                action: DisplayAction::Close { reply },
+                wake: self.wake.clone(),
+            })
+            .ok()?;
+        Some(rx)
     }
 
     /// Ask the SFTP subsystem for the session's home directory (`.`).
@@ -429,7 +682,7 @@ impl SshSession {
     pub fn sftp_login_shell(
         &self,
         user: &str,
-    ) -> Option<std_mpsc::Receiver<Result<String, String>>> {
+    ) -> Option<std_mpsc::Receiver<Result<ShellInfo, String>>> {
         let (reply, rx) = std_mpsc::channel();
         self.sftp_tx
             .send(SftpRequest {
@@ -447,12 +700,18 @@ impl SshSession {
     pub fn sftp_edit_hook(
         &self,
         rc: String,
+        kind: ShellKind,
         install: bool,
     ) -> Option<std_mpsc::Receiver<Result<HookResult, String>>> {
         let (reply, rx) = std_mpsc::channel();
         self.sftp_tx
             .send(SftpRequest {
-                action: SftpAction::EditHook { rc, install, reply },
+                action: SftpAction::EditHook {
+                    rc,
+                    kind,
+                    install,
+                    reply,
+                },
                 wake: self.wake.clone(),
             })
             .ok()?;
@@ -704,11 +963,13 @@ fn client_config() -> client::Config {
 async fn connect_and_auth(
     config: &SshConfig,
     prompt_tx: Option<std_mpsc::Sender<HostKeyPrompt>>,
+    wake: Option<Wake>,
 ) -> Result<(
     Handle<ClientHandler>,
     Channel<ClientMsg>,
     Option<SftpSession>,
     Option<String>,
+    Arc<X11Shared>,
 )> {
     /// How long to wait for the TCP handshake before reporting a timeout.
     /// The OS default can be over two minutes on an unreachable host.
@@ -720,11 +981,13 @@ async fn connect_and_auth(
     // The handler is moved into `client::connect`, so the reason for a
     // rejection has to live outside it.
     let failure: Arc<Mutex<Option<HostKeyFailure>>> = Arc::new(Mutex::new(None));
+    let x11 = X11Shared::new(wake.clone());
     let handler = ClientHandler {
         host: config.host.clone(),
         port: config.port,
         prompt_tx,
         failure: Arc::clone(&failure),
+        x11: Arc::clone(&x11),
     };
 
     // `client::connect` does not set TCP_NODELAY. On high-latency links Nagle's
@@ -776,7 +1039,7 @@ async fn connect_and_auth(
 
     authenticate(&mut session, config).await?;
 
-    let channel = session
+    let mut channel = session
         .channel_open_session()
         .await
         .context("failed to open SSH channel")?;
@@ -785,6 +1048,12 @@ async fn connect_and_auth(
         .request_pty(false, "xterm-256color", 80, 24, 0, 0, &[])
         .await
         .context("PTY request rejected")?;
+    // X11 has to be requested before the shell starts: sshd only puts
+    // `DISPLAY` in the child environment when the request is known at spawn
+    // time. A refusal is reported in the bottom bar, never fatal.
+    if config.x11 {
+        request_x11_forwarding(&mut channel, &x11).await;
+    }
     channel
         .request_shell(false)
         .await
@@ -800,7 +1069,68 @@ async fn connect_and_auth(
         }
     };
 
-    Ok((session, channel, sftp, sftp_error))
+    Ok((session, channel, sftp, sftp_error, x11))
+}
+
+/// Ask the server to forward X11, then wait for its answer.
+///
+/// The cookie sent here is generated locally; sshd installs it for the remote
+/// display. The real local cookie is looked up separately when a channel is
+/// proxied, so the remote side never sees it.
+async fn request_x11_forwarding(channel: &mut Channel<ClientMsg>, shared: &X11Shared) {
+    const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
+
+    let Some(display) = x11::local_display() else {
+        shared.mark_forwarding(
+            false,
+            Some("no local X display (DISPLAY is unset)".to_string()),
+        );
+        return;
+    };
+    let auth = x11::local_auth(&display);
+    let cookie = x11::random_cookie_hex();
+    if let Err(err) = channel
+        .request_x11(true, false, "MIT-MAGIC-COOKIE-1", cookie, display.screen)
+        .await
+    {
+        shared.mark_forwarding(
+            false,
+            Some(format!("could not request X11 forwarding: {err}")),
+        );
+        return;
+    }
+
+    let reply = tokio::time::timeout(REPLY_TIMEOUT, async {
+        loop {
+            match channel.wait().await {
+                Some(ChannelMsg::Success) => return Ok(()),
+                Some(ChannelMsg::Failure) => {
+                    return Err(
+                        "the server refused X11 forwarding (check X11Forwarding on the server)"
+                            .to_string(),
+                    )
+                }
+                Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
+                    return Err("the session closed while asking for X11 forwarding".to_string())
+                }
+                // Nothing else is expected before the shell starts.
+                Some(_) => continue,
+            }
+        }
+    })
+    .await;
+
+    match reply {
+        Ok(Ok(())) => {
+            shared.set_config(Some(x11::X11Config { display, auth }));
+            shared.mark_forwarding(true, None);
+        }
+        Ok(Err(err)) => shared.mark_forwarding(false, Some(err)),
+        Err(_) => shared.mark_forwarding(
+            false,
+            Some("timed out waiting for the server to confirm X11 forwarding".to_string()),
+        ),
+    }
 }
 
 /// Open a second channel and start the SFTP client handshake (`SSH_FXP_INIT`).
@@ -979,6 +1309,7 @@ struct SessionIo {
     resize_rx: mpsc::UnboundedReceiver<(u16, u16)>,
     disconnect_rx: mpsc::UnboundedReceiver<()>,
     sftp_rx: mpsc::UnboundedReceiver<SftpRequest>,
+    display_rx: mpsc::UnboundedReceiver<DisplayRequest>,
     output_tx: std_mpsc::Sender<Vec<u8>>,
 }
 
@@ -994,12 +1325,15 @@ async fn run_session(
         mut resize_rx,
         mut disconnect_rx,
         mut sftp_rx,
+        mut display_rx,
         output_tx,
     } = io;
     // The client is behind a lock so a reconnect can swap in a fresh SFTP
     // channel while the terminal loop keeps running. Locks are only held long
     // enough to clone the `Arc`; all I/O happens without one.
     let sftp: SharedSftp = Arc::new(Mutex::new(sftp.map(|sftp| Arc::new(SftpClient::new(sftp)))));
+    // At most one VNC listener per session; stopping aborts its accept loop.
+    let mut vnc: Option<tokio::task::JoinHandle<()>> = None;
 
     loop {
         tokio::select! {
@@ -1060,6 +1394,48 @@ async fn run_session(
                     }
                 }
             }
+            maybe_display = display_rx.recv() => {
+                let Some(request) = maybe_display else { break };
+                let DisplayRequest { action, wake: request_wake } = request;
+                match action {
+                    DisplayAction::Probe { reply } => {
+                        let session = Arc::clone(&session);
+                        tokio::spawn(async move {
+                            let result = probe_vnc(&session).await;
+                            let _ = reply.send(result);
+                            if let Some(wake) = request_wake {
+                                wake();
+                            }
+                        });
+                    }
+                    DisplayAction::Open { host, port, reply } => {
+                        if let Some(tunnel) = vnc.take() {
+                            tunnel.abort();
+                        }
+                        match open_vnc(&session, &host, port).await {
+                            Ok((local_port, handle)) => {
+                                vnc = Some(handle);
+                                let _ = reply.send(Ok(local_port));
+                            }
+                            Err(err) => {
+                                let _ = reply.send(Err(err));
+                            }
+                        }
+                        if let Some(wake) = request_wake {
+                            wake();
+                        }
+                    }
+                    DisplayAction::Close { reply } => {
+                        if let Some(tunnel) = vnc.take() {
+                            tunnel.abort();
+                        }
+                        let _ = reply.send(());
+                        if let Some(wake) = request_wake {
+                            wake();
+                        }
+                    }
+                }
+            }
             msg = channel.wait() => {
                 match msg {
                     Some(ChannelMsg::Data { data }) => {
@@ -1085,6 +1461,11 @@ async fn run_session(
         }
     }
 
+    // Stop the VNC listener; aborting drops the task and its socket.
+    if let Some(tunnel) = vnc.take() {
+        tunnel.abort();
+    }
+
     // Best-effort graceful disconnect on every exit path.
     let _ = session
         .disconnect(russh::Disconnect::ByApplication, "", "en")
@@ -1092,6 +1473,120 @@ async fn run_session(
     if let Some(wake) = wake.as_ref() {
         wake();
     }
+}
+
+/// Look for a VNC listener on the server.
+async fn probe_vnc(session: &Handle<ClientHandler>) -> Result<Option<VncTarget>, String> {
+    let channel = session
+        .channel_open_session()
+        .await
+        .map_err(|err| format!("could not open a probe channel: {err}"))?;
+    // Force /bin/sh: the login shell may be csh and the server may be old.
+    // Both `ss` and `netstat` are tried; `-an` is the last resort for a very
+    // old netstat without `-l`.
+    channel
+        .exec(
+            true,
+            "/bin/sh -c 'ss -ltn 2>/dev/null || netstat -ltn 2>/dev/null || netstat -an 2>/dev/null'",
+        )
+        .await
+        .map_err(|err| format!("could not run the VNC probe: {err}"))?;
+    let mut stream = channel.into_stream();
+    let mut output = Vec::new();
+    let read = tokio::time::timeout(Duration::from_secs(8), stream.read_to_end(&mut output)).await;
+    match read {
+        Ok(Ok(_)) => {}
+        Ok(Err(err)) => return Err(format!("VNC probe failed: {err}")),
+        // A slow or silent server is not fatal: parse what arrived.
+        Err(_) => {}
+    }
+    Ok(parse_vnc_listener(&String::from_utf8_lossy(&output)))
+}
+
+/// Find a listening VNC port (5900-5999) in `ss`/`netstat` output.
+fn parse_vnc_listener(text: &str) -> Option<VncTarget> {
+    let mut found: Option<VncTarget> = None;
+    for line in text.lines() {
+        // `-ltn` output is already filtered; `-an` mixes states.
+        if line.contains("ESTABLISHED") || line.contains("TIME_WAIT") {
+            continue;
+        }
+        let Some(target) = vnc_target_from_line(line) else {
+            continue;
+        };
+        // Prefer display :0, otherwise keep the lowest display found.
+        if found.as_ref().is_none_or(|best| target.port < best.port) {
+            found = Some(target);
+        }
+    }
+    found
+}
+
+fn vnc_target_from_line(line: &str) -> Option<VncTarget> {
+    for token in line.split_whitespace() {
+        let Some(colon) = token.rfind(':') else {
+            continue;
+        };
+        let digits: String = token[colon + 1..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        let Ok(port) = digits.parse::<u16>() else {
+            continue;
+        };
+        if !(5900..=5999).contains(&port) {
+            continue;
+        }
+        let mut host = token[..colon].trim_matches(['[', ']']);
+        if let Some((base, _)) = host.split_once('%') {
+            host = base;
+        }
+        let host = if host.is_empty() || matches!(host, "*" | "0.0.0.0" | "::") {
+            "127.0.0.1".to_string()
+        } else {
+            host.to_string()
+        };
+        return Some(VncTarget { host, port });
+    }
+    None
+}
+
+/// Open a loopback listener; each accepted viewer connection gets its own
+/// `direct-tcpip` channel to the VNC server.
+async fn open_vnc(
+    session: &Arc<Handle<ClientHandler>>,
+    host: &str,
+    port: u16,
+) -> Result<(u16, tokio::task::JoinHandle<()>), String> {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .map_err(|err| format!("could not open a local VNC port: {err}"))?;
+    let local = listener
+        .local_addr()
+        .map_err(|err| format!("could not read the local VNC port: {err}"))?
+        .port();
+    let session = Arc::clone(session);
+    let host = host.to_string();
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let session = Arc::clone(&session);
+            let host = host.clone();
+            tokio::spawn(async move {
+                let Ok(channel) = session
+                    .channel_open_direct_tcpip(host, port as u32, "127.0.0.1", 0)
+                    .await
+                else {
+                    return;
+                };
+                let mut stream = channel.into_stream();
+                let _ = tokio::io::copy_bidirectional(&mut socket, &mut stream).await;
+            });
+        }
+    });
+    Ok((local, handle))
 }
 
 /// A request from the UI to the SFTP task.
@@ -1158,11 +1653,12 @@ enum SftpAction {
     /// Look up the account's login shell in `/etc/passwd`.
     LoginShell {
         user: String,
-        reply: std_mpsc::Sender<Result<String, String>>,
+        reply: std_mpsc::Sender<Result<ShellInfo, String>>,
     },
     /// Install or remove the directory-tracking block in `rc`.
     EditHook {
         rc: String,
+        kind: ShellKind,
         install: bool,
         reply: std_mpsc::Sender<Result<HookResult, String>>,
     },
@@ -1236,8 +1732,13 @@ impl SftpAction {
                 let result = login_shell(&client.session, &user).await;
                 let _ = reply.send(result);
             }
-            SftpAction::EditHook { rc, install, reply } => {
-                let result = edit_hook(client, &rc, install).await;
+            SftpAction::EditHook {
+                rc,
+                kind,
+                install,
+                reply,
+            } => {
+                let result = edit_hook(client, &rc, kind, install).await;
                 let _ = reply.send(result);
             }
             SftpAction::Rename { from, to, reply } => {
@@ -1447,16 +1948,29 @@ async fn resolve_link(client: &SftpClient, path: &str) -> Result<ResolvedLink, S
 }
 
 /// Read the seventh field of the account's `/etc/passwd` line.
-async fn login_shell(sftp: &SftpSession, user: &str) -> Result<String, String> {
+async fn login_shell(sftp: &SftpSession, user: &str) -> Result<ShellInfo, String> {
     let contents = sftp
         .read("/etc/passwd")
         .await
         .map_err(|err| format!("could not read /etc/passwd: {err}"))?;
-    shell_from_passwd(&String::from_utf8_lossy(&contents), user)
-        .ok_or_else(|| format!("/etc/passwd has no login shell for '{user}'"))
+    let (shell, home) = shell_from_passwd(&String::from_utf8_lossy(&contents), user)
+        .ok_or_else(|| format!("/etc/passwd has no login shell for '{user}'"))?;
+    let kind = ShellKind::from_shell(&shell).ok_or_else(|| {
+        format!(
+            "Directory tracking is not available for {shell}; bash, zsh, csh and tcsh are supported"
+        )
+    })?;
+    let home = if home.is_empty() {
+        remote_home(sftp).await?
+    } else {
+        home
+    };
+    let rc = hook_rc_path(sftp, &home, kind).await;
+    Ok(ShellInfo { shell, kind, rc })
 }
 
-fn shell_from_passwd(contents: &str, user: &str) -> Option<String> {
+/// Returns the login shell path and the account's home directory.
+fn shell_from_passwd(contents: &str, user: &str) -> Option<(String, String)> {
     contents.lines().find_map(|line| {
         let fields: Vec<&str> = line.split(':').collect();
         if fields.len() < 7 || fields[0].trim() != user {
@@ -1466,9 +1980,39 @@ fn shell_from_passwd(contents: &str, user: &str) -> Option<String> {
         if shell.is_empty() {
             None
         } else {
-            Some(shell.to_string())
+            Some((shell.to_string(), fields[5].trim().to_string()))
         }
     })
+}
+
+/// Pick the startup file the shell actually reads.
+///
+/// tcsh reads `~/.tcshrc` *instead of* `~/.cshrc` when it exists, so an
+/// existing file wins; otherwise the block goes in `~/.cshrc`, which both
+/// shells read.
+async fn hook_rc_path(sftp: &SftpSession, home: &str, kind: ShellKind) -> String {
+    let file = match kind {
+        ShellKind::Bash => ".bashrc",
+        ShellKind::Zsh => ".zshrc",
+        ShellKind::Csh => ".cshrc",
+        ShellKind::Tcsh => {
+            let tcshrc = join_home(home, ".tcshrc");
+            if sftp.metadata(&tcshrc).await.is_ok() {
+                ".tcshrc"
+            } else {
+                ".cshrc"
+            }
+        }
+    };
+    join_home(home, file)
+}
+
+fn join_home(dir: &str, name: &str) -> String {
+    if dir.ends_with('/') {
+        format!("{dir}{name}")
+    } else {
+        format!("{dir}/{name}")
+    }
 }
 
 /// Markers around the shell hook, so re-installing replaces the old block and
@@ -1479,7 +2023,7 @@ pub(crate) const HOOK_END: &str = "# <<< rustterm directory tracking <<<";
 /// Emits OSC 7 before every prompt. Works in bash (`PROMPT_COMMAND`) and zsh
 /// (`precmd_functions`); the zsh-only syntax sits inside `eval`, so bash never
 /// has to parse it.
-const HOOK_BODY: &str = r#"__rustterm_cwd() {
+const BASH_HOOK_BODY: &str = r#"__rustterm_cwd() {
     printf '\033]7;file://%s%s\033\\' "${HOSTNAME:-localhost}" "$PWD"
 }
 if [ -n "$ZSH_VERSION" ]; then
@@ -1491,8 +2035,23 @@ else
     esac
 fi"#;
 
-fn hook_block() -> String {
-    format!("{HOOK_BEGIN}\n{HOOK_BODY}\n{HOOK_END}\n")
+/// csh/tcsh run `cwdcmd` after every directory change. Both shells only have
+/// one such alias, so installing replaces whatever was there; the dialog
+/// warns about that and the file backup keeps the original.
+const CSH_HOOK_BODY: &str = r#"if ( $?prompt ) then
+    alias cwdcmd 'printf "\033]7;file://%s\a" "$cwd"'
+    printf "\033]7;file://%s\a" "$cwd"
+endif"#;
+
+fn hook_body(kind: ShellKind) -> &'static str {
+    match kind {
+        ShellKind::Bash | ShellKind::Zsh => BASH_HOOK_BODY,
+        ShellKind::Csh | ShellKind::Tcsh => CSH_HOOK_BODY,
+    }
+}
+
+fn hook_block(kind: ShellKind) -> String {
+    format!("{HOOK_BEGIN}\n{}\n{HOOK_END}\n", hook_body(kind))
 }
 
 /// Remove a marked block, leaving the rest of the file untouched.
@@ -1527,7 +2086,7 @@ fn strip_hook_block(text: &str) -> String {
 }
 
 /// Replace any existing block with a fresh one, so installing twice is safe.
-fn install_hook_block(text: &str) -> String {
+fn install_hook_block(text: &str, kind: ShellKind) -> String {
     let mut base = strip_hook_block(text);
     if !base.is_empty() {
         if !base.ends_with('\n') {
@@ -1536,12 +2095,17 @@ fn install_hook_block(text: &str) -> String {
         // One blank line between the user's file and our block.
         base.push('\n');
     }
-    base.push_str(&hook_block());
+    base.push_str(&hook_block(kind));
     base
 }
 
 /// Add or remove the hook in `rc`, creating a one-time backup before writing.
-async fn edit_hook(client: &SftpClient, rc: &str, install: bool) -> Result<HookResult, String> {
+async fn edit_hook(
+    client: &SftpClient,
+    rc: &str,
+    kind: ShellKind,
+    install: bool,
+) -> Result<HookResult, String> {
     let existing = match client.session.metadata(rc).await {
         Ok(_) => client
             .session
@@ -1553,7 +2117,7 @@ async fn edit_hook(client: &SftpClient, rc: &str, install: bool) -> Result<HookR
     };
     let text = String::from_utf8_lossy(&existing).into_owned();
     let next = if install {
-        install_hook_block(&text)
+        install_hook_block(&text, kind)
     } else {
         strip_hook_block(&text)
     };
@@ -2474,6 +3038,7 @@ struct ClientHandler {
     /// than silently trusted.
     prompt_tx: Option<std_mpsc::Sender<HostKeyPrompt>>,
     failure: Arc<Mutex<Option<HostKeyFailure>>>,
+    x11: Arc<X11Shared>,
 }
 
 impl ClientHandler {
@@ -2574,6 +3139,27 @@ impl client::Handler for ClientHandler {
                 Ok(false)
             }
         }
+    }
+
+    /// Proxy one server-opened X11 channel to the local X server.
+    async fn server_channel_open_x11(
+        &mut self,
+        channel: Channel<ClientMsg>,
+        _originator_address: &str,
+        _originator_port: u32,
+        _session: &mut russh::client::Session,
+    ) -> std::result::Result<(), Self::Error> {
+        let Some(config) = self.x11.config() else {
+            // Forwarding was not granted; drop the channel.
+            return Ok(());
+        };
+        let shared = Arc::clone(&self.x11);
+        tokio::spawn(async move {
+            shared.opened();
+            let error = x11::proxy(channel, config.display, config.auth).await.err();
+            shared.closed(error);
+        });
+        Ok(())
     }
 }
 
@@ -2804,12 +3390,12 @@ empty:x:1001:1001::/home/empty:
 short:x:1
 ";
         assert_eq!(
-            shell_from_passwd(passwd, "alice").as_deref(),
-            Some("/usr/bin/zsh")
+            shell_from_passwd(passwd, "alice"),
+            Some(("/usr/bin/zsh".into(), "/home/alice".into()))
         );
         assert_eq!(
-            shell_from_passwd(passwd, "root").as_deref(),
-            Some("/bin/bash")
+            shell_from_passwd(passwd, "root"),
+            Some(("/bin/bash".into(), "/root".into()))
         );
         assert_eq!(shell_from_passwd(passwd, "empty"), None);
         assert_eq!(shell_from_passwd(passwd, "short"), None);
@@ -2817,16 +3403,30 @@ short:x:1
     }
 
     #[test]
+    fn recognises_supported_shells() {
+        assert_eq!(ShellKind::from_shell("/bin/bash"), Some(ShellKind::Bash));
+        assert_eq!(ShellKind::from_shell("/usr/bin/zsh"), Some(ShellKind::Zsh));
+        assert_eq!(ShellKind::from_shell("/bin/csh"), Some(ShellKind::Csh));
+        assert_eq!(
+            ShellKind::from_shell("/usr/local/bin/tcsh"),
+            Some(ShellKind::Tcsh)
+        );
+        assert_eq!(ShellKind::from_shell("/bin/sh"), None);
+        assert_eq!(ShellKind::from_shell("/bin/fish"), None);
+        assert_eq!(ShellKind::from_shell("bash"), Some(ShellKind::Bash));
+    }
+
+    #[test]
     fn hook_block_installs_once_and_can_be_removed() {
         let original = "# my bashrc\nexport EDITOR=vim\n";
-        let installed = install_hook_block(original);
+        let installed = install_hook_block(original, ShellKind::Bash);
         assert!(installed.starts_with(original.trim_end()));
         assert_eq!(installed.matches(HOOK_BEGIN).count(), 1);
         assert_eq!(installed.matches(HOOK_END).count(), 1);
         assert!(installed.contains("__rustterm_cwd"));
 
         // Installing again must replace, not append a second block.
-        let again = install_hook_block(&installed);
+        let again = install_hook_block(&installed, ShellKind::Bash);
         assert_eq!(again, installed);
         assert_eq!(again.matches(HOOK_BEGIN).count(), 1);
 
@@ -2836,8 +3436,27 @@ short:x:1
     }
 
     #[test]
+    fn csh_block_installs_once_and_can_be_removed() {
+        let original = "set prompt = '\\% '\n";
+        let installed = install_hook_block(original, ShellKind::Csh);
+        assert!(installed.starts_with(original.trim_end()));
+        assert!(installed.contains("alias cwdcmd"));
+        assert_eq!(installed.matches(HOOK_BEGIN).count(), 1);
+
+        // tcsh and csh share the body; installing twice is still idempotent.
+        let again = install_hook_block(&installed, ShellKind::Tcsh);
+        assert_eq!(again, installed);
+
+        assert_eq!(strip_hook_block(&installed), original);
+    }
+
+    #[test]
     fn hook_block_creates_a_file_that_only_has_the_block() {
-        let installed = install_hook_block("");
+        let installed = install_hook_block("", ShellKind::Bash);
+        assert!(installed.starts_with(HOOK_BEGIN));
+        assert_eq!(strip_hook_block(&installed), "");
+
+        let installed = install_hook_block("", ShellKind::Csh);
         assert!(installed.starts_with(HOOK_BEGIN));
         assert_eq!(strip_hook_block(&installed), "");
     }
@@ -2851,6 +3470,20 @@ short:x:1
     }
 
     #[test]
+    fn session_hooks_are_one_line() {
+        for kind in [
+            ShellKind::Bash,
+            ShellKind::Zsh,
+            ShellKind::Csh,
+            ShellKind::Tcsh,
+        ] {
+            let line = kind.session_hook();
+            assert!(!line.contains('\n'), "{} hook spans lines", kind.name());
+            assert!(!line.is_empty());
+        }
+    }
+
+    #[test]
     fn hook_snippet_is_valid_bash() {
         let bash = std::path::Path::new("/bin/bash");
         if !bash.exists() {
@@ -2859,7 +3492,7 @@ short:x:1
         let dir = std::env::temp_dir().join(format!("rustterm-hook-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let script = dir.join("hook.sh");
-        std::fs::write(&script, format!("{HOOK_BODY}\n")).unwrap();
+        std::fs::write(&script, format!("{}\n", hook_body(ShellKind::Bash))).unwrap();
         let status = std::process::Command::new(bash)
             .arg("-n")
             .arg(&script)
@@ -2867,5 +3500,89 @@ short:x:1
             .unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         assert!(status.success(), "bash -n rejected the hook snippet");
+    }
+
+    #[test]
+    fn csh_snippets_parse_when_csh_is_installed() {
+        // csh is not on every machine; the live server check covers those.
+        let Some(csh) = ["/bin/csh", "/usr/bin/csh", "/bin/tcsh", "/usr/bin/tcsh"]
+            .into_iter()
+            .find(|path| std::path::Path::new(path).exists())
+        else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("rustterm-csh-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("hook.csh");
+        std::fs::write(&script, format!("{}\n", hook_body(ShellKind::Csh))).unwrap();
+        let status = std::process::Command::new(csh)
+            .arg("-f")
+            .arg(&script)
+            .status()
+            .unwrap();
+        let one_line = std::process::Command::new(csh)
+            .arg("-f")
+            .arg("-c")
+            .arg(ShellKind::Csh.session_hook())
+            .status()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(status.success(), "{csh} rejected the hook snippet");
+        assert!(one_line.success(), "{csh} rejected the session hook");
+    }
+
+    #[test]
+    fn finds_the_lowest_vnc_listener() {
+        let ss = "\
+State  Recv-Q Send-Q Local Address:Port Peer Address:Port
+LISTEN 0      5      0.0.0.0:5901       0.0.0.0:*
+LISTEN 0      5      [::]:5903          [::]:*
+LISTEN 0      5      0.0.0.0:22          0.0.0.0:*
+";
+        assert_eq!(
+            parse_vnc_listener(ss),
+            Some(VncTarget {
+                host: "127.0.0.1".into(),
+                port: 5901
+            })
+        );
+
+        // A very old netstat prints the state as the last column.
+        let netstat =
+            "tcp 0 0 127.0.0.1:5902 0.0.0.0:* LISTEN\ntcp 0 0 1.2.3.4:5904 0.0.0.0:* LISTEN\n";
+        assert_eq!(
+            parse_vnc_listener(netstat),
+            Some(VncTarget {
+                host: "127.0.0.1".into(),
+                port: 5902
+            })
+        );
+
+        // Non-VNC ports and established connections are ignored.
+        assert_eq!(parse_vnc_listener("LISTEN 0 5 0.0.0.0:22 0.0.0.0:*"), None);
+        assert_eq!(
+            parse_vnc_listener("tcp 0 0 127.0.0.1:59234 127.0.0.1:5000 ESTABLISHED"),
+            None
+        );
+        assert_eq!(parse_vnc_listener(""), None);
+    }
+
+    #[test]
+    fn vnc_setting_accepts_host_and_host_port_forms() {
+        assert_eq!(VncTarget::parse("", 5900), None);
+        assert_eq!(
+            VncTarget::parse("vnc.example", 5900),
+            Some(VncTarget {
+                host: "vnc.example".into(),
+                port: 5900
+            })
+        );
+        assert_eq!(
+            VncTarget::parse("10.0.0.4:5903", 5900),
+            Some(VncTarget {
+                host: "10.0.0.4".into(),
+                port: 5903
+            })
+        );
     }
 }

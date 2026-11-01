@@ -15,7 +15,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use notify::Watcher as _;
 
 use crate::ssh::{
-    ConflictPolicy, HookResult, RemoteEntry, ResolvedLink, SshSession, TransferProgress, Wake,
+    ConflictPolicy, HookResult, RemoteEntry, ResolvedLink, ShellInfo, ShellKind, SshSession,
+    TransferProgress, Wake,
 };
 
 /// Where a remote file should be opened locally.
@@ -524,19 +525,6 @@ const HOOK_HINT_DELAY: Duration = Duration::from_secs(3);
 /// Upper bound on each history stack.
 const HISTORY_LIMIT: usize = 100;
 
-/// One-line version of the hook, typed into a live shell by **Enable now**.
-///
-/// It must stay on a single line so Enter runs the whole thing, and it is
-/// idempotent so a second click does not stack `PROMPT_COMMAND` entries. The
-/// zsh-only expression sits inside `eval` so bash never has to parse it.
-const SESSION_HOOK: &str = concat!(
-    "__rustterm_cwd() { printf '\\033]7;file://%s%s\\033\\\\' \"${HOSTNAME:-localhost}\" \"$PWD\"; }; ",
-    "if [ -n \"$ZSH_VERSION\" ]; then ",
-    "eval 'typeset -ga precmd_functions; (( ${precmd_functions[(Ie)__rustterm_cwd]} )) || precmd_functions+=(__rustterm_cwd)'; ",
-    "else case \"$PROMPT_COMMAND\" in *__rustterm_cwd*) ;; *) ",
-    "PROMPT_COMMAND=\"__rustterm_cwd${PROMPT_COMMAND:+;$PROMPT_COMMAND}\" ;; esac; fi"
-);
-
 /// Why a listing was started. History is committed only when the reply
 /// succeeds, so a failed navigation cannot corrupt the stacks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -638,6 +626,17 @@ pub struct HookPrompt {
     pub path: String,
     /// Login shell that selected it.
     pub shell: String,
+    /// Family deciding the block body and the `cwdcmd` warning.
+    pub kind: ShellKind,
+}
+
+/// What to do once the login shell is known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HookAction {
+    /// Type the one-liner into the running shell.
+    EnableNow,
+    /// Offer to write the marked block into a startup file.
+    Install,
 }
 
 /// State for the SFTP side panel.
@@ -667,11 +666,11 @@ pub struct SftpExplorer {
     user: String,
     /// Resolved remote home directory, used to build startup-file paths.
     home: Option<String>,
-    /// Login shell from `/etc/passwd`.
-    login_shell: Option<String>,
-    /// Set when the install dialog was requested but the shell was still being
+    /// Login shell from `/etc/passwd`, with the startup file it reads.
+    login_shell: Option<ShellInfo>,
+    /// Set when a hook action was requested but the shell was still being
     /// detected.
-    hook_requested: bool,
+    pending_hook: Option<HookAction>,
     /// Set when the hint was dismissed for this session.
     hook_hint_dismissed: bool,
     /// When the panel was created, so the hint waits for the first prompt.
@@ -738,7 +737,7 @@ enum Job {
         rx: std_mpsc::Receiver<Result<ResolvedLink, String>>,
     },
     /// Login-shell lookup for the install dialog.
-    Shell(std_mpsc::Receiver<Result<String, String>>),
+    Shell(std_mpsc::Receiver<Result<ShellInfo, String>>),
     /// Install/remove the startup-file hook.
     Hook {
         install: bool,
@@ -928,18 +927,22 @@ impl SftpExplorer {
                 }
             },
             Job::Shell(rx) => match rx.try_recv() {
-                Ok(Ok(shell)) => {
-                    self.login_shell = Some(shell.clone());
-                    if self.hook_requested {
-                        self.hook_requested = false;
-                        self.open_hook_prompt();
-                    } else {
-                        self.status.info(format!("Login shell: {shell}"));
+                Ok(Ok(info)) => {
+                    let name = info.shell.clone();
+                    self.login_shell = Some(info);
+                    match self.pending_hook.take() {
+                        Some(HookAction::Install) => {
+                            self.open_hook_prompt();
+                        }
+                        Some(HookAction::EnableNow) => {
+                            self.send_session_hook(ssh);
+                        }
+                        None => self.status.info(format!("Login shell: {name}")),
                     }
                     true
                 }
                 Ok(Err(err)) => {
-                    self.hook_requested = false;
+                    self.pending_hook = None;
                     self.status.error(err);
                     true
                 }
@@ -2054,52 +2057,53 @@ impl SftpExplorer {
 
     /// Ask for the login shell, then open the install dialog.
     pub fn begin_hook_prompt(&mut self, ssh: &SshSession) -> bool {
+        self.request_shell(ssh, HookAction::Install)
+    }
+
+    /// Type the tracking snippet into the running shell.
+    ///
+    /// The shell is detected first when unknown, because csh/tcsh need a
+    /// different snippet than bash/zsh.
+    pub fn begin_session_hook(&mut self, ssh: &SshSession) -> bool {
+        self.request_shell(ssh, HookAction::EnableNow)
+    }
+
+    fn request_shell(&mut self, ssh: &SshSession, action: HookAction) -> bool {
         if self.unavailable.is_some() {
             return false;
+        }
+        if self.login_shell.is_some() {
+            return match action {
+                HookAction::Install => self.open_hook_prompt(),
+                HookAction::EnableNow => self.send_session_hook(ssh),
+            };
         }
         // Same single-job slot as a listing: do not drop its reply.
         if self.loading {
             self.status.info("Wait for the current listing to finish");
             return false;
         }
-        if self.login_shell.is_none() {
-            match ssh.sftp_login_shell(&self.user) {
-                Some(rx) => {
-                    self.hook_requested = true;
-                    self.pending = Some(Job::Shell(rx));
-                    self.status.info("Detecting your login shell…");
-                }
-                None => self.mark_unavailable(ssh),
+        self.pending_hook = Some(action);
+        match ssh.sftp_login_shell(&self.user) {
+            Some(rx) => {
+                self.pending = Some(Job::Shell(rx));
+                self.status.info("Detecting your login shell…");
             }
-            return true;
+            None => self.mark_unavailable(ssh),
         }
-        self.open_hook_prompt();
         true
     }
 
     fn open_hook_prompt(&mut self) -> bool {
-        let Some(shell) = self.login_shell.clone() else {
+        let Some(info) = self.login_shell.clone() else {
             return false;
         };
-        let Some(path) = self.rc_path(&shell) else {
-            self.status.error(format!(
-                "Directory tracking is not available for {shell}; bash and zsh are supported"
-            ));
-            return true;
-        };
-        self.hook_prompt = Some(HookPrompt { path, shell });
+        self.hook_prompt = Some(HookPrompt {
+            path: info.rc,
+            shell: info.shell,
+            kind: info.kind,
+        });
         true
-    }
-
-    fn rc_path(&self, shell: &str) -> Option<String> {
-        let name = shell.rsplit('/').next().unwrap_or(shell);
-        let file = match name {
-            "bash" => ".bashrc",
-            "zsh" => ".zshrc",
-            _ => return None,
-        };
-        let home = self.home.as_deref()?;
-        Some(join_path(home, file))
     }
 
     /// Apply the choice from the shell-hook dialog.
@@ -2107,7 +2111,7 @@ impl SftpExplorer {
         let Some(prompt) = self.hook_prompt.take() else {
             return false;
         };
-        match ssh.sftp_edit_hook(prompt.path.clone(), install) {
+        match ssh.sftp_edit_hook(prompt.path.clone(), prompt.kind, install) {
             Some(rx) => {
                 if install {
                     self.status
@@ -2131,11 +2135,16 @@ impl SftpExplorer {
     ///
     /// Only useful at a prompt: the bytes go to whatever owns the terminal.
     pub fn send_session_hook(&mut self, ssh: &SshSession) -> bool {
-        let mut line = String::from(SESSION_HOOK);
+        let Some(kind) = self.login_shell.as_ref().map(|info| info.kind) else {
+            return false;
+        };
+        let mut line = String::from(kind.session_hook());
         line.push('\r');
         if ssh.input_sender().send(line.into_bytes()).is_ok() {
-            self.status
-                .info("Sent directory tracking to the shell — it applies at the next prompt");
+            self.status.info(format!(
+                "Sent {} directory tracking to the shell — it applies at the next prompt",
+                kind.name()
+            ));
             true
         } else {
             self.status
@@ -2575,7 +2584,8 @@ mod tests {
 
     #[test]
     fn session_hook_is_one_line_and_parses_in_bash() {
-        assert!(!SESSION_HOOK.contains('\n'));
+        let hook = ShellKind::Bash.session_hook();
+        assert!(!hook.contains('\n'));
         let bash = Path::new("/bin/bash");
         if !bash.exists() {
             return;
@@ -2583,10 +2593,10 @@ mod tests {
         let status = Command::new(bash)
             .arg("-n")
             .arg("-c")
-            .arg(SESSION_HOOK)
+            .arg(hook)
             .status()
             .unwrap();
-        assert!(status.success(), "bash -n rejected SESSION_HOOK");
+        assert!(status.success(), "bash -n rejected the session hook");
     }
 
     #[test]

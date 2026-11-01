@@ -369,18 +369,6 @@ pub fn menu_item(
     ui.add_enabled(enabled, button)
 }
 
-/// A menu entry with a persistent selected state (theme picker).
-pub fn menu_selectable(
-    ui: &mut egui::Ui,
-    text: impl Into<egui::WidgetText>,
-    selected: bool,
-) -> egui::Response {
-    ui.add_sized(
-        Vec2::new(menu_row_width(ui), MENU_ROW_HEIGHT),
-        egui::SelectableLabel::new(selected, text),
-    )
-}
-
 /// Tinted frame used for warnings and other callouts inside a dialog.
 pub fn callout_frame(theme: &Theme, fill: Color32) -> egui::Frame {
     egui::Frame::none()

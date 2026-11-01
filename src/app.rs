@@ -5,8 +5,8 @@
 //!
 //! `SshSession::connect` blocks through auth, so it runs on a background
 //! thread and the result is polled each frame (handoff flaw F1). Closing a tab
-//! or pressing Disconnect sends on `disconnect_tx` so the SSH connection is
-//! torn down cleanly (handoff flaw F2).
+//! sends on `disconnect_tx` so the SSH connection is torn down cleanly
+//! (handoff flaw F2).
 //!
 //! Host-key verification (handoff flaw F3) runs on that same background thread
 //! and may pause the handshake to ask the user about an unknown host. The
@@ -29,12 +29,14 @@ use eframe::egui;
 use crate::input;
 use crate::secrets;
 use crate::sessions::{SessionProfile, SessionStore};
-use crate::settings::Settings;
+use crate::settings::{DisplayPref, Settings};
 use crate::sftp::{
     command_available, editor_program, format_age, format_owner, format_size, format_timestamp,
     EditJournal, EditorChoice, SftpDialogKind, SftpExplorer, StatusKind,
 };
-use crate::ssh::{ConflictPolicy, HostKeyPrompt, RemoteEntry, SshConfig, SshSession, Wake};
+use crate::ssh::{
+    ConflictPolicy, HostKeyPrompt, RemoteEntry, SshConfig, SshSession, VncTarget, Wake,
+};
 use crate::terminal::{TermAction, TerminalView};
 use crate::theme::{self, Theme, ThemeId};
 
@@ -837,8 +839,10 @@ pub struct RustTermApp {
     status: StatusMessage,
     /// Whether the SFTP side panel is shown for connected sessions.
     show_sftp: bool,
-    /// Selected application theme.
-    theme: ThemeId,
+    /// Persisted preferences: theme, panel history and remote display.
+    settings: Settings,
+    /// Whether the Settings window is open.
+    settings_open: bool,
 }
 
 /// One line of user feedback below the connect form.
@@ -858,11 +862,48 @@ struct ActiveSession {
     sftp_columns: SftpColumns,
     /// Sort order of the file table.
     sftp_sort: SftpSort,
+    /// Remote-display state (X11 status is read from `ssh`; VNC is here).
+    display: DisplayUi,
     /// Set once so the terminal takes focus on first appearance.
     focus_requested: bool,
     /// Set when the session thread exits; the tab then shows a closed banner
     /// instead of a stale, unresponsive terminal.
     connection_lost: bool,
+}
+
+/// Which remote-display path the user chose for this session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DisplayChoice {
+    X11,
+    Vnc,
+}
+
+/// Per-session VNC probe/tunnel state shown in the bottom bar.
+#[derive(Default)]
+struct DisplayUi {
+    /// The Ask preference is showing its small chooser.
+    ask: bool,
+    /// A probe or tunnel request is in flight.
+    busy: bool,
+    probe: Option<std_mpsc::Receiver<Result<Option<VncTarget>, String>>>,
+    open: Option<std_mpsc::Receiver<Result<u16, String>>>,
+    /// Local loopback port the external viewer connects to.
+    tunnel_port: Option<u16>,
+    /// VNC server the tunnel points at.
+    target: Option<VncTarget>,
+    message: Option<String>,
+    /// External viewer process, kept so Stop can close it.
+    viewer: Option<std::process::Child>,
+}
+
+impl Drop for DisplayUi {
+    fn drop(&mut self) {
+        // Closing the tab or the app must not leave an orphaned viewer.
+        if let Some(mut child) = self.viewer.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 struct ConnectingState {
@@ -928,7 +969,8 @@ impl Default for RustTermApp {
             save_as_profile: false,
             status,
             show_sftp: true,
-            theme: settings.theme,
+            settings,
+            settings_open: false,
         }
     }
 }
@@ -936,7 +978,7 @@ impl Default for RustTermApp {
 impl RustTermApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let app = Self::default();
-        theme::apply(&cc.egui_ctx, app.theme.theme());
+        theme::apply(&cc.egui_ctx, app.settings.theme.theme());
         app
     }
 
@@ -986,6 +1028,7 @@ impl RustTermApp {
             use_key: self.form.use_key,
             key_path: self.form.key_path.trim().to_string(),
             use_agent: self.form.use_agent,
+            x11: self.settings.x11,
         };
         let label = format!("{}@{}:{}", config.user, config.host, config.port);
 
@@ -1091,6 +1134,7 @@ impl RustTermApp {
                     sftp,
                     sftp_columns: SftpColumns::default(),
                     sftp_sort: SftpSort::default(),
+                    display: DisplayUi::default(),
                     focus_requested: false,
                     connection_lost: false,
                 });
@@ -1126,7 +1170,7 @@ impl RustTermApp {
 
         let mut answer: Option<bool> = None;
 
-        let theme = self.theme.theme();
+        let theme = self.settings.theme.theme();
         egui::Window::new("Unknown host key")
             .id(egui::Id::new("host_key_prompt"))
             .title_bar(false)
@@ -1334,7 +1378,7 @@ impl RustTermApp {
     }
 
     fn tabs_ui(&mut self, ui: &mut egui::Ui) {
-        let theme = self.theme.theme();
+        let theme = self.settings.theme.theme();
         let mut switch_to: Option<usize> = None;
         let mut close: Option<usize> = None;
 
@@ -1342,7 +1386,13 @@ impl RustTermApp {
             // The theme picker is drawn first in a right-to-left layout so it
             // stays pinned to the far edge no matter how many tabs are open.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                self.theme_menu_ui(ui);
+                if ui
+                    .selectable_label(self.settings_open, "Settings")
+                    .on_hover_text("Appearance, file panel and remote display")
+                    .clicked()
+                {
+                    self.settings_open = !self.settings_open;
+                }
                 ui.add_space(2.0);
                 ui.separator();
                 ui.add_space(2.0);
@@ -1409,27 +1459,101 @@ impl RustTermApp {
         }
     }
 
-    /// Small theme picker shown at the right edge of the tab bar.
-    fn theme_menu_ui(&mut self, ui: &mut egui::Ui) {
-        let mut chosen: Option<ThemeId> = None;
-        ui.menu_button("🎨 Theme", |ui| {
-            theme::menu_style(ui);
-            for id in ThemeId::ALL {
-                if theme::menu_selectable(ui, id.name(), self.theme == id).clicked() {
-                    chosen = Some(id);
-                    ui.close_menu();
-                }
-            }
-        })
-        .response
-        .on_hover_text("Choose a theme");
+    /// Dedicated Settings window: appearance, file panel and remote display.
+    fn settings_window_ui(&mut self, ctx: &egui::Context) {
+        if !self.settings_open {
+            return;
+        }
+        let theme = self.settings.theme.theme();
+        let before = self.settings.clone();
+        let mut close = false;
 
-        if let Some(id) = chosen {
-            self.theme = id;
-            theme::apply(ui.ctx(), id.theme());
-            let settings = Settings { theme: id };
-            if let Err(err) = settings.save_default() {
-                log::warn!("could not save theme choice: {err}");
+        egui::Window::new("Settings")
+            .id(egui::Id::new("settings_window"))
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .default_size(egui::vec2(theme::DIALOG_WIDTH + 40.0, 0.0))
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .frame(theme::modal_frame(theme))
+            .show(ctx, |ui| {
+                ui.set_width(theme::dialog_inner_width(theme) + 40.0);
+                ui.horizontal(|ui| {
+                    theme::modal_heading(ui, theme, "Settings");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if theme::modal_close(ui) {
+                            close = true;
+                        }
+                    });
+                });
+                ui.add_space(theme.metrics.pad);
+
+                ui.label(egui::RichText::new("Appearance").strong());
+                ui.horizontal_wrapped(|ui| {
+                    for id in ThemeId::ALL {
+                        if ui
+                            .selectable_label(self.settings.theme == id, id.name())
+                            .clicked()
+                        {
+                            self.settings.theme = id;
+                        }
+                    }
+                });
+
+                ui.add_space(theme.metrics.card_padding);
+                ui.separator();
+                ui.add_space(theme.metrics.card_padding);
+
+                ui.label(egui::RichText::new("File panel").strong());
+                ui.checkbox(
+                    &mut self.settings.sftp_history,
+                    "Show Back/Forward history buttons",
+                );
+
+                ui.add_space(theme.metrics.card_padding);
+                ui.separator();
+                ui.add_space(theme.metrics.card_padding);
+
+                ui.label(egui::RichText::new("Remote display").strong());
+                theme::muted(
+                    ui,
+                    theme,
+                    "Both are off by default. A session checks the server before offering either.",
+                );
+                ui.checkbox(&mut self.settings.x11, "X11 forwarding (ssh -X)");
+                ui.checkbox(&mut self.settings.vnc, "VNC over SSH");
+                if self.settings.x11 && self.settings.vnc {
+                    ui.add_space(4.0);
+                    for pref in DisplayPref::ALL {
+                        ui.radio_value(&mut self.settings.display_pref, pref, pref.label());
+                    }
+                    theme::muted(ui, theme, self.settings.display_pref.hint());
+                }
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("VNC server");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.settings.vnc_host)
+                            .hint_text("detect in shell, else host[:port]")
+                            .desired_width(220.0),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("VNC port");
+                    ui.add(egui::DragValue::new(&mut self.settings.vnc_port).range(1..=65535));
+                    theme::muted(ui, theme, "5900 is display :0");
+                });
+            });
+
+        if close {
+            self.settings_open = false;
+        }
+        if self.settings != before {
+            if self.settings.theme != before.theme {
+                theme::apply(ctx, self.settings.theme.theme());
+            }
+            if let Err(err) = self.settings.save_default() {
+                log::warn!("could not save settings: {err}");
             }
         }
     }
@@ -1670,7 +1794,7 @@ impl RustTermApp {
     }
 
     fn new_session_ui(&mut self, ui: &mut egui::Ui) {
-        let theme = self.theme.theme();
+        let theme = self.settings.theme.theme();
         egui::ScrollArea::vertical()
             .id_salt("new_session_scroll")
             .auto_shrink([false, false])
@@ -1901,7 +2025,8 @@ impl RustTermApp {
     /// Returns `true` when the panel started a request, changed selection or was
     /// hidden, so the caller can request another frame.
     fn sftp_ui(&mut self, ui: &mut egui::Ui, index: usize) -> bool {
-        let theme = self.theme.theme();
+        let theme = self.settings.theme.theme();
+        let show_history = self.settings.sftp_history;
         let Some(session) = self.sessions.get_mut(index) else {
             return false;
         };
@@ -1911,7 +2036,6 @@ impl RustTermApp {
         let columns = &mut session.sftp_columns;
         let sort = &mut session.sftp_sort;
         let mut activity = false;
-        let mut hide = false;
 
         // Never let a wide child grow the panel's stored width.
         let content_width = ui.available_width();
@@ -2046,41 +2170,35 @@ impl RustTermApp {
                 explorer.reconnect(ssh);
                 activity = true;
             }
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if theme::icon_button(ui, theme, theme::icons::CLOSE, "Hide the file panel", true)
-                    .clicked()
-                {
-                    hide = true;
-                }
-            });
         });
 
         ui.horizontal(|ui| {
             let control = theme.metrics.control_height;
-            if theme::icon_button(
-                ui,
-                theme,
-                theme::icons::BACK,
-                "Back to the previous folder",
-                explorer.can_back() && !busy,
-            )
-            .clicked()
-            {
-                explorer.back(ssh);
-                activity = true;
-            }
-            if theme::icon_button(
-                ui,
-                theme,
-                theme::icons::FORWARD,
-                "Forward to the next folder",
-                explorer.can_forward() && !busy,
-            )
-            .clicked()
-            {
-                explorer.forward(ssh);
-                activity = true;
+            if show_history {
+                if theme::icon_button(
+                    ui,
+                    theme,
+                    theme::icons::BACK,
+                    "Back to the previous folder",
+                    explorer.can_back() && !busy,
+                )
+                .clicked()
+                {
+                    explorer.back(ssh);
+                    activity = true;
+                }
+                if theme::icon_button(
+                    ui,
+                    theme,
+                    theme::icons::FORWARD,
+                    "Forward to the next folder",
+                    explorer.can_forward() && !busy,
+                )
+                .clicked()
+                {
+                    explorer.forward(ssh);
+                    activity = true;
+                }
             }
 
             // Reserve room for Go and Follow so the field cannot push them
@@ -2150,7 +2268,7 @@ impl RustTermApp {
                             )
                             .clicked()
                         {
-                            explorer.send_session_hook(ssh);
+                            explorer.begin_session_hook(ssh);
                             explorer.dismiss_hook_hint();
                             activity = true;
                         }
@@ -2219,10 +2337,7 @@ impl RustTermApp {
                     activity = true;
                 }
             });
-            if hide {
-                self.show_sftp = false;
-            }
-            return activity || hide;
+            return activity;
         }
 
         let visible_indices = sorted_indices(&explorer.entries, explorer.show_hidden, *sort);
@@ -2576,15 +2691,12 @@ impl RustTermApp {
             }
         }
 
-        if hide {
-            self.show_sftp = false;
-        }
-        activity || hide
+        activity
     }
 
     /// Render rename / new-folder / delete dialogs for the active session.
     fn sftp_dialogs_ui(&mut self, ctx: &egui::Context, index: usize) -> bool {
-        let theme = self.theme.theme();
+        let theme = self.settings.theme.theme();
         let Some(session) = self.sessions.get_mut(index) else {
             return false;
         };
@@ -2731,7 +2843,7 @@ impl RustTermApp {
 
     /// Consent dialog for writing directory tracking into a startup file.
     fn sftp_hook_dialog_ui(&mut self, ctx: &egui::Context, index: usize) -> bool {
-        let theme = self.theme.theme();
+        let theme = self.settings.theme.theme();
         let Some(session) = self.sessions.get_mut(index) else {
             return false;
         };
@@ -2742,6 +2854,7 @@ impl RustTermApp {
 
         let mut install = false;
         let mut remove = false;
+        let mut copy = false;
         let mut cancel = false;
         let control = theme.metrics.control_height;
 
@@ -2785,6 +2898,19 @@ impl RustTermApp {
                     )
                     .wrap(),
                 );
+                if prompt.kind.shares_cwdcmd() {
+                    ui.add_space(6.0);
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(
+                                "csh has a single cwdcmd alias, so Install replaces any alias you already have. The backup keeps the original; Copy snippet lets you add it yourself instead.",
+                            )
+                            .color(theme.palette.warning)
+                            .size(theme.metrics.small_size),
+                        )
+                        .wrap(),
+                    );
+                }
 
                 ui.add_space(theme.metrics.card_padding);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2810,11 +2936,21 @@ impl RustTermApp {
                     {
                         cancel = true;
                     }
+                    if ui
+                        .add(egui::Button::new("Copy snippet").min_size(egui::vec2(108.0, control)))
+                        .on_hover_text("Copy the one-line snippet to add by hand")
+                        .clicked()
+                    {
+                        copy = true;
+                    }
                 });
             });
 
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             cancel = true;
+        }
+        if copy {
+            ctx.copy_text(prompt.kind.session_hook().to_string());
         }
         if cancel {
             return explorer.cancel_hook_prompt();
@@ -2827,7 +2963,7 @@ impl RustTermApp {
 
     /// Render the "Open with…" editor picker for the active session.
     fn editor_picker_ui(&mut self, ctx: &egui::Context, index: usize) -> bool {
-        let theme = self.theme.theme();
+        let theme = self.settings.theme.theme();
         let Some(session) = self.sessions.get_mut(index) else {
             return false;
         };
@@ -2922,7 +3058,7 @@ impl RustTermApp {
 
     /// Ask how to resolve existing destinations before a transfer starts.
     fn sftp_conflict_ui(&mut self, ctx: &egui::Context, index: usize) -> bool {
-        let theme = self.theme.theme();
+        let theme = self.settings.theme.theme();
         let Some(session) = self.sessions.get_mut(index) else {
             return false;
         };
@@ -3031,34 +3167,114 @@ impl RustTermApp {
         ctx: &egui::Context,
         index: usize,
     ) -> (bool, bool) {
+        let settings = self.settings.clone();
+        let theme = settings.theme.theme();
         let session = &mut self.sessions[index];
-        let theme = self.theme.theme();
         let mut activity = false;
+        poll_display(session, &settings);
 
-        // Keep the action row visible without taking height away from the
-        // terminal: it is declared as a bottom panel before the terminal.
+        // The bar is contextual: a lost connection needs a way out, and the
+        // remote-display controls appear only when a display option is on.
         let mut disconnect_clicked = false;
-        egui::TopBottomPanel::bottom(egui::Id::new(("terminal_actions", index)))
-            .exact_height(theme.metrics.control_height + 8.0)
-            .frame(
-                egui::Frame::none()
-                    .fill(theme.palette.bg)
-                    .inner_margin(egui::Margin::symmetric(4.0, 4.0)),
-            )
-            .show_inside(ui, |ui| {
-                if session.connection_lost {
-                    ui.label(
-                        egui::RichText::new("Connection lost — the server closed this session")
-                            .small()
-                            .color(theme.palette.danger),
-                    );
-                    if ui.button("Close tab").clicked() {
-                        disconnect_clicked = true;
-                    }
-                } else if ui.button("Disconnect").clicked() {
-                    disconnect_clicked = true;
-                }
-            });
+        let show_display = settings.x11 || settings.vnc;
+        if session.connection_lost || show_display || session.display.tunnel_port.is_some() {
+            egui::TopBottomPanel::bottom(egui::Id::new(("terminal_actions", index)))
+                .exact_height(theme.metrics.control_height + 8.0)
+                .frame(
+                    egui::Frame::none()
+                        .fill(theme.palette.bg)
+                        .inner_margin(egui::Margin::symmetric(4.0, 4.0)),
+                )
+                .show_inside(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        if session.connection_lost {
+                            ui.label(
+                                egui::RichText::new(
+                                    "Connection lost — the server closed this session",
+                                )
+                                .small()
+                                .color(theme.palette.danger),
+                            );
+                            if ui.button("Close tab").clicked() {
+                                disconnect_clicked = true;
+                            }
+                            return;
+                        }
+
+                        if show_display
+                            && ui
+                                .button("Display")
+                                .on_hover_text("Start or open the remote display")
+                                .clicked()
+                        {
+                            begin_display(session, &settings);
+                        }
+                        if settings.x11 {
+                            let status = session.ssh.x11_status();
+                            if status.forwarding {
+                                let text = match status.active {
+                                    0 => "X11: forwarding".to_string(),
+                                    1 => "X11: 1 connection".to_string(),
+                                    active => format!("X11: {active} connections"),
+                                };
+                                ui.label(
+                                    egui::RichText::new(text)
+                                        .small()
+                                        .color(theme.palette.success),
+                                );
+                            } else if let Some(err) = status.error {
+                                ui.label(
+                                    egui::RichText::new("X11: unavailable")
+                                        .small()
+                                        .color(theme.palette.warning),
+                                )
+                                .on_hover_text(err);
+                            }
+                        }
+                        if let Some(port) = session.display.tunnel_port {
+                            ui.separator();
+                            ui.label(
+                                egui::RichText::new(format!("VNC 127.0.0.1:{port}"))
+                                    .small()
+                                    .color(theme.palette.text),
+                            );
+                            if ui
+                                .small_button("Open")
+                                .on_hover_text("Open the viewer again")
+                                .clicked()
+                            {
+                                launch_vnc_viewer(&mut session.display, port);
+                            }
+                            if ui
+                                .small_button("Copy")
+                                .on_hover_text("Copy the tunnel address")
+                                .clicked()
+                            {
+                                ui.ctx().copy_text(format!("127.0.0.1:{port}"));
+                                session.display.message = Some("Tunnel address copied".to_string());
+                            }
+                            if ui
+                                .small_button("Stop")
+                                .on_hover_text("Close the tunnel and the viewer")
+                                .clicked()
+                            {
+                                stop_vnc(session);
+                            }
+                        }
+                        if session.display.busy {
+                            ui.spinner();
+                        }
+                        if let Some(message) = &session.display.message {
+                            ui.label(
+                                egui::RichText::new(message)
+                                    .small()
+                                    .color(theme.palette.muted),
+                            )
+                            .on_hover_text(message);
+                        }
+                    });
+                });
+        }
 
         let response = session.terminal.ui(ui);
 
@@ -3154,6 +3370,87 @@ impl RustTermApp {
             session.ssh.resize(cols as u16, rows as u16);
         }
 
+        // The "Ask every time" chooser, shown when both options are enabled.
+        if session.display.ask {
+            let status = session.ssh.x11_status();
+            let mut choice: Option<DisplayChoice> = None;
+            let mut cancel = false;
+            let control = theme.metrics.control_height;
+            egui::Window::new("Remote display")
+                .id(egui::Id::new(("display_choice", index)))
+                .title_bar(false)
+                .collapsible(false)
+                .resizable(false)
+                .default_size(theme::dialog_size(theme))
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .frame(theme::modal_frame(theme))
+                .show(ctx, |ui| {
+                    ui.set_width(theme::dialog_inner_width(theme));
+                    ui.horizontal(|ui| {
+                        theme::modal_heading(ui, theme, "Remote display");
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if theme::modal_close(ui) {
+                                cancel = true;
+                            }
+                        });
+                    });
+                    theme::muted(
+                        ui,
+                        theme,
+                        "Both X11 and VNC are enabled. Choose one for this session.",
+                    );
+                    ui.add_space(theme.metrics.pad);
+                    if status.forwarding {
+                        ui.label(
+                            egui::RichText::new("X11 forwarding is active")
+                                .small()
+                                .color(theme.palette.success),
+                        );
+                    } else {
+                        ui.label(
+                            egui::RichText::new("X11 forwarding is not available")
+                                .small()
+                                .color(theme.palette.muted),
+                        );
+                        if let Some(err) = &status.error {
+                            theme::muted(ui, theme, err);
+                        }
+                    }
+                    ui.add_space(theme.metrics.card_padding);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(
+                                theme::primary_button(theme, "VNC")
+                                    .min_size(egui::vec2(92.0, control)),
+                            )
+                            .clicked()
+                        {
+                            choice = Some(DisplayChoice::Vnc);
+                        }
+                        if ui
+                            .add(egui::Button::new("X11").min_size(egui::vec2(92.0, control)))
+                            .clicked()
+                        {
+                            choice = Some(DisplayChoice::X11);
+                        }
+                        if ui
+                            .add(egui::Button::new("Cancel").min_size(egui::vec2(92.0, control)))
+                            .clicked()
+                        {
+                            cancel = true;
+                        }
+                    });
+                });
+            if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+                cancel = true;
+            }
+            if let Some(choice) = choice {
+                apply_display_choice(session, &settings, choice);
+            } else if cancel {
+                session.display.ask = false;
+            }
+        }
+
         (disconnect_clicked, activity)
     }
 }
@@ -3176,7 +3473,7 @@ impl eframe::App for RustTermApp {
         // another session is visible. New output is what wakes egui, so this
         // happens before the UI is painted.
         let mut activity = self.pump_sessions(ctx);
-        let theme = self.theme.theme();
+        let theme = self.settings.theme.theme();
 
         egui::TopBottomPanel::top("tab_bar")
             .frame(theme::panel_frame(theme))
@@ -3227,6 +3524,7 @@ impl eframe::App for RustTermApp {
             });
 
         self.host_key_prompt_ui(ctx);
+        self.settings_window_ui(ctx);
 
         if disconnect_requested {
             if let Some(idx) = self.active.checked_sub(1) {
@@ -3247,6 +3545,214 @@ impl eframe::App for RustTermApp {
             ctx.request_repaint_after(Duration::from_millis(CONNECT_POLL_MS));
         }
     }
+}
+
+/// Process finished VNC probes and tunnel replies for one session.
+fn poll_display(session: &mut ActiveSession, settings: &Settings) {
+    if let Some(rx) = session.display.probe.take() {
+        match rx.try_recv() {
+            Ok(Ok(found)) => {
+                let target = found.unwrap_or_else(|| settings_vnc_target(settings));
+                session.display.target = Some(target.clone());
+                start_vnc_tunnel(session, target);
+            }
+            Ok(Err(err)) => {
+                // Detection failed (an old server without `ss`/`netstat`):
+                // the editable setting still makes VNC work there.
+                let target = settings_vnc_target(settings);
+                session.display.message = Some(format!("{err} — using {}", target.label()));
+                session.display.target = Some(target.clone());
+                start_vnc_tunnel(session, target);
+            }
+            Err(std_mpsc::TryRecvError::Empty) => session.display.probe = Some(rx),
+            Err(std_mpsc::TryRecvError::Disconnected) => {
+                session.display.busy = false;
+                session.display.message =
+                    Some("the SSH session closed while probing for VNC".to_string());
+            }
+        }
+    }
+
+    if let Some(rx) = session.display.open.take() {
+        match rx.try_recv() {
+            Ok(Ok(port)) => {
+                session.display.busy = false;
+                session.display.tunnel_port = Some(port);
+                let opened = launch_vnc_viewer(&mut session.display, port);
+                if !opened && settings.x11 && session.ssh.x11_status().forwarding {
+                    session.display.message = Some(format!(
+                        "No VNC viewer installed — X11 forwarding is active (tunnel: 127.0.0.1:{port})"
+                    ));
+                }
+            }
+            Ok(Err(err)) => {
+                session.display.busy = false;
+                session.display.message = Some(err);
+            }
+            Err(std_mpsc::TryRecvError::Empty) => session.display.open = Some(rx),
+            Err(std_mpsc::TryRecvError::Disconnected) => {
+                session.display.busy = false;
+                session.display.message =
+                    Some("the SSH session closed while opening the VNC tunnel".to_string());
+            }
+        }
+    }
+
+    if session
+        .display
+        .viewer
+        .as_mut()
+        .is_some_and(|child| child.try_wait().ok().flatten().is_some())
+    {
+        session.display.viewer = None;
+    }
+}
+
+fn settings_vnc_target(settings: &Settings) -> VncTarget {
+    VncTarget::parse(&settings.vnc_host, settings.vnc_port).unwrap_or_else(|| VncTarget {
+        host: "127.0.0.1".to_string(),
+        port: settings.vnc_port,
+    })
+}
+
+/// Start a probe, then tunnel to whatever it finds (or to the setting).
+fn start_vnc(session: &mut ActiveSession) {
+    session.display.busy = true;
+    session.display.message = Some("Looking for a VNC server on the SSH host…".to_string());
+    match session.ssh.vnc_probe() {
+        Some(rx) => session.display.probe = Some(rx),
+        None => {
+            session.display.busy = false;
+            session.display.message = Some("the SSH session is no longer available".to_string());
+        }
+    }
+}
+
+fn start_vnc_tunnel(session: &mut ActiveSession, target: VncTarget) {
+    match session.ssh.vnc_open(&target) {
+        Some(rx) => {
+            session.display.busy = true;
+            session.display.open = Some(rx);
+            session.display.message = Some(format!("Opening a tunnel to {}…", target.label()));
+        }
+        None => {
+            session.display.busy = false;
+            session.display.message = Some("the SSH session is no longer available".to_string());
+        }
+    }
+}
+
+/// Start or open the remote display, honouring the Ask/Prefer setting.
+fn begin_display(session: &mut ActiveSession, settings: &Settings) {
+    let choice = match (settings.x11, settings.vnc, settings.display_pref) {
+        (true, true, DisplayPref::Ask) => {
+            session.display.ask = true;
+            return;
+        }
+        (true, true, DisplayPref::X11) => DisplayChoice::X11,
+        (true, true, DisplayPref::Vnc) => DisplayChoice::Vnc,
+        (true, false, _) => DisplayChoice::X11,
+        (false, true, _) => DisplayChoice::Vnc,
+        (false, false, _) => return,
+    };
+    apply_display_choice(session, settings, choice);
+}
+
+fn apply_display_choice(session: &mut ActiveSession, settings: &Settings, choice: DisplayChoice) {
+    session.display.ask = false;
+    match choice {
+        DisplayChoice::X11 => {
+            let status = session.ssh.x11_status();
+            if status.forwarding {
+                session.display.message = Some(match status.active {
+                    0 => "X11 forwarding is active — start a program on the server".to_string(),
+                    1 => "X11 forwarding is active (1 connection)".to_string(),
+                    active => format!("X11 forwarding is active ({active} connections)"),
+                });
+                return;
+            }
+            if settings.vnc {
+                session.display.message = Some(match status.error {
+                    Some(err) => format!("X11 unavailable ({err}) — trying VNC"),
+                    None => "X11 unavailable — trying VNC".to_string(),
+                });
+                start_vnc(session);
+            } else {
+                session.display.message = Some(match status.error {
+                    Some(err) => err,
+                    None => "X11 was not requested for this session — reconnect to enable it"
+                        .to_string(),
+                });
+            }
+        }
+        DisplayChoice::Vnc => {
+            if let Some(port) = session.display.tunnel_port {
+                launch_vnc_viewer(&mut session.display, port);
+            } else {
+                start_vnc(session);
+            }
+        }
+    }
+}
+
+fn stop_vnc(session: &mut ActiveSession) {
+    if let Some(mut child) = session.display.viewer.take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let _ = session.ssh.vnc_close();
+    session.display.tunnel_port = None;
+    session.display.target = None;
+    session.display.busy = false;
+    session.display.message = Some("VNC tunnel closed".to_string());
+}
+
+/// Start an installed external VNC viewer against the tunnel.
+fn launch_vnc_viewer(display: &mut DisplayUi, port: u16) -> bool {
+    let Some((program, args)) = vnc_viewer_command(port) else {
+        display.message = Some(format!(
+            "VNC tunnel ready at 127.0.0.1:{port} — install a viewer or copy this address"
+        ));
+        return false;
+    };
+    match std::process::Command::new(program)
+        .args(&args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => {
+            display.viewer = Some(child);
+            display.message = Some(format!("VNC viewer opened at 127.0.0.1:{port}"));
+            true
+        }
+        Err(err) => {
+            display.message = Some(format!("could not start {program}: {err}"));
+            false
+        }
+    }
+}
+
+/// First viewer on `PATH`, with the argument form it understands.
+fn vnc_viewer_command(port: u16) -> Option<(&'static str, Vec<String>)> {
+    // TigerVNC and tightvncviewer accept `host::port` for a raw TCP port.
+    if command_available("vncviewer") {
+        return Some(("vncviewer", vec![format!("127.0.0.1::{port}")]));
+    }
+    if command_available("xtigervncviewer") {
+        return Some(("xtigervncviewer", vec![format!("127.0.0.1::{port}")]));
+    }
+    if command_available("gvncviewer") {
+        return Some(("gvncviewer", vec![format!("127.0.0.1:{port}")]));
+    }
+    if command_available("remmina") {
+        return Some((
+            "remmina",
+            vec!["-c".to_string(), format!("vnc://127.0.0.1:{port}")],
+        ));
+    }
+    None
 }
 
 #[cfg(test)]

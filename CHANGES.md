@@ -1032,3 +1032,82 @@ and `handoff.md` (F26 closed).
   5 history/normalization/one-line snippet.
 - GUI checks: `USAGE.md` §14 and `TESTING.md` §2.7 (F12–F15). Not yet run on a
   live server.
+
+# Step: csh/tcsh tracking, Settings window, X11 and VNC
+
+## What changed
+
+**csh / tcsh directory tracking (`src/ssh.rs`, `src/sftp.rs`).**
+- `ShellKind { Bash, Zsh, Csh, Tcsh }` parses the login-shell path from
+  `/etc/passwd`; `ShellInfo` carries the shell, its family and the startup file
+  chosen on the server.
+- bash/zsh keep the existing prompt hook. csh/tcsh use
+  `alias cwdcmd 'printf "\033]7;file://%s\a" "$cwd"'` guarded by `$?prompt`,
+  emitted once immediately and again after every directory change.
+- tcsh reads `~/.tcshrc` instead of `~/.cshrc` when that file already exists, so
+  the install never hides an existing setup. csh uses `~/.cshrc`.
+- The one-line **Enable now** snippet is now per-shell and is only sent after the
+  shell is detected (`HookAction { EnableNow, Install }`).
+- The install dialog warns that csh/tcsh have a single `cwdcmd` alias and offers
+  **Copy snippet** as the non-destructive route. The backup and **Remove** still
+  work exactly as before.
+- Unsupported shells now report "bash, zsh, csh and tcsh are supported".
+
+**Settings window and decluttering (`src/settings.rs`, `src/app.rs`,
+`src/theme.rs`).**
+- `Settings` is `Clone` and stores `theme`, `sftp_history`, `x11`, `vnc`,
+  `display_pref` (Ask / Prefer X11 / Prefer VNC), `vnc_host` and `vnc_port`
+  (default 5900). Unknown or missing fields fall back individually, so old
+  `settings.toml` files keep working.
+- The tab-bar theme menu and its helper were replaced by one **Settings**
+  button. The dedicated window holds Appearance, File panel and Remote display
+  and saves on every change.
+- Back/Forward history buttons are hidden unless **Show Back/Forward history
+  buttons** is enabled (default off).
+- The SFTP panel's redundant **×** and its hide plumbing were removed; the
+  **Files** toggle is the only way to hide the panel.
+- The terminal's permanent **Disconnect** bar was removed. The bar is now
+  contextual: it shows the connection-lost banner, X11 state, VNC controls and
+  messages.
+
+**X11 forwarding (`src/x11.rs`, new).**
+- When `x11` is enabled, `x11-req` is sent **before** `request_shell`, because
+  sshd only puts `DISPLAY` in the child environment at spawn time. The server's
+  Success/Failure is awaited (10 s timeout) and reported in the bottom bar.
+- Server-opened `x11` channels are spliced to the local X server. The first
+  connection-setup packet is rewritten with the local `xauth` cookie
+  (MIT-MAGIC-COOKIE-1), so the remote side never sees the real cookie. Local
+  displays use `/tmp/.X11-unix/X<n>`, with a TCP fallback for remote displays.
+- A random 16-byte cookie is generated for the request. No local X socket is
+  opened: only channels the server asks for are forwarded.
+
+**VNC over SSH (`src/ssh.rs`, `src/app.rs`).**
+- The session thread now owns a display-command channel. `ProbeVnc` opens a
+  second session channel and runs, through `/bin/sh`,
+  `ss -ltn || netstat -ltn || netstat -an`; listeners on 5900–5999 are parsed,
+  preferring the lowest display, with wildcard binds mapped to `127.0.0.1`.
+  Detection failure (very old server) falls back to the editable address.
+- `OpenVnc` binds a loopback listener and opens one `direct-tcpip` channel per
+  accepted viewer connection; `CloseVnc` aborts the listener. The bar shows the
+  local address with **Copy**, **Open** and **Stop**.
+- Viewer discovery tries `vncviewer`, `xtigervncviewer`, `gvncviewer`, then
+  `remmina -c`. With none installed the tunnel stays up and the address is
+  copyable; when X11 is active the bar says so.
+- **Ask** shows a chooser when both are enabled; **Prefer X11** / **Prefer VNC**
+  run directly and fall back to the other path.
+
+**Docs** — `USAGE.md` §14/§15 updated and §19 added; `TESTING.md` smoke items and
+§2.7 updated, new §2.10 and cleanup; `handoff.md` status/history updated.
+
+## Verified
+
+- `cargo build` ✅
+- `cargo clippy --all-targets -- -D warnings` ✅
+- `cargo test` ✅ **107 passed** (default and `--no-default-features`)
+- `cargo fmt --check` ✅
+- New unit tests: shell parsing (4 kinds), csh one-liner/block idempotency,
+  optional live `csh`/`tcsh` syntax check, settings round trip/old-file
+  defaults, X11 display/cookie/setup rewrite, VNC listener parsing and address
+  forms.
+- GUI / live-server checks: `USAGE.md` §19 and `TESTING.md` §2.10 (G1–G11).
+  Not yet run.

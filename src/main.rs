@@ -7,6 +7,7 @@ mod sftp;
 mod ssh;
 mod terminal;
 mod theme;
+mod x11;
 
 use app::RustTermApp;
 

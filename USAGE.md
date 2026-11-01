@@ -545,10 +545,11 @@ reflows the columns or hides one.
   **Clear messages**.
 - Type a remote path in the **Path** box and press **Enter** (or click ➡).
   Relative paths are resolved by the server against the login directory.
-- **‹ / ›** step through the directories you have visited (up to 100). History
-  is committed only after a listing succeeds, so a typo or a permission error
-  never leaves Back pointing at a folder that would not open. A new navigation
-  after going back discards the forward stack.
+- **‹ / ›** step through the directories you have visited (up to 100) when
+  **Show Back/Forward history buttons** is enabled in **Settings → File panel**
+  (off by default). History is committed only after a listing succeeds, so a
+  typo or a permission error never leaves Back pointing at a folder that would
+  not open. A new navigation after going back discards the forward stack.
 - The **Follow** chip sits at the right of the path row. It is on by default:
   the panel follows the shell's working directory. Any manual move (path box,
   **Up**, **Home**, a folder click, **Back/Forward**) pauses following until
@@ -596,12 +597,15 @@ Most stock shells do not send it. About three seconds after the first listing,
 if no directory has been reported, a small strip under the path row offers three
 choices:
 
-- **Enable now** types a one-line snippet into the current shell. It installs a
-  `__rustterm_cwd` prompt hook for this session only (bash `PROMPT_COMMAND` or
-  zsh `precmd_functions`); nothing is written to disk. It takes effect at the
-  next prompt. Pressing it twice is harmless.
+- **Enable now** types a one-line snippet into the current shell. The login
+  shell is detected first from `/etc/passwd`, then the matching hook is used:
+  bash `PROMPT_COMMAND`, zsh `precmd_functions`, or the csh/tcsh `cwdcmd` alias.
+  Nothing is written to disk. It takes effect at the next prompt. Pressing it
+  twice is harmless.
 - **Install…** detects your login shell from `/etc/passwd`, then asks before
-  editing `~/.bashrc` or `~/.zshrc`. The block is wrapped in
+  editing the startup file that shell actually reads: `~/.bashrc`, `~/.zshrc`,
+  `~/.cshrc`, or `~/.tcshrc` when that file already exists (tcsh reads it
+  instead of `~/.cshrc`). The block is wrapped in
   `# >>> rustterm directory tracking >>>` / `# <<< ... <<<` markers. The first
   install writes a one-time `<file>.rustterm-backup`; installing again replaces
   the block instead of appending a second one. The dialog's **Remove** deletes
@@ -609,9 +613,12 @@ choices:
   Fish and other shells are not supported and report that in the status bar.
 - **×** dismisses the hint for this session.
 
-The hint disappears as soon as any OSC 7 report arrives. Only bash and zsh are
-handled; the snippet is syntax-checked with `bash -n` in the test suite. Nothing
-is ever written without clicking **Install…** and confirming in the dialog.
+csh and tcsh have a single `cwdcmd` alias, so **Install** replaces one you
+already have. The dialog warns about this, keeps the original in the backup, and
+**Copy snippet** copies the one-liner so you can add it yourself instead. The
+snippet is syntax-checked with `bash -n` (and by a real `csh`/`tcsh` when one is
+installed) in the test suite. Nothing is ever written without clicking
+**Install…** and confirming in the dialog.
 
 **Verify**
 
@@ -727,24 +734,28 @@ so delete/copy tests cannot touch real data.
       the panel follows and the strip disappears. After dismissing with **×**,
       right-click the **Follow** chip → **Set up directory tracking…** opens the
       same dialog.
-- [ ] **Install / Remove**: **Install…** → the dialog names `~/.bashrc` (or
-      `~/.zshrc`) and the detected shell. **Install** → the block is appended, a
+- [ ] **Install / Remove**: **Install…** → the dialog names the detected shell
+      and the startup file it reads (`~/.bashrc`, `~/.zshrc`, `~/.cshrc`, or an
+      existing `~/.tcshrc`). **Install** → the block is appended, a
       `.rustterm-backup` is created and the status bar confirms it. Install
       again → no duplicate block. **Remove** → the block is gone and the rest of
       the file is unchanged. A new login still has tracking (open a new tab).
+- [ ] **csh / tcsh**: as an account whose login shell is `/bin/csh` or
+      `/bin/tcsh`, **Enable now** types the `cwdcmd` snippet and `cd` in the
+      terminal moves the panel. **Install…** warns that the single `cwdcmd`
+      alias will be replaced; **Copy snippet** copies the same one-liner.
 - [ ] **Unsupported shell**: connect as an account whose login shell is `fish`
-      (or `/bin/sh`) → **Install…** reports that only bash and zsh are
+      (or `/bin/sh`) → **Install…** reports that bash, zsh, csh and tcsh are
       supported; no file is written.
-- [ ] **Toggle**: **Files** hides the panel; click again to show it. The panel
-      **×** also hides it. Switching tabs shows the other tab's directory,
-      clipboard, message history and hidden-file state.
+- [ ] **Toggle**: **Files** hides the panel; click again to show it. Switching
+      tabs shows the other tab's directory, clipboard, message history and
+      hidden-file state.
 - [ ] **Background tab**: navigate tab A to `/tmp`, switch to tab B and run some
       output, switch back → tab A is still in `/tmp` and its listing is intact.
 - [ ] **Responsiveness**: navigate to a very large directory (e.g. `/usr/bin`),
       start a large folder copy, and keep typing in the terminal → keystrokes echo
       and output flows while the listing/copy runs.
-- [ ] **Teardown**: close the tab with the panel open, and disconnect via the
-      **Disconnect** bar at the bottom of the terminal → no crash, no stuck
+- [ ] **Teardown**: close the tab with the panel open → no crash, no stuck
       thread.
 - [ ] **Window cap**: with the panel open, shrink the window to ~900 px wide →
       the panel stops at 55% (about 495 px) and the terminal stays usable; drag
@@ -752,12 +763,14 @@ so delete/copy tests cannot touch real data.
 
 ## 15. Appearance and themes — [V]
 
-**How:** the **🎨 Theme** button at the far right of the tab bar opens a short
-menu with the built-in themes. Selecting one applies it to the whole app
-immediately — top bar, forms, cards, tables, dialogs and the SFTP panel — and
-closes the menu. The design is deliberately flat and boxy: square corners, 1 px
-borders, no drop shadows and no accent-coloured hover glow. All controls share
-the same padding and a 26 px control height. The choice is saved in:
+**How:** the **Settings** button at the far right of the tab bar opens a
+dedicated window (not a tab). **Appearance** lists the built-in themes;
+selecting one applies it to the whole app immediately — top bar, forms, cards,
+tables, dialogs and the SFTP panel. The design is deliberately flat and boxy:
+square corners, 1 px borders, no drop shadows and no accent-coloured hover glow.
+All controls share the same padding and a 26 px control height. The same window
+holds **File panel** (Back/Forward history buttons) and **Remote display**
+(§19). The choice is saved in:
 
 ```
 $XDG_CONFIG_HOME/rustterm/settings.toml      # if XDG_CONFIG_HOME is set
@@ -786,7 +799,7 @@ Adding a theme:
 
 **Verify**
 
-- [ ] Theme button sits at the far-right edge of the tab bar and shows a hover
+- [ ] **Settings** sits at the far-right edge of the tab bar and shows a hover
       tooltip, at small and large window widths, with several tabs open.
 - [ ] Switching Midnight ↔ Graphite recolours the tab bar, New Session cards,
       tables, dialogs and status bar without restarting. No text becomes
@@ -982,3 +995,87 @@ remote path.
       uploaded.
 - [ ] **Expiry**: leave a pending file unsynced for more than 15 minutes → the
       journal drops it and the status bar says so.
+
+## 19. Settings and remote display (X11 / VNC) — [U]
+
+**Settings** is a dedicated window opened from the tab bar. It has three
+sections:
+
+- **Appearance** — the theme (§15).
+- **File panel** — *Show Back/Forward history buttons* (off by default).
+- **Remote display** — *X11 forwarding* and *VNC over SSH*, both **off** by
+  default, plus a preference and the VNC fallback address.
+
+The preference is used only when both options are enabled: **Ask every time**
+shows a two-button chooser when you click **Display**, **Prefer X11** tries X11
+first and falls back to VNC, and **Prefer VNC** does the reverse. Every setting
+is saved immediately to `settings.toml`; old files keep the defaults for fields
+they do not contain.
+
+### X11 (`ssh -X`, untrusted)
+
+When *X11 forwarding* is on, the request is sent **before the shell starts**, so
+the remote shell and every program it launches inherit `DISPLAY`. The server's
+answer is checked: a refusal (X11Forwarding off) is reported as
+`X11: unavailable` in the bottom bar with a tooltip explaining why. There is no
+local listening socket; the app only forwards `x11` channels that the server
+opens, which is what makes it untrusted forwarding. The first X11 packet is
+rewritten with the local `xauth` cookie, so the remote side never sees the real
+cookie.
+
+Enabling the option affects the **next connection**; an existing tab was
+connected without the request, and the bar says so.
+
+### VNC over SSH
+
+When *VNC over SSH* is on, **Display** probes the server over a second SSH
+channel:
+
+```
+ss -ltn || netstat -ltn || netstat -an
+```
+
+The probe runs through `/bin/sh`, so it works when the login shell is csh and on
+very old systems without `ss`. Any listener on 5900–5999 is used (preferring
+`:0`, i.e. 5900); the bind address is kept, with wildcard addresses mapped to
+`127.0.0.1`. If the probe finds nothing or cannot run, the editable **VNC
+server** address is used (`host` or `host:port`; blank means
+`127.0.0.1:<port>`).
+
+The tunnel is a local loopback listener whose connections are opened with
+`direct-tcpip` to the server. The bottom bar shows the address
+(`VNC 127.0.0.1:<port>`) with **Copy**, **Open** and **Stop**. The external
+viewer is the first of `vncviewer`, `xtigervncviewer`, `gvncviewer`, or
+`remmina -c`. If none is installed, the tunnel stays up and the bar shows the
+copyable address (and notes that X11 is active when it is), so a viewer on
+another machine can be pointed at it. **Stop** closes the listener, the SSH
+channels and the viewer process; closing the tab does the same.
+
+**Verify**
+
+- [ ] **Off by default**: a fresh `settings.toml` has `x11 = false` and
+      `vnc = false`; no Display button appears in the bottom bar.
+- [ ] **Old file**: a `settings.toml` containing only `theme = "graphite"` loads
+      with all new fields at their defaults and does not error.
+- [ ] **X11 accepted**: enable X11, reconnect, run `echo $DISPLAY` and
+      `xeyes`/`xclock` on the server → the window appears locally and
+      `X11: forwarding` (or `N connections`) is shown.
+- [ ] **X11 refused**: set `X11Forwarding no` on the server, reconnect →
+      `X11: unavailable` with the server's reason; the terminal still works.
+- [ ] **X11 enabled mid-session**: enable it without reconnecting, click
+      **Display** → the bar explains the session must be reconnected.
+- [ ] **VNC detection**: run a VNC server on `:0` on the SSH host, enable VNC,
+      click **Display** → the viewer opens against `127.0.0.1:<local port>` and
+      the bar shows that address.
+- [ ] **VNC fallback address**: stop the VNC server (nothing listens) and set
+      the editable address to a host that does → the tunnel uses the setting.
+- [ ] **No viewer**: temporarily hide the viewers from `PATH`, click
+      **Display** → the bar shows `VNC tunnel ready at 127.0.0.1:<port>`;
+      **Copy** copies it; with X11 active the message says so.
+- [ ] **Both enabled, Ask**: click **Display** → the chooser appears; **X11**
+      and **VNC** each do the right thing; **Cancel** closes it.
+- [ ] **Prefer X11 / Prefer VNC**: with both enabled, the matching path starts
+      without the chooser, and an unavailable X11 falls back to VNC.
+- [ ] **Stop**: click **Stop** → the viewer closes, `ss -ltn` on the local
+      machine no longer shows the port, and the bar forgets the address.
+

@@ -69,17 +69,17 @@ logs anyway.
 
 | ID | Do | Expect |
 |----|----|--------|
-| S1 | Start the app. | **New Session** tab is active; one card with Host/Port/User/Password; saved-profiles table below; **🎨 Theme** at the far right. |
+| S1 | Start the app. | **New Session** tab is active; one card with Host/Port/User/Password; saved-profiles table below; **Settings** at the far right. |
 | S2 | Click **Load** on the `sshuser` row. | Host `localhost`, Port `22`, User `sshuser`; password box shows dots; **Save password in the system keyring** is ticked. |
-| S3 | Click **Connect**. | The tab label becomes `sshuser@<host>:~`; a shell prompt appears; the SFTP pane lists `/home/sshuser`; the bottom bar shows **Disconnect**. |
+| S3 | Click **Connect**. | The tab label becomes `sshuser@<host>:~`; a shell prompt appears; the SFTP pane lists `/home/sshuser`; there is no permanent Disconnect bar (the tab `×` closes the session). |
 | S4 | Type `whoami` ↵, `pwd` ↵, `echo hello from rustterm` ↵. | Outputs: `sshuser`, `/home/sshuser`, `hello from rustterm`. No duplicated or missing characters. |
 | S5 | Click **+ New Session**, load the profile, **Connect**. In the new tab run `sleep 30`; switch back to the first tab and run `echo tab1`. | Two tabs with independent output; `echo tab1` runs immediately in tab 1 while tab 2 is still sleeping. |
 | S6 | Run `seq 1 500`; scroll up with the wheel; press `Shift+Home`. | A scrollbar thumb appears on the right edge; you can reach line 1; `Shift+End` returns to the prompt. |
 | S7 | Run `stty size`; drag a window edge, then run `stty size` again; open `htop`, resize, then `q`. | The two numbers change; `htop` reflows instead of clipping. |
 | S8 | Run `printf '\033]0;My Title\007'`. | The tab label changes to `My Title`. |
 | S9 | Run `printf '\a'`, then check the log. | The log contains a `terminal bell` line. |
-| S10 | Click **Disconnect** in the bottom bar. | The tab closes; `ss -tnp \| grep ':22'` shows no socket owned by rustterm. |
-| S11 | Open **🎨 Theme**, choose **Graphite**; quit and relaunch. | The whole UI is recoloured immediately; Graphite is still selected after restart. Switch back to **Midnight**. |
+| S10 | Click the tab's **×**. | The tab closes; `ss -tnp \| grep ':22'` shows no socket owned by rustterm. |
+| S11 | Open **Settings**, choose **Graphite** under Appearance; quit and relaunch. | The whole UI is recoloured immediately; Graphite is still selected after restart. Switch back to **Midnight**. |
 | S12 | Quit, relaunch, **Load** the profile. | Fields are restored and the password still comes from the keyring. |
 
 If any smoke item fails, stop and report before running the full pass.
@@ -262,13 +262,17 @@ Use a scratch directory so nothing real is touched.
       ~3 s at the first listing → the **Track the shell's folder?** strip
       appears. **×** hides it for that tab. **Enable now** types the snippet;
       run `cd` → the panel follows and the strip is gone. Reopen a tab and
-      choose **Install…** → the dialog names `~/.bashrc` or `~/.zshrc` and the
-      detected shell; **Install** appends the marked block and creates
+      choose **Install…** → the dialog names the detected shell and its startup
+      file (`~/.bashrc`, `~/.zshrc`, `~/.cshrc`, or an existing `~/.tcshrc`);
+      **Install** appends the marked block and creates
       `<file>.rustterm-backup`; installing twice does not duplicate it;
       **Remove** deletes the block and leaves the rest of the file unchanged.
-      A `fish` login reports that only bash and zsh are supported.
-- [ ] **F16 — hide/show.** **Files** in the tab bar and the panel's `×` hide it;
-      the terminal reflows. Showing it restores the previous directory.
+      As a csh/tcsh login the dialog warns that the single `cwdcmd` alias is
+      replaced and **Copy snippet** copies the one-liner. A `fish` login reports
+      that bash, zsh, csh and tcsh are supported.
+- [ ] **F16 — hide/show.** **Files** in the tab bar hides the panel and the
+      terminal reflows. Showing it restores the previous directory; the panel
+      has no `×` of its own.
 - [ ] **F17 — cleanup.** In the terminal: `rm -rf ~/sftp-test`; **🔄 Refresh**.
 
 ### 2.8 Appearance
@@ -286,7 +290,38 @@ Use a scratch directory so nothing real is touched.
 - [ ] **B2 — bell.** `printf '\a'` logs `terminal bell`; no audible beep is
       expected yet.
 
-### 2.10 New Session page details
+### 2.10 Settings and remote display
+
+- [ ] **G1 — Settings window.** The tab-bar **Settings** button opens a dedicated
+      window (not a tab). Appearance, File panel and Remote display sections are
+      present; × closes it.
+- [ ] **G2 — defaults.** Both X11 and VNC are unticked; Back/Forward history is
+      off; the SFTP back/forward buttons are absent until enabled.
+- [ ] **G3 — persistence and old files.** Change the theme and tick Back/Forward;
+      restart → both survive. A `settings.toml` with only `theme = "graphite"`
+      loads without error and shows the defaults for the new fields.
+- [ ] **G4 — X11 accepted.** Tick X11, reconnect, then `echo $DISPLAY` and run
+      `xeyes` (or `xclock`) on the server → the window appears locally; the bar
+      shows `X11: forwarding` or `X11: N connections`.
+- [ ] **G5 — X11 refused.** With `X11Forwarding no` on the server, reconnect →
+      `X11: unavailable` with a hover explanation; the terminal still works.
+- [ ] **G6 — X11 after connect.** Enable X11 without reconnecting, click
+      **Display** → the bar says the session must be reconnected.
+- [ ] **G7 — VNC detection.** Run a VNC server on `:0` on the SSH host, enable
+      VNC, click **Display** → a viewer opens against `127.0.0.1:<local port>`
+      and that address is shown.
+- [ ] **G8 — VNC fallback.** With no VNC listener (or an old server without
+      `ss`/`netstat`), the editable **VNC server** address is used instead.
+- [ ] **G9 — no viewer.** Hide the viewers from `PATH`, click **Display** → the
+      bar shows the copyable tunnel address; **Copy** copies it. With X11
+      active, the message says X11 is available.
+- [ ] **G10 — chooser and preference.** With both enabled: **Ask every time**
+      shows the chooser on **Display**; **Prefer X11** / **Prefer VNC** start the
+      matching path and fall back when it is unavailable.
+- [ ] **G11 — Stop.** **Stop** closes the viewer and the tunnel; the local port
+      no longer listens.
+
+### 2.11 New Session page details
 
 - [ ] **N1 — conditional fields.** The key-path field appears only after
       **Use a private key**; the profile-name field is disabled until **Save as
@@ -296,7 +331,7 @@ Use a scratch directory so nothing real is touched.
 - [ ] **N3 — profile count.** The saved-profiles heading shows the correct count;
       hovering it reveals the store path.
 
-### 2.11 File transfers
+### 2.12 File transfers
 
 - [x] **T1 — download file.** Select a remote file, click **📥**, choose a local
       folder → progress bar advances, status says `Downloaded …`, and
@@ -333,7 +368,7 @@ Use a scratch directory so nothing real is touched.
       **Close tab**. The other tabs keep working.
 - [ ] **T12 — cleanup.** In the terminal: `rm -rf ~/sftp-test ~/Downloads/rt-*`.
 
-### 2.12 Edit and upload on save
+### 2.13 Edit and upload on save
 
 Use a scratch file, e.g. `~/sftp-test/notes.txt`.
 
@@ -409,6 +444,7 @@ Resize:           R1–R4:  __ / 4
 SFTP:             F1–F17: __ / 17
 Appearance:       A1–A3:  __ / 3
 Title/bell:       B1–B2:  __ / 2
+Settings/display: G1–G11: __ / 11
 New Session:      N1–N3:  __ / 3
 Failures:         (IDs + one line each)
 Artifacts:        target/manual/run-*.log, screenshots
@@ -418,7 +454,7 @@ Artifacts:        target/manual/run-*.log, screenshots
 
 ## 5. Cleanup after a session
 
-- [ ] Disconnect every tab (or quit; each session disconnects cleanly).
+- [ ] Close every tab (or quit; each session disconnects cleanly).
 - [ ] Delete temporary profiles (`manual-smoke`, the bad-password copy).
 - [ ] Remove their keyring entries via Seahorse.
 - [ ] `rm -rf ~/sftp-test` on the server.

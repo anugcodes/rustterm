@@ -44,6 +44,7 @@ use tokio::sync::{mpsc, oneshot, OnceCell};
 /// Wakes the egui thread when asynchronous SSH data arrives.
 pub type Wake = Arc<dyn Fn() + Send + Sync>;
 
+#[derive(Clone)]
 pub struct SshConfig {
     pub host: String,
     pub port: u16,
@@ -117,6 +118,8 @@ pub struct SshSession {
     alive: Arc<AtomicBool>,
     /// X11 forwarding state, shared with the handler and the proxies.
     x11: Arc<X11Shared>,
+    /// Whether this session requested X11 forwarding at connect time.
+    x11_requested: bool,
 }
 
 /// Flips `alive` to false and wakes egui when the session thread ends,
@@ -547,6 +550,7 @@ impl SshSession {
             wake: session_wake,
             alive,
             x11,
+            x11_requested: config.x11,
         })
     }
 
@@ -565,6 +569,11 @@ impl SshSession {
     /// Current X11 forwarding state (accepted, active channels, last error).
     pub fn x11_status(&self) -> X11Status {
         self.x11.status()
+    }
+
+    /// Whether this session requested X11 forwarding at connect time.
+    pub fn x11_requested(&self) -> bool {
+        self.x11_requested
     }
 
     /// Look for a VNC listener on the server.
@@ -2130,23 +2139,62 @@ async fn edit_hook(
     }
 
     // Back up the original once; a second install must not replace the backup
-    // with an already-modified file.
+    // with an already-modified file. `write` opens with WRITE only, so it fails
+    // with "No such file" when the file does not exist and never truncates
+    // when it does; use `create` (CREATE | TRUNCATE | WRITE) instead.
     let backup = format!("{rc}.rustterm-backup");
     let mut backup_path = None;
-    if install && !existing.is_empty() && client.session.metadata(&backup).await.is_err() {
-        client
+    if install
+        && !existing.is_empty()
+        && client
             .session
-            .write(&backup, &existing)
+            .metadata(&backup)
             .await
-            .map_err(|err| format!("could not write '{backup}': {err}"))?;
-        backup_path = Some(backup);
+            .map_err(|err| err.to_string())
+            .map(|_| ())
+            .is_err()
+    {
+        // Only treat "not found" as "create the backup"; other errors are
+        // reported verbatim.
+        match client.session.metadata(&backup).await {
+            Ok(_) => {}
+            Err(err) if err.to_string().to_lowercase().contains("no such") => {
+                let mut file = client
+                    .session
+                    .create(&backup)
+                    .await
+                    .map_err(|err| format!("could not create '{backup}': {err}"))?;
+                file.write_all(&existing)
+                    .await
+                    .map_err(|err| format!("could not write '{backup}': {err}"))?;
+                file.flush()
+                    .await
+                    .map_err(|err| format!("could not finish writing '{backup}': {err}"))?;
+                file.close()
+                    .await
+                    .map_err(|err| format!("could not close '{backup}': {err}"))?;
+                backup_path = Some(backup.clone());
+            }
+            Err(err) => {
+                return Err(format!("could not stat '{backup}': {err}"));
+            }
+        }
     }
 
-    client
+    let mut file = client
         .session
-        .write(rc, next.as_bytes())
+        .create(rc)
+        .await
+        .map_err(|err| format!("could not create '{rc}': {err}"))?;
+    file.write_all(next.as_bytes())
         .await
         .map_err(|err| format!("could not write '{rc}': {err}"))?;
+    file.flush()
+        .await
+        .map_err(|err| format!("could not finish writing '{rc}': {err}"))?;
+    file.close()
+        .await
+        .map_err(|err| format!("could not close '{rc}': {err}"))?;
     Ok(HookResult {
         path: rc.to_string(),
         backup: backup_path,

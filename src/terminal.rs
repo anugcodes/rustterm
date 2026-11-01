@@ -175,7 +175,7 @@ fn wheel_button_code(up: bool) -> u8 {
 
 #[derive(Clone)]
 struct EventProxy {
-    input_tx: mpsc::UnboundedSender<Vec<u8>>,
+    input_tx: Arc<Mutex<mpsc::UnboundedSender<Vec<u8>>>>,
     title: Arc<Mutex<Option<String>>>,
     bell: Arc<AtomicBool>,
     grid_size: Arc<Mutex<(usize, usize, f32, f32)>>,
@@ -185,7 +185,7 @@ impl alacritty_terminal::event::EventListener for EventProxy {
     fn send_event(&self, event: alacritty_terminal::event::Event) {
         match event {
             alacritty_terminal::event::Event::PtyWrite(text) => {
-                let _ = self.input_tx.send(text.into_bytes());
+                let _ = self.input_tx.lock().unwrap().send(text.into_bytes());
             }
             alacritty_terminal::event::Event::Title(title) => {
                 if let Ok(mut slot) = self.title.lock() {
@@ -214,7 +214,7 @@ impl alacritty_terminal::event::EventListener for EventProxy {
                         cell_height: size.3 as u16, // Individual cell pixel height
                     };
                     let reply = format(size_info);
-                    let _ = self.input_tx.send(reply.into_bytes());
+                    let _ = self.input_tx.lock().unwrap().send(reply.into_bytes());
                 }
             }
             alacritty_terminal::event::Event::ColorRequest(index, format) => {
@@ -226,7 +226,7 @@ impl alacritty_terminal::event::EventListener for EventProxy {
                     b: color.b(),
                 };
                 let reply = format(rgb);
-                let _ = self.input_tx.send(reply.into_bytes());
+                let _ = self.input_tx.lock().unwrap().send(reply.into_bytes());
             }
             other => {
                 log::debug!("unhandled terminal event: {other:?}");
@@ -400,6 +400,8 @@ fn hex_value(byte: u8) -> Option<u8> {
 pub struct TerminalView {
     term: Term<EventProxy>,
     processor: Processor<StdSyncHandler>,
+    /// Shared handle to the current PTY input channel; swapped on reconnect.
+    input_tx: Arc<Mutex<mpsc::UnboundedSender<Vec<u8>>>>,
     /// OSC 7 extractor; runs alongside the VTE parser.
     osc7: Osc7Scanner,
     /// Most recent directory reported by the shell, waiting for the app.
@@ -426,12 +428,20 @@ pub struct TerminalView {
 }
 
 impl TerminalView {
+    /// Swap the channel that keystrokes are written to. Used on reconnect, so
+    /// the existing view (and its scrollback) keeps working against the new
+    /// session instead of being replaced.
+    pub fn set_input_tx(&mut self, input_tx: mpsc::UnboundedSender<Vec<u8>>) {
+        *self.input_tx.lock().unwrap() = input_tx;
+    }
+
     pub fn new(cols: usize, rows: usize, input_tx: mpsc::UnboundedSender<Vec<u8>>) -> Self {
         let title = Arc::new(Mutex::new(None));
         let bell = Arc::new(AtomicBool::new(false));
         let grid_size = Arc::new(Mutex::new((cols, rows, 8.4, 16.8)));
+        let input_tx = Arc::new(Mutex::new(input_tx));
         let event_proxy = EventProxy {
-            input_tx,
+            input_tx: Arc::clone(&input_tx),
             title: Arc::clone(&title),
             bell: Arc::clone(&bell),
             grid_size: Arc::clone(&grid_size),
@@ -442,6 +452,7 @@ impl TerminalView {
         Self {
             term,
             processor: Processor::new(),
+            input_tx,
             osc7: Osc7Scanner::default(),
             pending_cwd: None,
             cols,

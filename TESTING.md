@@ -304,7 +304,9 @@ Use a scratch directory so nothing real is touched.
       `xeyes` (or `xclock`) on the server → the window appears locally; the bar
       shows `X11: forwarding` or `X11: N connections`.
 - [ ] **G5 — X11 refused.** With `X11Forwarding no` on the server, reconnect →
-      `X11: unavailable` with a hover explanation; the terminal still works.
+      `X11: unavailable` (reason shown inline and on hover) with the server's
+      reason; the terminal still works. The **Reconnect** button is offered when
+      X11 is enabled but not active for the session.
 - [ ] **G6 — X11 after connect.** Enable X11 without reconnecting, click
       **Display** → the bar says the session must be reconnected.
 - [ ] **G7 — VNC detection.** Run a VNC server on `:0` on the SSH host, enable

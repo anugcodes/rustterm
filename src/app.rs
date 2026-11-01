@@ -830,6 +830,9 @@ pub struct RustTermApp {
     active: usize,
     form: ConnectForm,
     connecting: Option<ConnectingState>,
+    /// A reconnect requested from inside a terminal tab's bottom bar; processed
+    /// in `update` once the borrow ends.
+    pending_reconnect: Option<(usize, bool)>,
     /// Persisted profiles loaded at startup (F19: no passwords stored).
     store: SessionStore,
     /// Name used when "Save as profile" is checked.
@@ -854,8 +857,13 @@ struct StatusMessage {
 
 struct ActiveSession {
     title: String,
+    /// Connection parameters used to open this session; kept so a reconnect
+    /// can re-open it with the same credentials (and a different X11 flag).
+    config: SshConfig,
     ssh: SshSession,
     terminal: TerminalView,
+    /// In-flight reconnect attempt, if any.
+    reconnect: Option<ConnectingState>,
     /// Per-session remote file browser. Each tab keeps its own directory.
     sftp: SftpExplorer,
     /// Resized column widths of the file table.
@@ -912,6 +920,7 @@ struct ConnectingState {
     /// Taken out to draw the modal, put back if the user has not answered yet.
     prompt: Option<HostKeyPrompt>,
     label: String,
+    config: SshConfig,
     /// Fires to abort the attempt at any await point in `SshSession::connect`.
     cancel_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
@@ -964,6 +973,7 @@ impl Default for RustTermApp {
             active: NEW_SESSION_TAB,
             form: ConnectForm::default(),
             connecting: None,
+            pending_reconnect: None,
             store,
             profile_name: String::new(),
             save_as_profile: false,
@@ -1032,6 +1042,8 @@ impl RustTermApp {
         };
         let label = format!("{}@{}:{}", config.user, config.host, config.port);
 
+        let config_for_state = config.clone();
+
         // The SSH thread wakes egui as soon as output arrives. Without this,
         // remote echo on a high-latency link was only displayed on the next
         // keyboard/mouse event (the previous 8 ms polling tail had long expired).
@@ -1054,6 +1066,7 @@ impl RustTermApp {
             prompt_rx,
             prompt: None,
             label,
+            config: config_for_state,
             cancel_tx: Some(cancel_tx),
         });
         self.clear_status();
@@ -1070,6 +1083,111 @@ impl RustTermApp {
                 let _ = tx.send(());
             }
             self.set_info("Connection cancelled");
+        }
+    }
+
+    /// Reconnect one session, optionally enabling X11 forwarding.
+    ///
+    /// Keeps the tab and its title; on success the new SSH session replaces
+    /// the old one, the terminal's input channel is swapped and a divider is
+    /// written into the scrollback, and SFTP restarts at the home directory.
+    fn begin_reconnect(&mut self, index: usize, ctx: &egui::Context, enable_x11: bool) {
+        let Some(session) = self.sessions.get(index) else {
+            return;
+        };
+        if session.reconnect.is_some() {
+            return; // one reconnect at a time per tab
+        }
+        let mut config = session.config.clone();
+        config.x11 = enable_x11 || self.settings.x11;
+        let label = session.title.clone();
+
+        let wake: Wake = {
+            let ctx = ctx.clone();
+            Arc::new(move || ctx.request_repaint())
+        };
+        let (tx, rx) = std_mpsc::channel();
+        let (_prompt_tx, prompt_rx) = std_mpsc::channel();
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let result = SshSession::connect(config, None, Some(wake), Some(cancel_rx))
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(result);
+        });
+
+        let session = &mut self.sessions[index];
+        session.reconnect = Some(ConnectingState {
+            rx,
+            prompt_rx,
+            prompt: None,
+            label,
+            config: session.config.clone(),
+            cancel_tx: Some(cancel_tx),
+        });
+        session.display.message = Some("Reconnecting…".to_string());
+    }
+
+    /// Poll an in-flight reconnect attempt for one session.
+    fn poll_reconnecting(&mut self, index: usize) -> bool {
+        // First, surface a host-key prompt if one arrived.
+        if let Some(state) = self.sessions[index].reconnect.as_mut() {
+            if state.prompt.is_none() {
+                if let Ok(prompt) = state.prompt_rx.try_recv() {
+                    state.prompt = Some(prompt);
+                    return true;
+                }
+            }
+        }
+
+        enum Polled {
+            Pending,
+            Ready(Result<SshSession, String>),
+            Gone,
+        }
+        let polled = match self.sessions[index].reconnect.as_ref() {
+            None => return false,
+            Some(state) => match state.rx.try_recv() {
+                Ok(r) => Polled::Ready(r),
+                Err(std_mpsc::TryRecvError::Empty) => Polled::Pending,
+                Err(std_mpsc::TryRecvError::Disconnected) => Polled::Gone,
+            },
+        };
+
+        match polled {
+            Polled::Pending => false,
+            Polled::Gone => {
+                if let Some(s) = self.sessions.get_mut(index) {
+                    s.reconnect = None;
+                    s.display.message = Some("Reconnect failed: worker thread died".to_string());
+                }
+                true
+            }
+            Polled::Ready(Ok(new_ssh)) => {
+                let input_tx = new_ssh.input_sender();
+                let state = self.sessions[index]
+                    .reconnect
+                    .take()
+                    .expect("checked above");
+                let session = &mut self.sessions[index];
+                session.ssh = new_ssh;
+                session.terminal.set_input_tx(input_tx);
+                session
+                    .terminal
+                    .feed(b"\r\n\r\n--- reconnected ---\r\n\r\n");
+                session.connection_lost = false;
+                session.sftp = SftpExplorer::start(&session.ssh, &session.title);
+                session.display.message = Some("Reconnected".to_string());
+                // Keep the stored config's x11 flag in sync with what was used.
+                session.config.x11 = state.config.x11;
+                true
+            }
+            Polled::Ready(Err(err)) => {
+                if let Some(s) = self.sessions.get_mut(index) {
+                    s.reconnect = None;
+                    s.display.message = Some(format!("Reconnect failed: {err}"));
+                }
+                true
+            }
         }
     }
 
@@ -1129,8 +1247,10 @@ impl RustTermApp {
                 }
                 self.sessions.push(ActiveSession {
                     title: state.label,
+                    config: state.config,
                     ssh,
                     terminal: TerminalView::new(DEFAULT_COLS, DEFAULT_ROWS, input_tx),
+                    reconnect: None,
                     sftp,
                     sftp_columns: SftpColumns::default(),
                     sftp_sort: SftpSort::default(),
@@ -3174,9 +3294,15 @@ impl RustTermApp {
         poll_display(session, &settings);
 
         // The bar is contextual: a lost connection needs a way out, and the
-        // remote-display controls appear only when a display option is on.
+        // remote-display controls appear based on what the session actually
+        // negotiated, not on the live checkboxes.
         let mut disconnect_clicked = false;
-        let show_display = settings.x11 || settings.vnc;
+        let session_x11 = session.ssh.x11_requested();
+        let show_display = session_x11
+            || settings.x11
+            || settings.vnc
+            || session.display.tunnel_port.is_some()
+            || session.display.busy;
         if session.connection_lost || show_display || session.display.tunnel_port.is_some() {
             egui::TopBottomPanel::bottom(egui::Id::new(("terminal_actions", index)))
                 .exact_height(theme.metrics.control_height + 8.0)
@@ -3201,7 +3327,7 @@ impl RustTermApp {
                             return;
                         }
 
-                        if show_display
+                        if (settings.x11 || settings.vnc)
                             && ui
                                 .button("Display")
                                 .on_hover_text("Start or open the remote display")
@@ -3209,7 +3335,8 @@ impl RustTermApp {
                         {
                             begin_display(session, &settings);
                         }
-                        if settings.x11 {
+                        // X11 state belongs to the session, not the checkbox.
+                        if session_x11 {
                             let status = session.ssh.x11_status();
                             if status.forwarding {
                                 let text = match status.active {
@@ -3228,7 +3355,23 @@ impl RustTermApp {
                                         .small()
                                         .color(theme.palette.warning),
                                 )
-                                .on_hover_text(err);
+                                .on_hover_text(err.clone());
+                                ui.label(
+                                    egui::RichText::new(err).small().color(theme.palette.muted),
+                                );
+                            }
+                        } else if settings.x11 {
+                            ui.label(
+                                egui::RichText::new("X11: reconnect to enable")
+                                    .small()
+                                    .color(theme.palette.muted),
+                            );
+                            if ui
+                                .small_button("Reconnect")
+                                .on_hover_text("Reconnect with X11 forwarding enabled")
+                                .clicked()
+                            {
+                                self.pending_reconnect = Some((index, true));
                             }
                         }
                         if let Some(port) = session.display.tunnel_port {
@@ -3458,6 +3601,17 @@ impl RustTermApp {
 impl eframe::App for RustTermApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_connecting();
+        // Poll reconnect attempts for every tab.
+        let n = self.sessions.len();
+        for i in 0..n {
+            self.poll_reconnecting(i);
+        }
+        // Dispatch a reconnect requested from a tab's bottom bar.
+        if let Some((index, enable_x11)) = self.pending_reconnect.take() {
+            if index < self.sessions.len() {
+                self.begin_reconnect(index, ctx, enable_x11);
+            }
+        }
         // Escape aborts a connection attempt as well as the ✕ button. While a
         // host-key prompt is up, Esc is left to the modal.
         if self

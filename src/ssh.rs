@@ -142,6 +142,26 @@ pub struct RemoteEntry {
     pub modified: Option<SystemTime>,
 }
 
+/// What a remote symlink ultimately points at.
+#[derive(Debug, Clone)]
+pub struct ResolvedLink {
+    /// Whether the *target* (not the link itself) is a directory.
+    pub is_dir: bool,
+    /// The link's raw target, when the server reports it.
+    pub target: Option<String>,
+}
+
+/// Result of installing or removing the shell hook.
+#[derive(Debug, Clone)]
+pub struct HookResult {
+    /// Startup file that was edited.
+    pub path: String,
+    /// Backup created before the first edit, if there was a file to back up.
+    pub backup: Option<String>,
+    /// False when the file already had the requested state.
+    pub changed: bool,
+}
+
 /// How a transfer treats a destination that already exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConflictPolicy {
@@ -377,6 +397,62 @@ impl SshSession {
         self.sftp_tx
             .send(SftpRequest {
                 action: SftpAction::Reconnect { reply },
+                wake: self.wake.clone(),
+            })
+            .ok()?;
+        Some(rx)
+    }
+
+    /// Resolve a symlink to learn whether its target is a folder.
+    ///
+    /// `stat` follows the link (unlike the listing's `lstat`), and the raw
+    /// target is returned for display. A dangling link comes back as an error
+    /// that names the target.
+    pub fn sftp_resolve(
+        &self,
+        path: &str,
+    ) -> Option<std_mpsc::Receiver<Result<ResolvedLink, String>>> {
+        let (reply, rx) = std_mpsc::channel();
+        self.sftp_tx
+            .send(SftpRequest {
+                action: SftpAction::Resolve {
+                    path: path.to_string(),
+                    reply,
+                },
+                wake: self.wake.clone(),
+            })
+            .ok()?;
+        Some(rx)
+    }
+
+    /// Ask for the login shell of `user` from `/etc/passwd`.
+    pub fn sftp_login_shell(
+        &self,
+        user: &str,
+    ) -> Option<std_mpsc::Receiver<Result<String, String>>> {
+        let (reply, rx) = std_mpsc::channel();
+        self.sftp_tx
+            .send(SftpRequest {
+                action: SftpAction::LoginShell {
+                    user: user.to_string(),
+                    reply,
+                },
+                wake: self.wake.clone(),
+            })
+            .ok()?;
+        Some(rx)
+    }
+
+    /// Add or remove the marked directory-tracking block in a startup file.
+    pub fn sftp_edit_hook(
+        &self,
+        rc: String,
+        install: bool,
+    ) -> Option<std_mpsc::Receiver<Result<HookResult, String>>> {
+        let (reply, rx) = std_mpsc::channel();
+        self.sftp_tx
+            .send(SftpRequest {
+                action: SftpAction::EditHook { rc, install, reply },
                 wake: self.wake.clone(),
             })
             .ok()?;
@@ -1074,6 +1150,22 @@ enum SftpAction {
     Reconnect {
         reply: std_mpsc::Sender<Result<(), String>>,
     },
+    /// Follow a symlink and report what it points at.
+    Resolve {
+        path: String,
+        reply: std_mpsc::Sender<Result<ResolvedLink, String>>,
+    },
+    /// Look up the account's login shell in `/etc/passwd`.
+    LoginShell {
+        user: String,
+        reply: std_mpsc::Sender<Result<String, String>>,
+    },
+    /// Install or remove the directory-tracking block in `rc`.
+    EditHook {
+        rc: String,
+        install: bool,
+        reply: std_mpsc::Sender<Result<HookResult, String>>,
+    },
     Rename {
         from: String,
         to: String,
@@ -1135,6 +1227,18 @@ impl SftpAction {
                 // Reconnect needs the SSH handle, so `run_session` handles it
                 // before dispatching an action here.
                 let _ = reply.send(Err("SFTP reconnect was not dispatched correctly".into()));
+            }
+            SftpAction::Resolve { path, reply } => {
+                let result = resolve_link(client, &path).await;
+                let _ = reply.send(result);
+            }
+            SftpAction::LoginShell { user, reply } => {
+                let result = login_shell(&client.session, &user).await;
+                let _ = reply.send(result);
+            }
+            SftpAction::EditHook { rc, install, reply } => {
+                let result = edit_hook(client, &rc, install).await;
+                let _ = reply.send(result);
             }
             SftpAction::Rename { from, to, reply } => {
                 let result = client
@@ -1247,6 +1351,15 @@ impl SftpAction {
             SftpAction::Reconnect { reply } => {
                 let _ = reply.send(Err(message.to_string()));
             }
+            SftpAction::Resolve { reply, .. } => {
+                let _ = reply.send(Err(message.to_string()));
+            }
+            SftpAction::LoginShell { reply, .. } => {
+                let _ = reply.send(Err(message.to_string()));
+            }
+            SftpAction::EditHook { reply, .. } => {
+                let _ = reply.send(Err(message.to_string()));
+            }
             SftpAction::Rename { reply, .. }
             | SftpAction::Delete { reply, .. }
             | SftpAction::CreateDir { reply, .. }
@@ -1310,6 +1423,171 @@ fn parse_passwd(contents: &str) -> HashMap<u32, String> {
             Some((uid, name.to_string()))
         })
         .collect()
+}
+
+/// Follow a symlink: `stat` (not `lstat`) so the target's type is reported.
+async fn resolve_link(client: &SftpClient, path: &str) -> Result<ResolvedLink, String> {
+    match client.session.metadata(path).await {
+        Ok(metadata) => {
+            let target = client.session.read_link(path).await.ok();
+            Ok(ResolvedLink {
+                is_dir: metadata.file_type().is_dir(),
+                target,
+            })
+        }
+        Err(err) => {
+            // A dangling link is the common failure, and naming the target is
+            // far more useful than the raw "no such file".
+            match client.session.read_link(path).await {
+                Ok(target) => Err(format!("broken symlink '{path}' -> '{target}'")),
+                Err(_) => Err(format!("could not follow '{path}': {err}")),
+            }
+        }
+    }
+}
+
+/// Read the seventh field of the account's `/etc/passwd` line.
+async fn login_shell(sftp: &SftpSession, user: &str) -> Result<String, String> {
+    let contents = sftp
+        .read("/etc/passwd")
+        .await
+        .map_err(|err| format!("could not read /etc/passwd: {err}"))?;
+    shell_from_passwd(&String::from_utf8_lossy(&contents), user)
+        .ok_or_else(|| format!("/etc/passwd has no login shell for '{user}'"))
+}
+
+fn shell_from_passwd(contents: &str, user: &str) -> Option<String> {
+    contents.lines().find_map(|line| {
+        let fields: Vec<&str> = line.split(':').collect();
+        if fields.len() < 7 || fields[0].trim() != user {
+            return None;
+        }
+        let shell = fields[6].trim();
+        if shell.is_empty() {
+            None
+        } else {
+            Some(shell.to_string())
+        }
+    })
+}
+
+/// Markers around the shell hook, so re-installing replaces the old block and
+/// Remove can find it again.
+pub(crate) const HOOK_BEGIN: &str = "# >>> rustterm directory tracking >>>";
+pub(crate) const HOOK_END: &str = "# <<< rustterm directory tracking <<<";
+
+/// Emits OSC 7 before every prompt. Works in bash (`PROMPT_COMMAND`) and zsh
+/// (`precmd_functions`); the zsh-only syntax sits inside `eval`, so bash never
+/// has to parse it.
+const HOOK_BODY: &str = r#"__rustterm_cwd() {
+    printf '\033]7;file://%s%s\033\\' "${HOSTNAME:-localhost}" "$PWD"
+}
+if [ -n "$ZSH_VERSION" ]; then
+    eval 'typeset -ga precmd_functions; (( ${precmd_functions[(Ie)__rustterm_cwd]} )) || precmd_functions+=(__rustterm_cwd)'
+else
+    case "$PROMPT_COMMAND" in
+        *__rustterm_cwd*) ;;
+        *) PROMPT_COMMAND="__rustterm_cwd${PROMPT_COMMAND:+;$PROMPT_COMMAND}" ;;
+    esac
+fi"#;
+
+fn hook_block() -> String {
+    format!("{HOOK_BEGIN}\n{HOOK_BODY}\n{HOOK_END}\n")
+}
+
+/// Remove a marked block, leaving the rest of the file untouched.
+///
+/// A file with only one of the two markers is returned unchanged rather than
+/// truncated: a half-written block is not ours to guess at.
+fn strip_hook_block(text: &str) -> String {
+    if !text.contains(HOOK_BEGIN) || !text.contains(HOOK_END) {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    let mut inside = false;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(['\r', '\n']).trim();
+        if trimmed == HOOK_BEGIN {
+            inside = true;
+            continue;
+        }
+        if inside {
+            if trimmed == HOOK_END {
+                inside = false;
+            }
+            continue;
+        }
+        out.push_str(line);
+    }
+    // Drop the blank line the block was separated with.
+    while out.ends_with("\n\n") {
+        out.pop();
+    }
+    out
+}
+
+/// Replace any existing block with a fresh one, so installing twice is safe.
+fn install_hook_block(text: &str) -> String {
+    let mut base = strip_hook_block(text);
+    if !base.is_empty() {
+        if !base.ends_with('\n') {
+            base.push('\n');
+        }
+        // One blank line between the user's file and our block.
+        base.push('\n');
+    }
+    base.push_str(&hook_block());
+    base
+}
+
+/// Add or remove the hook in `rc`, creating a one-time backup before writing.
+async fn edit_hook(client: &SftpClient, rc: &str, install: bool) -> Result<HookResult, String> {
+    let existing = match client.session.metadata(rc).await {
+        Ok(_) => client
+            .session
+            .read(rc)
+            .await
+            .map_err(|err| format!("could not read '{rc}': {err}"))?,
+        // A missing startup file is normal: it is created below.
+        Err(_) => Vec::new(),
+    };
+    let text = String::from_utf8_lossy(&existing).into_owned();
+    let next = if install {
+        install_hook_block(&text)
+    } else {
+        strip_hook_block(&text)
+    };
+    if next == text {
+        return Ok(HookResult {
+            path: rc.to_string(),
+            backup: None,
+            changed: false,
+        });
+    }
+
+    // Back up the original once; a second install must not replace the backup
+    // with an already-modified file.
+    let backup = format!("{rc}.rustterm-backup");
+    let mut backup_path = None;
+    if install && !existing.is_empty() && client.session.metadata(&backup).await.is_err() {
+        client
+            .session
+            .write(&backup, &existing)
+            .await
+            .map_err(|err| format!("could not write '{backup}': {err}"))?;
+        backup_path = Some(backup);
+    }
+
+    client
+        .session
+        .write(rc, next.as_bytes())
+        .await
+        .map_err(|err| format!("could not write '{rc}': {err}"))?;
+    Ok(HookResult {
+        path: rc.to_string(),
+        backup: backup_path,
+        changed: true,
+    })
 }
 
 async fn remote_home(sftp: &SftpSession) -> Result<String, String> {
@@ -2515,5 +2793,79 @@ bob:x:1001:1001::/home/bob:/bin/sh
         let config = client_config();
         assert_eq!(config.keepalive_interval, Some(Duration::from_secs(15)));
         assert_eq!(config.keepalive_max, 3);
+    }
+
+    #[test]
+    fn finds_the_login_shell_in_passwd() {
+        let passwd = "\
+root:x:0:0:root:/root:/bin/bash
+alice:x:1000:1000:Alice:/home/alice:/usr/bin/zsh
+empty:x:1001:1001::/home/empty:
+short:x:1
+";
+        assert_eq!(
+            shell_from_passwd(passwd, "alice").as_deref(),
+            Some("/usr/bin/zsh")
+        );
+        assert_eq!(
+            shell_from_passwd(passwd, "root").as_deref(),
+            Some("/bin/bash")
+        );
+        assert_eq!(shell_from_passwd(passwd, "empty"), None);
+        assert_eq!(shell_from_passwd(passwd, "short"), None);
+        assert_eq!(shell_from_passwd(passwd, "nobody"), None);
+    }
+
+    #[test]
+    fn hook_block_installs_once_and_can_be_removed() {
+        let original = "# my bashrc\nexport EDITOR=vim\n";
+        let installed = install_hook_block(original);
+        assert!(installed.starts_with(original.trim_end()));
+        assert_eq!(installed.matches(HOOK_BEGIN).count(), 1);
+        assert_eq!(installed.matches(HOOK_END).count(), 1);
+        assert!(installed.contains("__rustterm_cwd"));
+
+        // Installing again must replace, not append a second block.
+        let again = install_hook_block(&installed);
+        assert_eq!(again, installed);
+        assert_eq!(again.matches(HOOK_BEGIN).count(), 1);
+
+        // Removing restores the original text (modulo the blank separator).
+        let restored = strip_hook_block(&installed);
+        assert_eq!(restored, original);
+    }
+
+    #[test]
+    fn hook_block_creates_a_file_that_only_has_the_block() {
+        let installed = install_hook_block("");
+        assert!(installed.starts_with(HOOK_BEGIN));
+        assert_eq!(strip_hook_block(&installed), "");
+    }
+
+    #[test]
+    fn hook_block_leaves_partial_markers_alone() {
+        let broken = format!("keep me\n{HOOK_BEGIN}\nhalf a block\n");
+        assert_eq!(strip_hook_block(&broken), broken);
+        // A file without markers is returned untouched.
+        assert_eq!(strip_hook_block("plain\n"), "plain\n");
+    }
+
+    #[test]
+    fn hook_snippet_is_valid_bash() {
+        let bash = std::path::Path::new("/bin/bash");
+        if !bash.exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("rustterm-hook-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("hook.sh");
+        std::fs::write(&script, format!("{HOOK_BODY}\n")).unwrap();
+        let status = std::process::Command::new(bash)
+            .arg("-n")
+            .arg(&script)
+            .status()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(status.success(), "bash -n rejected the hook snippet");
     }
 }

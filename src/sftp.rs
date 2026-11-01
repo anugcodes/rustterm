@@ -5,14 +5,18 @@
 //! `ssh.rs`; this module tracks the current path, the last listing, clipboard
 //! contents, dialogs and the in-flight request or file operation.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::ssh::{ConflictPolicy, RemoteEntry, SshSession, TransferProgress};
+use notify::Watcher as _;
+
+use crate::ssh::{
+    ConflictPolicy, HookResult, RemoteEntry, ResolvedLink, SshSession, TransferProgress, Wake,
+};
 
 /// Where a remote file should be opened locally.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -204,13 +208,24 @@ pub struct ActiveTransfer {
     pub progress: Arc<TransferProgress>,
     rx: std_mpsc::Receiver<Result<String, String>>,
     verb: &'static str,
+    /// Local copy of an editor upload, so a success can clear its journal entry.
+    local: Option<PathBuf>,
 }
 
-/// How often the local copies opened in an editor are checked for a save.
-const EDIT_CHECK_INTERVAL: Duration = Duration::from_millis(600);
+/// How long the local copies opened in an editor stay quiet after a filesystem
+/// event before the save is uploaded. Editors emit several events per write.
+const EDIT_DEBOUNCE: Duration = Duration::from_millis(150);
+
+/// Safety pass while a file is open: catches events inotify can miss (network
+/// mounts, watcher limits) and notices a deleted temporary copy.
+const EDIT_SAFETY_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How long a missing local file is tolerated. Editors that save atomically
+/// replace the file, so it is briefly absent.
+const EDIT_GONE_GRACE: Duration = Duration::from_secs(12);
 
 /// Size and modification time of a local file. Cheap to read and enough to
-/// notice a save from any editor (including atomic write-and-rename).
+/// confirm that an event really was a save.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FileStamp {
     modified: Option<SystemTime>,
@@ -245,13 +260,11 @@ struct EditWatch {
     name: String,
     /// State at the last upload (or at launch), to detect the next save.
     stamp: Option<FileStamp>,
-    /// Consecutive checks that found no local file.
-    missing: u32,
+    /// When the watcher last reported activity for this file.
+    dirty_at: Option<Instant>,
+    /// When the local copy was first found missing.
+    missing_since: Option<Instant>,
 }
-
-/// How many checks (at `EDIT_CHECK_INTERVAL`) a missing local file is
-/// tolerated. Editors that save by writing and renaming are briefly absent.
-const WATCH_GONE_CHECKS: u32 = 20;
 
 impl EditWatch {
     fn new(local: PathBuf, remote: String, name: String) -> Self {
@@ -261,28 +274,370 @@ impl EditWatch {
             remote,
             name,
             stamp,
-            missing: 0,
+            dirty_at: None,
+            missing_since: None,
         }
     }
 
-    fn check(&mut self) -> WatchState {
+    /// A filesystem event mentioned this file; start the quiet period.
+    fn touch(&mut self, now: Instant) {
+        self.dirty_at = Some(now);
+        self.missing_since = None;
+    }
+
+    /// Whether a filesystem event has settled long enough to be uploaded.
+    fn settled(&self, now: Instant) -> bool {
+        self.dirty_at
+            .is_some_and(|at| now.duration_since(at) >= EDIT_DEBOUNCE)
+    }
+
+    fn check(&mut self, now: Instant) -> WatchState {
         let Some(stamp) = FileStamp::of(&self.local) else {
             // A file that momentarily disappears (atomic save) is not an
-            // error and is not uploaded; the next check sees the replacement.
-            self.missing += 1;
-            return if self.missing >= WATCH_GONE_CHECKS {
-                WatchState::Gone
-            } else {
-                WatchState::Unchanged
-            };
+            // error and is not uploaded; the next pass sees the replacement.
+            let since = *self.missing_since.get_or_insert(now);
+            if now.duration_since(since) >= EDIT_GONE_GRACE {
+                return WatchState::Gone;
+            }
+            return WatchState::Unchanged;
         };
-        self.missing = 0;
+        self.missing_since = None;
         if Some(stamp) == self.stamp {
+            self.dirty_at = None;
             return WatchState::Unchanged;
         }
         self.stamp = Some(stamp);
+        self.dirty_at = None;
         WatchState::Changed
     }
+}
+
+/// Inotify watcher behind the save detection.
+///
+/// One watcher is shared by every open copy. It watches the *parent directory*
+/// of each file because most editors save by writing a temporary file and
+/// renaming it over the original, which would silently break a watch on the
+/// file itself.
+struct EditNotifier {
+    watcher: notify::RecommendedWatcher,
+    events: std_mpsc::Receiver<notify::Event>,
+    dirs: std::collections::HashSet<PathBuf>,
+}
+
+impl std::fmt::Debug for EditNotifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EditNotifier")
+            .field("dirs", &self.dirs)
+            .finish()
+    }
+}
+
+impl EditNotifier {
+    fn new(wake: Option<Wake>) -> Option<Self> {
+        let (tx, events) = std_mpsc::channel();
+        let watcher = notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
+            if let Ok(event) = result {
+                let _ = tx.send(event);
+                if let Some(wake) = &wake {
+                    wake();
+                }
+            }
+        })
+        .ok()?;
+        Some(Self {
+            watcher,
+            events,
+            dirs: std::collections::HashSet::new(),
+        })
+    }
+
+    /// Watch the folder containing `local`, once per folder.
+    fn watch_parent(&mut self, local: &Path) -> bool {
+        let Some(dir) = local.parent() else {
+            return false;
+        };
+        let dir = dir.to_path_buf();
+        if self.dirs.contains(&dir) {
+            return true;
+        }
+        if self
+            .watcher
+            .watch(&dir, notify::RecursiveMode::NonRecursive)
+            .is_err()
+        {
+            return false;
+        }
+        self.dirs.insert(dir);
+        true
+    }
+}
+
+/// The wake callback handed to the SFTP panel, kept behind a manual `Debug`
+/// impl so `SftpExplorer` can still derive it.
+#[derive(Default)]
+struct Waker(Option<Wake>);
+
+impl std::fmt::Debug for Waker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Waker")
+    }
+}
+
+/// How long unsynced local edits remain eligible after the connection drops.
+const EDIT_SYNC_WINDOW: Duration = Duration::from_secs(15 * 60);
+
+/// One local copy that may still need to be uploaded.
+#[derive(Debug, Clone)]
+struct PendingEdit {
+    local: PathBuf,
+    remote: String,
+    name: String,
+    /// Stamp the server is known to have, from the last successful upload.
+    uploaded: Option<FileStamp>,
+    /// When the connection was lost, if it is currently down.
+    offline_since: Option<Instant>,
+}
+
+/// Local copies opened in an editor that outlive a connection.
+///
+/// `EditWatch` only lives while the SFTP panel is alive. This journal is kept
+/// by the app and handed to the next session for the same profile, so a save
+/// made while offline is picked up on reconnect instead of being lost.
+#[derive(Debug, Default)]
+pub struct EditJournal {
+    profile: String,
+    entries: Vec<PendingEdit>,
+    /// Whether the entries were already offered to the current connection.
+    synced: bool,
+}
+
+impl EditJournal {
+    fn for_profile(profile: &str) -> Self {
+        Self {
+            profile: profile.to_string(),
+            ..Self::default()
+        }
+    }
+
+    pub fn profile(&self) -> &str {
+        &self.profile
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Re-open the local copy for `remote` if it still has unsynced changes.
+    fn local_copy(&self, remote: &str) -> Option<PathBuf> {
+        self.entries
+            .iter()
+            .find(|entry| {
+                entry.remote == remote
+                    && entry.local.exists()
+                    && FileStamp::of(&entry.local) != entry.uploaded
+            })
+            .map(|entry| entry.local.clone())
+    }
+
+    /// Remember a file that was just opened in an editor.
+    ///
+    /// Re-opening the same remote path keeps the previously uploaded stamp, so
+    /// changes made while the connection was down still count as unsynced.
+    fn record(&mut self, local: &Path, remote: &str, name: &str) {
+        if let Some(entry) = self.entries.iter_mut().find(|seen| seen.local == local) {
+            entry.remote = remote.to_string();
+            entry.name = name.to_string();
+            return;
+        }
+        // A fresh download supersedes any older copy of the same remote path.
+        self.entries.retain(|entry| entry.remote != remote);
+        self.entries.push(PendingEdit {
+            local: local.to_path_buf(),
+            remote: remote.to_string(),
+            name: name.to_string(),
+            uploaded: FileStamp::of(local),
+            offline_since: None,
+        });
+    }
+
+    /// The server now has the file as it is on disk.
+    fn mark_uploaded(&mut self, local: &Path) {
+        if let Some(entry) = self.entries.iter_mut().find(|seen| seen.local == local) {
+            entry.uploaded = FileStamp::of(local);
+            entry.offline_since = None;
+        }
+    }
+
+    fn forget(&mut self, local: &Path) {
+        self.entries.retain(|entry| entry.local != local);
+    }
+
+    /// Mark every entry as waiting for a working connection.
+    pub fn mark_offline(&mut self, now: Instant) {
+        for entry in &mut self.entries {
+            entry.offline_since.get_or_insert(now);
+        }
+    }
+
+    /// Drop entries that have been offline longer than `EDIT_SYNC_WINDOW`.
+    /// Returns their names so the caller can tell the user.
+    pub fn expire(&mut self, now: Instant) -> Vec<String> {
+        let mut expired = Vec::new();
+        self.entries.retain(|entry| {
+            let stale = entry
+                .offline_since
+                .is_some_and(|since| now.duration_since(since) >= EDIT_SYNC_WINDOW);
+            if stale {
+                expired.push(entry.name.clone());
+            }
+            !stale
+        });
+        expired
+    }
+
+    /// Files whose local copy differs from what the server was last given.
+    ///
+    /// A file that no longer exists locally is not pending; it is dropped.
+    fn pending(&mut self, now: Instant) -> Vec<(PathBuf, String, String)> {
+        self.entries.retain(|entry| entry.local.exists());
+        for entry in &mut self.entries {
+            entry.offline_since.get_or_insert(now);
+        }
+        self.entries
+            .iter()
+            .filter(|entry| FileStamp::of(&entry.local) != entry.uploaded)
+            .map(|entry| {
+                (
+                    entry.local.clone(),
+                    entry.remote.clone(),
+                    entry.name.clone(),
+                )
+            })
+            .collect()
+    }
+}
+
+/// Give the first shell prompt a moment to report its directory before
+/// offering the shell-hook hint; otherwise it flashes on every connect.
+const HOOK_HINT_DELAY: Duration = Duration::from_secs(3);
+
+/// Upper bound on each history stack.
+const HISTORY_LIMIT: usize = 100;
+
+/// One-line version of the hook, typed into a live shell by **Enable now**.
+///
+/// It must stay on a single line so Enter runs the whole thing, and it is
+/// idempotent so a second click does not stack `PROMPT_COMMAND` entries. The
+/// zsh-only expression sits inside `eval` so bash never has to parse it.
+const SESSION_HOOK: &str = concat!(
+    "__rustterm_cwd() { printf '\\033]7;file://%s%s\\033\\\\' \"${HOSTNAME:-localhost}\" \"$PWD\"; }; ",
+    "if [ -n \"$ZSH_VERSION\" ]; then ",
+    "eval 'typeset -ga precmd_functions; (( ${precmd_functions[(Ie)__rustterm_cwd]} )) || precmd_functions+=(__rustterm_cwd)'; ",
+    "else case \"$PROMPT_COMMAND\" in *__rustterm_cwd*) ;; *) ",
+    "PROMPT_COMMAND=\"__rustterm_cwd${PROMPT_COMMAND:+;$PROMPT_COMMAND}\" ;; esac; fi"
+);
+
+/// Why a listing was started. History is committed only when the reply
+/// succeeds, so a failed navigation cannot corrupt the stacks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NavIntent {
+    /// First listing or reconnect: replace the directory silently.
+    Initial,
+    /// Explicit navigation: path box, Up, Home, or a folder click.
+    User,
+    /// Shell-driven following.
+    Follow,
+    /// Same directory, re-listed after a file operation.
+    Refresh,
+    /// Back/Forward buttons.
+    Back,
+    Forward,
+}
+
+/// Browser-style directory history for the panel.
+#[derive(Debug, Default)]
+struct SftpHistory {
+    back: Vec<String>,
+    forward: Vec<String>,
+    current: String,
+}
+
+impl SftpHistory {
+    fn can_back(&self) -> bool {
+        !self.back.is_empty()
+    }
+
+    fn can_forward(&self) -> bool {
+        !self.forward.is_empty()
+    }
+
+    fn back_target(&self) -> Option<String> {
+        self.back.last().cloned()
+    }
+
+    fn forward_target(&self) -> Option<String> {
+        self.forward.last().cloned()
+    }
+
+    /// Record a listing that actually succeeded.
+    fn visit(&mut self, path: &str, intent: NavIntent) {
+        match intent {
+            NavIntent::Initial => self.current = path.to_string(),
+            NavIntent::Refresh => {
+                if self.current.is_empty() {
+                    self.current = path.to_string();
+                }
+            }
+            NavIntent::User | NavIntent::Follow => {
+                if self.current == path {
+                    return;
+                }
+                if !self.current.is_empty() {
+                    let previous = std::mem::take(&mut self.current);
+                    push_history(&mut self.back, previous);
+                }
+                self.current = path.to_string();
+                self.forward.clear();
+            }
+            NavIntent::Back => {
+                if self.back.last().map(String::as_str) == Some(path) {
+                    self.back.pop();
+                }
+                if self.current != path {
+                    let previous = std::mem::replace(&mut self.current, path.to_string());
+                    push_history(&mut self.forward, previous);
+                }
+            }
+            NavIntent::Forward => {
+                if self.forward.last().map(String::as_str) == Some(path) {
+                    self.forward.pop();
+                }
+                if self.current != path {
+                    let previous = std::mem::replace(&mut self.current, path.to_string());
+                    push_history(&mut self.back, previous);
+                }
+            }
+        }
+    }
+}
+
+fn push_history(stack: &mut Vec<String>, path: String) {
+    if path.is_empty() || stack.last() == Some(&path) {
+        return;
+    }
+    stack.push(path);
+    if stack.len() > HISTORY_LIMIT {
+        stack.remove(0);
+    }
+}
+
+/// Consent modal for writing the shell hook into a startup file.
+#[derive(Debug, Clone)]
+pub struct HookPrompt {
+    /// Startup file that will be edited.
+    pub path: String,
+    /// Login shell that selected it.
+    pub shell: String,
 }
 
 /// State for the SFTP side panel.
@@ -295,6 +650,38 @@ pub struct SftpExplorer {
     pub listed_path: String,
     /// Editable copy shown in the path box.
     pub path_edit: String,
+    /// Follow the shell's working directory (OSC 7). Manual navigation turns
+    /// this off; the Follow chip turns it back on.
+    pub follow: bool,
+    /// True while the path box has focus. Following waits so it cannot
+    /// overwrite what the user is typing.
+    pub path_focused: bool,
+    /// Most recent directory reported by the shell.
+    shell_cwd: Option<String>,
+    /// Whether any OSC 7 report has arrived this session.
+    saw_shell_cwd: bool,
+    /// A shell directory the panel already failed to open; not retried on
+    /// every prompt.
+    follow_denied: Option<String>,
+    /// Login name, for the `/etc/passwd` shell lookup.
+    user: String,
+    /// Resolved remote home directory, used to build startup-file paths.
+    home: Option<String>,
+    /// Login shell from `/etc/passwd`.
+    login_shell: Option<String>,
+    /// Set when the install dialog was requested but the shell was still being
+    /// detected.
+    hook_requested: bool,
+    /// Set when the hint was dismissed for this session.
+    hook_hint_dismissed: bool,
+    /// When the panel was created, so the hint waits for the first prompt.
+    started_at: Option<Instant>,
+    /// Consent modal for the shell hook.
+    pub hook_prompt: Option<HookPrompt>,
+    /// Symlink targets resolved so far, for the details strip.
+    link_targets: HashMap<String, String>,
+    /// Directory history behind Back/Forward.
+    history: SftpHistory,
     pub entries: Vec<RemoteEntry>,
     pub selected: Option<usize>,
     pub loading: bool,
@@ -314,8 +701,14 @@ pub struct SftpExplorer {
     last_auto_upload: bool,
     /// Local copies opened in an editor, watched for saves.
     edits: Vec<EditWatch>,
-    /// Rate limit for the save watch: statting on every frame is wasteful.
-    last_edit_check: Option<Instant>,
+    /// Inotify watcher shared by every open copy.
+    notifier: Option<EditNotifier>,
+    /// When the safety pass last compared timestamps.
+    last_edit_safety: Option<Instant>,
+    /// Wakes egui when a save event arrives.
+    wake: Waker,
+    /// Local copies that outlive this connection, keyed by profile.
+    journal: EditJournal,
     /// Latest message and recent history, shown at the bottom of the panel.
     pub status: StatusLog,
     pending: Option<Job>,
@@ -329,12 +722,28 @@ pub struct SftpExplorer {
 
 #[derive(Debug)]
 enum Job {
-    Home(std_mpsc::Receiver<Result<String, String>>),
+    Home {
+        intent: NavIntent,
+        rx: std_mpsc::Receiver<Result<String, String>>,
+    },
     List {
         path: String,
+        intent: NavIntent,
         rx: std_mpsc::Receiver<Result<Vec<RemoteEntry>, String>>,
     },
     Reconnect(std_mpsc::Receiver<Result<(), String>>),
+    /// A symlink is being resolved so it can be followed.
+    Resolve {
+        entry: RemoteEntry,
+        rx: std_mpsc::Receiver<Result<ResolvedLink, String>>,
+    },
+    /// Login-shell lookup for the install dialog.
+    Shell(std_mpsc::Receiver<Result<String, String>>),
+    /// Install/remove the startup-file hook.
+    Hook {
+        install: bool,
+        rx: std_mpsc::Receiver<Result<HookResult, String>>,
+    },
 }
 
 #[derive(Debug)]
@@ -361,9 +770,14 @@ enum OnSuccess {
 
 impl SftpExplorer {
     /// Create the panel state and start resolving the remote home directory.
-    pub fn start(ssh: &SshSession) -> Self {
+    pub fn start(ssh: &SshSession, profile: &str) -> Self {
+        let user = profile.split('@').next().unwrap_or(profile).to_string();
         let mut explorer = Self {
+            follow: true,
+            user,
+            started_at: Some(Instant::now()),
             last_auto_upload: true,
+            journal: EditJournal::for_profile(profile),
             ..Self::default()
         };
         if let Some(reason) = ssh.sftp_unavailable() {
@@ -381,16 +795,29 @@ impl SftpExplorer {
         let mut activity = self.poll_transfer(ssh);
         activity |= self.poll_operation(ssh);
         activity |= self.poll_edits(ssh);
+        // One reconnect-sync attempt per connection. `synced` is reset when the
+        // journal is installed or when Reconnect SFTP succeeds.
+        if !self.journal.synced && self.unavailable.is_none() && !self.journal.is_empty() {
+            self.journal.synced = true;
+            activity |= self.sync_journal(ssh);
+        }
+        // Entries that stayed offline past the window are no longer eligible.
+        for name in self.journal.expire(Instant::now()) {
+            self.status.info(format!(
+                "{name} changed while offline but was not synced within 15 minutes"
+            ));
+        }
         let Some(job) = self.pending.take() else {
             return activity;
         };
 
         match job {
-            Job::Home(rx) => match rx.try_recv() {
+            Job::Home { intent, rx } => match rx.try_recv() {
                 Ok(Ok(home)) => {
+                    self.home = Some(home.clone());
                     self.current = home.clone();
                     self.path_edit = home.clone();
-                    self.start_list(ssh, home);
+                    self.start_list(ssh, home, intent);
                     true
                 }
                 Ok(Err(err)) => {
@@ -398,7 +825,7 @@ impl SftpExplorer {
                     true
                 }
                 Err(std_mpsc::TryRecvError::Empty) => {
-                    self.pending = Some(Job::Home(rx));
+                    self.pending = Some(Job::Home { intent, rx });
                     activity
                 }
                 Err(std_mpsc::TryRecvError::Disconnected) => {
@@ -406,11 +833,13 @@ impl SftpExplorer {
                     true
                 }
             },
-            Job::List { path, rx } => match rx.try_recv() {
+            Job::List { path, intent, rx } => match rx.try_recv() {
                 Ok(Ok(mut entries)) => {
                     sort_entries(&mut entries);
                     let count = entries.len();
                     self.entries = entries;
+                    // Only a successful listing becomes part of history.
+                    self.history.visit(&path, intent);
                     self.listed_path = path;
                     self.selected = None;
                     self.loading = false;
@@ -426,11 +855,15 @@ impl SftpExplorer {
                     true
                 }
                 Ok(Err(err)) => {
+                    if intent == NavIntent::Follow {
+                        // Do not retry an unreadable directory on every prompt.
+                        self.follow_denied = Some(path.clone());
+                    }
                     self.fail(err);
                     true
                 }
                 Err(std_mpsc::TryRecvError::Empty) => {
-                    self.pending = Some(Job::List { path, rx });
+                    self.pending = Some(Job::List { path, intent, rx });
                     activity
                 }
                 Err(std_mpsc::TryRecvError::Disconnected) => {
@@ -441,6 +874,9 @@ impl SftpExplorer {
             Job::Reconnect(rx) => match rx.try_recv() {
                 Ok(Ok(())) => {
                     self.unavailable = None;
+                    // The channel is back: pick up any edits made while it was
+                    // down before the listing is refreshed.
+                    self.journal.synced = false;
                     self.load_home(ssh);
                     self.status.success("SFTP reconnected");
                     true
@@ -460,6 +896,103 @@ impl SftpExplorer {
                     let message = "the SSH session closed while reconnecting SFTP";
                     self.unavailable = Some(message.to_string());
                     self.status.error(message);
+                    true
+                }
+            },
+            Job::Resolve { entry, rx } => match rx.try_recv() {
+                Ok(Ok(link)) => {
+                    if let Some(target) = link.target {
+                        self.link_targets.insert(entry.path.clone(), target);
+                    }
+                    if link.is_dir {
+                        // Following a link is manual browsing; stop tracking
+                        // the shell so the next prompt does not yank it away.
+                        self.follow = false;
+                        self.start_list(ssh, entry.path, NavIntent::User);
+                    } else {
+                        self.begin_open_with(&entry);
+                    }
+                    true
+                }
+                Ok(Err(err)) => {
+                    self.status.error(err);
+                    true
+                }
+                Err(std_mpsc::TryRecvError::Empty) => {
+                    self.pending = Some(Job::Resolve { entry, rx });
+                    activity
+                }
+                Err(std_mpsc::TryRecvError::Disconnected) => {
+                    self.fail("the SFTP session closed while resolving a link");
+                    true
+                }
+            },
+            Job::Shell(rx) => match rx.try_recv() {
+                Ok(Ok(shell)) => {
+                    self.login_shell = Some(shell.clone());
+                    if self.hook_requested {
+                        self.hook_requested = false;
+                        self.open_hook_prompt();
+                    } else {
+                        self.status.info(format!("Login shell: {shell}"));
+                    }
+                    true
+                }
+                Ok(Err(err)) => {
+                    self.hook_requested = false;
+                    self.status.error(err);
+                    true
+                }
+                Err(std_mpsc::TryRecvError::Empty) => {
+                    self.pending = Some(Job::Shell(rx));
+                    activity
+                }
+                Err(std_mpsc::TryRecvError::Disconnected) => {
+                    self.fail("the SFTP session closed while reading /etc/passwd");
+                    true
+                }
+            },
+            Job::Hook { install, rx } => match rx.try_recv() {
+                Ok(Ok(result)) => {
+                    if install {
+                        // Activate it in the current shell too, not only at the
+                        // next login — even when the file was already correct.
+                        self.send_session_hook(ssh);
+                        self.follow = true;
+                    }
+                    let backup = result
+                        .backup
+                        .map(|path| format!(" (backup: {path})"))
+                        .unwrap_or_default();
+                    if result.changed {
+                        let verb = if install {
+                            "installed in"
+                        } else {
+                            "removed from"
+                        };
+                        self.status
+                            .success(format!("Directory tracking {verb} {}{backup}", result.path));
+                    } else {
+                        let state = if install {
+                            "already installed"
+                        } else {
+                            "was not installed"
+                        };
+                        self.status
+                            .info(format!("Nothing to change: {} ({state})", result.path));
+                    }
+                    true
+                }
+                Ok(Err(err)) => {
+                    self.status.error(err);
+                    true
+                }
+                Err(std_mpsc::TryRecvError::Empty) => {
+                    self.pending = Some(Job::Hook { install, rx });
+                    activity
+                }
+                Err(std_mpsc::TryRecvError::Disconnected) => {
+                    self.fail("the SFTP session closed while editing the startup file");
                     true
                 }
             },
@@ -512,69 +1045,95 @@ impl SftpExplorer {
                 remote,
                 name,
                 auto_upload,
-            } => match launch_editor(editor, custom.as_deref(), &local) {
-                Ok(()) => {
-                    if auto_upload {
-                        // Watch from the state right after launch, so an
-                        // editor that touches the file on open does not
-                        // trigger an immediate re-upload. Opening the same
-                        // copy twice replaces the earlier watch instead of
-                        // uploading the file twice per save.
-                        let watch = EditWatch::new(local.clone(), remote, name.clone());
-                        match self.edits.iter_mut().find(|seen| seen.local == local) {
-                            Some(seen) => *seen = watch,
-                            None => self.edits.push(watch),
-                        }
-                        self.status.success(format!(
-                            "Opened {name} in {} — saving uploads it back",
-                            editor_label(editor, custom.as_deref())
-                        ));
-                    } else {
-                        self.status.success(format!(
-                            "Opened {name} in {} (downloaded to {})",
-                            editor_label(editor, custom.as_deref()),
-                            local.display()
-                        ));
-                    }
-                }
-                Err(err) => {
+            } => self.launch_local_copy(editor, custom, local, remote, name, auto_upload),
+        }
+    }
+
+    /// Open an already-downloaded copy and (optionally) watch it for saves.
+    fn launch_local_copy(
+        &mut self,
+        editor: EditorChoice,
+        custom: Option<String>,
+        local: PathBuf,
+        remote: String,
+        name: String,
+        auto_upload: bool,
+    ) {
+        let label = editor_label(editor, custom.as_deref());
+        match launch_editor(editor, custom.as_deref(), &local) {
+            Ok(()) => {
+                if auto_upload {
+                    // Watch from the state right after launch, so an editor
+                    // that touches the file on open does not trigger an
+                    // immediate re-upload. Opening the same copy twice replaces
+                    // the earlier watch instead of uploading it twice per save.
+                    self.watch_edit(local.clone(), remote, name.clone());
                     self.status
-                        .error(format!("{err} (the download is at {})", local.display()));
+                        .success(format!("Opened {name} in {label} — saving uploads it back"));
+                } else {
+                    self.status.success(format!(
+                        "Opened {name} in {label} (local copy: {})",
+                        local.display()
+                    ));
                 }
-            },
+            }
+            Err(err) => {
+                self.status
+                    .error(format!("{err} (the download is at {})", local.display()));
+            }
         }
     }
 
     /// Resolve `.` again (usually the login home directory).
+    ///
+    /// Used by connect and reconnect, so it keeps following the shell.
     pub fn load_home(&mut self, ssh: &SshSession) {
+        self.request_home(ssh, NavIntent::Initial);
+    }
+
+    /// Toolbar **Home**: explicit navigation, so following pauses.
+    pub fn go_home(&mut self, ssh: &SshSession) {
+        self.follow = false;
+        self.request_home(ssh, NavIntent::User);
+    }
+
+    fn request_home(&mut self, ssh: &SshSession, intent: NavIntent) {
         self.status.info("Loading remote files…");
         if let Some(rx) = ssh.sftp_home() {
             self.loading = true;
-            self.pending = Some(Job::Home(rx));
+            self.pending = Some(Job::Home { intent, rx });
         } else {
             self.mark_unavailable(ssh);
         }
     }
 
     /// Show `path`, replacing the current listing once the reply arrives.
+    ///
+    /// A user navigation stops shell following, so the panel never moves under
+    /// the user while they browse.
     pub fn navigate(&mut self, ssh: &SshSession, path: impl Into<String>) {
-        let path = path.into();
+        self.follow = false;
+        self.navigate_inner(ssh, path.into(), NavIntent::User);
+    }
+
+    fn navigate_inner(&mut self, ssh: &SshSession, path: String, intent: NavIntent) {
         let path = path.trim();
         if path.is_empty() {
             self.status.error("Enter a remote path");
             return;
         }
-        self.start_list(ssh, path.to_string());
+        self.start_list(ssh, path.to_string(), intent);
     }
 
-    /// Re-list the current directory.
+    /// Re-list the current directory. This is not a move, so it keeps
+    /// following and does not touch history.
     pub fn refresh(&mut self, ssh: &SshSession) {
         let path = if self.current.is_empty() {
             ".".to_string()
         } else {
             self.current.clone()
         };
-        self.navigate(ssh, path);
+        self.start_list(ssh, path, NavIntent::Refresh);
     }
 
     /// Go to the parent of `current`.
@@ -582,8 +1141,96 @@ impl SftpExplorer {
         if self.current.is_empty() {
             return;
         }
+        self.follow = false;
         let parent = parent_path(&self.current);
-        self.navigate(ssh, parent);
+        self.start_list(ssh, parent, NavIntent::User);
+    }
+
+    pub fn can_back(&self) -> bool {
+        self.history.can_back()
+    }
+
+    pub fn can_forward(&self) -> bool {
+        self.history.can_forward()
+    }
+
+    /// Go to the previous directory. Manual navigation pauses following.
+    pub fn back(&mut self, ssh: &SshSession) -> bool {
+        let Some(target) = self.history.back_target() else {
+            return false;
+        };
+        self.follow = false;
+        self.start_list(ssh, target, NavIntent::Back);
+        true
+    }
+
+    /// Go forward again after one or more **Back** steps.
+    pub fn forward(&mut self, ssh: &SshSession) -> bool {
+        let Some(target) = self.history.forward_target() else {
+            return false;
+        };
+        self.follow = false;
+        self.start_list(ssh, target, NavIntent::Forward);
+        true
+    }
+
+    /// Follow a directory reported by the shell via OSC 7.
+    ///
+    /// The latest report is always remembered, even while following is off or
+    /// the path box has focus, so clicking **Follow** can catch up instantly.
+    pub fn follow_shell_cwd(&mut self, ssh: &SshSession, cwd: &str) {
+        let Some(path) = normalize_shell_path(cwd) else {
+            return;
+        };
+        self.saw_shell_cwd = true;
+        if self.shell_cwd.as_deref() == Some(&path) {
+            return;
+        }
+        self.shell_cwd = Some(path.clone());
+        if !self.follow || self.unavailable.is_some() || self.path_focused {
+            return;
+        }
+        if self.current == path || self.listed_path == path {
+            return;
+        }
+        if self.follow_denied.as_deref() == Some(path.as_str()) {
+            return;
+        }
+        self.navigate_inner(ssh, path, NavIntent::Follow);
+    }
+
+    /// Turn following on or off; turning it on re-syncs to the shell at once.
+    pub fn set_follow(&mut self, ssh: &SshSession, follow: bool) {
+        self.follow = follow;
+        if !follow {
+            self.status.info("Stopped following the shell");
+            return;
+        }
+        match self.shell_cwd.clone() {
+            Some(cwd) if cwd != self.current => {
+                self.navigate_inner(ssh, cwd, NavIntent::Follow);
+            }
+            Some(_) => self.status.success("Following the shell again"),
+            None => self
+                .status
+                .info("Following the shell — waiting for the first directory report"),
+        }
+    }
+
+    /// Whether the panel should offer the shell-hook hint.
+    pub fn wants_hook_hint(&self) -> bool {
+        self.follow
+            && !self.saw_shell_cwd
+            && !self.hook_hint_dismissed
+            && self.unavailable.is_none()
+            && !self.current.is_empty()
+            && self
+                .started_at
+                .is_some_and(|started| started.elapsed() >= HOOK_HINT_DELAY)
+    }
+
+    pub fn dismiss_hook_hint(&mut self) {
+        self.hook_hint_dismissed = true;
     }
 
     /// Reopen the SFTP channel without touching the terminal.
@@ -815,7 +1462,16 @@ impl SftpExplorer {
             self.mark_unavailable(ssh);
             return false;
         };
-        self.transfer = Some(ActiveTransfer { progress, rx, verb });
+        let local = match &request.kind {
+            TransferKind::UploadOne { local, .. } => Some(local.clone()),
+            _ => None,
+        };
+        self.transfer = Some(ActiveTransfer {
+            progress,
+            rx,
+            verb,
+            local,
+        });
         true
     }
 
@@ -825,6 +1481,10 @@ impl SftpExplorer {
         };
         match active.rx.try_recv() {
             Ok(Ok(detail)) => {
+                if let Some(local) = &active.local {
+                    // The server now has this exact version.
+                    self.journal.mark_uploaded(local);
+                }
                 self.status.success(format!("{} {detail}", active.verb));
                 self.refresh(ssh);
                 self.start_next_transfer(ssh);
@@ -864,33 +1524,138 @@ impl SftpExplorer {
 
     /// Whether any opened file is being watched for saves.
     ///
-    /// The UI keeps a slow repaint timer alive while this is true; without it a
-    /// save in the editor would not be noticed until the next mouse move.
+    /// The UI keeps a slow safety repaint alive while this is true. Save events
+    /// themselves wake egui through the watcher callback.
     pub fn watches_edits(&self) -> bool {
         !self.edits.is_empty()
     }
 
-    /// Check the local copies of files opened in an editor and queue an upload
-    /// for every save. Returns `true` when the UI should redraw.
+    /// Whether a save event is still inside its quiet period. The UI uses this
+    /// to schedule one short repaint instead of a permanent timer.
+    pub fn pending_edit_settle(&self) -> bool {
+        self.edits.iter().any(|watch| watch.dirty_at.is_some())
+    }
+
+    /// Give the panel a way to wake egui when a save event arrives.
+    pub fn attach_wake(&mut self, wake: Wake) {
+        if self.wake.0.is_none() {
+            self.wake.0 = Some(wake);
+        }
+    }
+
+    /// Detach the journal so it can survive this connection.
+    pub fn take_journal(&mut self) -> EditJournal {
+        let mut journal = std::mem::take(&mut self.journal);
+        journal.mark_offline(Instant::now());
+        journal
+    }
+
+    /// Adopt the journal of an earlier session for the same profile.
+    pub fn install_journal(&mut self, journal: EditJournal) {
+        if journal.profile == self.journal.profile {
+            self.journal = journal;
+            self.journal.synced = false;
+        }
+    }
+
+    /// Upload every journal entry whose local copy changed while offline.
+    fn sync_journal(&mut self, ssh: &SshSession) -> bool {
+        let pending = self.journal.pending(Instant::now());
+        let mut activity = false;
+        for (local, remote, name) in pending {
+            // The live watch saw the same save while the channel was down;
+            // align it so the safety pass does not upload it a second time.
+            if let Some(watch) = self.edits.iter_mut().find(|watch| watch.local == local) {
+                watch.stamp = FileStamp::of(&local);
+                watch.dirty_at = None;
+            }
+            self.status.info(format!(
+                "Uploading {name} (changes kept from before the disconnect)…"
+            ));
+            let request = TransferRequest {
+                label: format!("Uploading {name}…"),
+                kind: TransferKind::UploadOne { local, remote },
+                policy: ConflictPolicy::Overwrite,
+            };
+            self.enqueue_or_ask(ssh, request, Vec::new());
+            activity = true;
+        }
+        activity
+    }
+
+    /// Start watching a local copy that an editor has opened.
+    fn watch_edit(&mut self, local: PathBuf, remote: String, name: String) {
+        let watch = EditWatch::new(local.clone(), remote.clone(), name.clone());
+        match self.edits.iter_mut().find(|seen| seen.local == local) {
+            Some(seen) => *seen = watch,
+            None => self.edits.push(watch),
+        }
+        self.journal.record(&local, &remote, &name);
+        if self.notifier.is_none() {
+            match EditNotifier::new(self.wake.0.clone()) {
+                Some(notifier) => self.notifier = Some(notifier),
+                None => {
+                    log::warn!("file watcher unavailable; falling back to the safety pass");
+                    self.status.info(
+                        "File watching is unavailable — saves are detected by a periodic check",
+                    );
+                }
+            }
+        }
+        if let Some(notifier) = &mut self.notifier {
+            if !notifier.watch_parent(&local) {
+                log::warn!("could not watch {}", local.display());
+            }
+        }
+    }
+
+    /// Drain watcher events, then upload every save that has settled.
+    ///
+    /// Events are the primary trigger; the `EDIT_SAFETY_INTERVAL` pass covers
+    /// watcher misses and notices deleted temporary copies. Returns `true` when
+    /// the UI should redraw.
     fn poll_edits(&mut self, ssh: &SshSession) -> bool {
         if self.edits.is_empty() {
             return false;
         }
-        let now = Instant::now();
-        if self
-            .last_edit_check
-            .is_some_and(|last| now.duration_since(last) < EDIT_CHECK_INTERVAL)
-        {
+        // While the channel is down, the journal keeps the changes and the
+        // reconnect sync uploads them; trying now would only fail every save.
+        if self.unavailable.is_some() {
             return false;
         }
-        self.last_edit_check = Some(now);
+        let now = Instant::now();
+
+        // 1. Mark every file named by a watcher event as dirty. Events are
+        //    matched by path, so unrelated activity in the folder is ignored.
+        if let Some(notifier) = &self.notifier {
+            while let Ok(event) = notifier.events.try_recv() {
+                for path in &event.paths {
+                    for watch in &mut self.edits {
+                        if watch.local == *path {
+                            watch.touch(now);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. The safety pass runs on its own slower clock.
+        let safety_due = self
+            .last_edit_safety
+            .is_none_or(|last| now.duration_since(last) >= EDIT_SAFETY_INTERVAL);
+        if safety_due {
+            self.last_edit_safety = Some(now);
+        }
 
         // An editor may save several times in a row; each change found here is
         // queued in order, so the last save always wins.
         let mut changed: Vec<(PathBuf, String, String)> = Vec::new();
         let mut gone: Vec<PathBuf> = Vec::new();
         for watch in &mut self.edits {
-            match watch.check() {
+            if !safety_due && !watch.settled(now) {
+                continue;
+            }
+            match watch.check(now) {
                 WatchState::Changed => {
                     changed.push((
                         watch.local.clone(),
@@ -903,8 +1668,17 @@ impl SftpExplorer {
             }
         }
         // Deleting the temp copy (or closing an editor that removes it) ends
-        // the watch, so the UI can stop its polling timer.
-        self.edits.retain(|watch| !gone.contains(&watch.local));
+        // the watch, so the UI can stop its safety timer.
+        if !gone.is_empty() {
+            for local in &gone {
+                self.journal.forget(local);
+            }
+            self.edits.retain(|watch| !gone.contains(&watch.local));
+            if self.edits.is_empty() {
+                self.notifier = None;
+                self.last_edit_safety = None;
+            }
+        }
 
         let mut activity = !changed.is_empty();
         for (local, remote, name) in changed {
@@ -1163,6 +1937,23 @@ impl SftpExplorer {
         if !self.can_start_operation() {
             return true;
         }
+        // A copy with unsynced changes from an earlier connection is opened
+        // as-is; downloading over it would throw those changes away.
+        if let Some(local) = self.journal.local_copy(&entry.path) {
+            self.status.info(format!(
+                "Opening {} with changes that have not reached the server",
+                entry.name
+            ));
+            self.launch_local_copy(
+                editor,
+                custom,
+                local,
+                entry.path.clone(),
+                entry.name.clone(),
+                auto_upload,
+            );
+            return true;
+        }
         let local = match temp_download_path(&entry.name) {
             Ok(path) => path,
             Err(err) => {
@@ -1213,16 +2004,143 @@ impl SftpExplorer {
         });
     }
 
-    fn start_list(&mut self, ssh: &SshSession, path: String) {
+    fn start_list(&mut self, ssh: &SshSession, path: String, intent: NavIntent) {
         self.current = path.clone();
         self.path_edit = path.clone();
         self.status.info(format!("Opening {path}…"));
 
         if let Some(rx) = ssh.sftp_list(&path) {
             self.loading = true;
-            self.pending = Some(Job::List { path, rx });
+            self.pending = Some(Job::List { path, intent, rx });
         } else {
             self.mark_unavailable(ssh);
+        }
+    }
+
+    /// Resolve and open a symlink from the listing.
+    ///
+    /// A folder target is navigated to (keeping the link path in the
+    /// breadcrumb); a file target goes through the normal "Open with…" picker.
+    pub fn open_link(&mut self, ssh: &SshSession, entry: &RemoteEntry) -> bool {
+        if !entry.is_symlink {
+            return false;
+        }
+        if !self.can_start_operation() {
+            return true;
+        }
+        // `pending` holds a single job; starting a resolve would drop a listing
+        // reply and leave `loading` set forever.
+        if self.loading {
+            self.status.info("Wait for the current listing to finish");
+            return false;
+        }
+        match ssh.sftp_resolve(&entry.path) {
+            Some(rx) => {
+                self.status.info(format!("Following {}…", entry.name));
+                self.pending = Some(Job::Resolve {
+                    entry: entry.clone(),
+                    rx,
+                });
+            }
+            None => self.mark_unavailable(ssh),
+        }
+        true
+    }
+
+    /// Target of a symlink resolved earlier, if any.
+    pub fn link_target(&self, path: &str) -> Option<&str> {
+        self.link_targets.get(path).map(String::as_str)
+    }
+
+    /// Ask for the login shell, then open the install dialog.
+    pub fn begin_hook_prompt(&mut self, ssh: &SshSession) -> bool {
+        if self.unavailable.is_some() {
+            return false;
+        }
+        // Same single-job slot as a listing: do not drop its reply.
+        if self.loading {
+            self.status.info("Wait for the current listing to finish");
+            return false;
+        }
+        if self.login_shell.is_none() {
+            match ssh.sftp_login_shell(&self.user) {
+                Some(rx) => {
+                    self.hook_requested = true;
+                    self.pending = Some(Job::Shell(rx));
+                    self.status.info("Detecting your login shell…");
+                }
+                None => self.mark_unavailable(ssh),
+            }
+            return true;
+        }
+        self.open_hook_prompt();
+        true
+    }
+
+    fn open_hook_prompt(&mut self) -> bool {
+        let Some(shell) = self.login_shell.clone() else {
+            return false;
+        };
+        let Some(path) = self.rc_path(&shell) else {
+            self.status.error(format!(
+                "Directory tracking is not available for {shell}; bash and zsh are supported"
+            ));
+            return true;
+        };
+        self.hook_prompt = Some(HookPrompt { path, shell });
+        true
+    }
+
+    fn rc_path(&self, shell: &str) -> Option<String> {
+        let name = shell.rsplit('/').next().unwrap_or(shell);
+        let file = match name {
+            "bash" => ".bashrc",
+            "zsh" => ".zshrc",
+            _ => return None,
+        };
+        let home = self.home.as_deref()?;
+        Some(join_path(home, file))
+    }
+
+    /// Apply the choice from the shell-hook dialog.
+    pub fn submit_hook_prompt(&mut self, ssh: &SshSession, install: bool) -> bool {
+        let Some(prompt) = self.hook_prompt.take() else {
+            return false;
+        };
+        match ssh.sftp_edit_hook(prompt.path.clone(), install) {
+            Some(rx) => {
+                if install {
+                    self.status
+                        .info(format!("Installing directory tracking in {}…", prompt.path));
+                } else {
+                    self.status
+                        .info(format!("Removing directory tracking from {}…", prompt.path));
+                }
+                self.pending = Some(Job::Hook { install, rx });
+            }
+            None => self.mark_unavailable(ssh),
+        }
+        true
+    }
+
+    pub fn cancel_hook_prompt(&mut self) -> bool {
+        self.hook_prompt.take().is_some()
+    }
+
+    /// Type the tracking one-liner into the current shell.
+    ///
+    /// Only useful at a prompt: the bytes go to whatever owns the terminal.
+    pub fn send_session_hook(&mut self, ssh: &SshSession) -> bool {
+        let mut line = String::from(SESSION_HOOK);
+        line.push('\r');
+        if ssh.input_sender().send(line.into_bytes()).is_ok() {
+            self.status
+                .info("Sent directory tracking to the shell — it applies at the next prompt");
+            true
+        } else {
+            self.status
+                .error("the SSH session is no longer accepting input");
+            false
         }
     }
 
@@ -1241,6 +2159,9 @@ impl SftpExplorer {
         let message = message.into();
         self.unavailable = Some(message.clone());
         self.status.error(message);
+        // Start the 15-minute window for any edit that was open when the
+        // connection dropped. The journal itself is kept.
+        self.journal.mark_offline(Instant::now());
     }
 
     /// The whole SSH session is gone: drop transfers and stop offering Reconnect.
@@ -1252,6 +2173,8 @@ impl SftpExplorer {
         // Nothing can be uploaded any more, and polling local files would
         // only queue transfers that are guaranteed to fail.
         self.edits.clear();
+        self.notifier = None;
+        self.last_edit_safety = None;
         self.mark_unavailable_with("the SSH connection is closed");
     }
 
@@ -1297,6 +2220,34 @@ pub fn parent_path(path: &str) -> String {
         // Relative path such as `foo` or `.`.
         None => ".".to_string(),
     }
+}
+
+/// Clean up an absolute path reported by the shell.
+///
+/// OSC 7 always carries a path, but it may have a trailing slash, repeated
+/// separators, or `.`/`..` segments (a shell that does not normalise `$PWD`).
+/// Returns `None` for anything that is not absolute, since following a
+/// relative path would be meaningless here.
+pub fn normalize_shell_path(path: &str) -> Option<String> {
+    let path = path.trim();
+    if !path.starts_with('/') {
+        return None;
+    }
+
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    if parts.is_empty() {
+        return Some("/".to_string());
+    }
+    Some(format!("/{}", parts.join("/")))
 }
 
 /// Directories first, then case-insensitive name.
@@ -1538,6 +2489,107 @@ mod tests {
     }
 
     #[test]
+    fn normalises_shell_directories() {
+        assert_eq!(
+            normalize_shell_path("/home/me").as_deref(),
+            Some("/home/me")
+        );
+        assert_eq!(
+            normalize_shell_path("/home/me/").as_deref(),
+            Some("/home/me")
+        );
+        assert_eq!(
+            normalize_shell_path("//home///me").as_deref(),
+            Some("/home/me")
+        );
+        assert_eq!(
+            normalize_shell_path("/home/me/../you").as_deref(),
+            Some("/home/you")
+        );
+        assert_eq!(normalize_shell_path("/.//").as_deref(), Some("/"));
+        assert_eq!(normalize_shell_path("/..").as_deref(), Some("/"));
+        assert_eq!(
+            normalize_shell_path("  /var/log  ").as_deref(),
+            Some("/var/log")
+        );
+        // Relative paths cannot be followed meaningfully.
+        assert_eq!(normalize_shell_path("relative/dir"), None);
+        assert_eq!(normalize_shell_path("~/src"), None);
+        assert_eq!(normalize_shell_path(""), None);
+    }
+
+    #[test]
+    fn history_records_moves_and_drops_duplicates() {
+        let mut history = SftpHistory::default();
+        history.visit("/home", NavIntent::Initial);
+        assert_eq!(history.current, "/home");
+        assert!(!history.can_back());
+
+        history.visit("/home/src", NavIntent::User);
+        history.visit("/home/src", NavIntent::User);
+        assert_eq!(history.back, ["/home"]);
+        assert_eq!(history.current, "/home/src");
+
+        // Refreshing is not a move.
+        history.visit("/home/src", NavIntent::Refresh);
+        assert_eq!(history.back, ["/home"]);
+        assert!(!history.can_forward());
+    }
+
+    #[test]
+    fn history_back_and_forward_swap_stacks() {
+        let mut history = SftpHistory::default();
+        history.visit("/a", NavIntent::Initial);
+        history.visit("/b", NavIntent::User);
+        history.visit("/c", NavIntent::User);
+
+        let back = history.back_target().unwrap();
+        assert_eq!(back, "/b");
+        history.visit(&back, NavIntent::Back);
+        assert_eq!(history.current, "/b");
+        assert!(history.can_forward());
+        assert_eq!(history.forward_target().as_deref(), Some("/c"));
+
+        // A new move after going back clears the forward stack.
+        history.visit("/d", NavIntent::User);
+        assert!(!history.can_forward());
+        assert_eq!(history.back, ["/a", "/b"]);
+    }
+
+    #[test]
+    fn history_is_capped() {
+        let mut history = SftpHistory::default();
+        history.visit("/0", NavIntent::Initial);
+        for step in 1..=(HISTORY_LIMIT + 20) {
+            history.visit(&format!("/{step}"), NavIntent::User);
+        }
+        assert_eq!(history.back.len(), HISTORY_LIMIT);
+        assert_eq!(history.current, format!("/{}", HISTORY_LIMIT + 20));
+        // The oldest entries fell off, the newest one is still there.
+        let expected = format!("/{}", HISTORY_LIMIT + 19);
+        assert_eq!(
+            history.back.last().map(String::as_str),
+            Some(expected.as_str())
+        );
+    }
+
+    #[test]
+    fn session_hook_is_one_line_and_parses_in_bash() {
+        assert!(!SESSION_HOOK.contains('\n'));
+        let bash = Path::new("/bin/bash");
+        if !bash.exists() {
+            return;
+        }
+        let status = Command::new(bash)
+            .arg("-n")
+            .arg("-c")
+            .arg(SESSION_HOOK)
+            .status()
+            .unwrap();
+        assert!(status.success(), "bash -n rejected SESSION_HOOK");
+    }
+
+    #[test]
     fn sorts_directories_first_then_names_case_insensitively() {
         let mut entries = vec![
             entry("zeta.txt", false),
@@ -1677,27 +2729,164 @@ mod tests {
         let dir = TempDir::new("edit-watch");
         std::fs::write(dir.0.join("notes.txt"), "one").unwrap();
         let mut watch = watch_for(&dir, "notes.txt");
+        let now = Instant::now();
 
-        assert_eq!(watch.check(), WatchState::Unchanged, "no save yet");
+        assert_eq!(watch.check(now), WatchState::Unchanged, "no save yet");
 
         std::fs::write(dir.0.join("notes.txt"), "two").unwrap();
-        assert_eq!(watch.check(), WatchState::Changed, "the write is a save");
-        assert_eq!(watch.check(), WatchState::Unchanged, "uploaded once");
+        assert_eq!(watch.check(now), WatchState::Changed, "the write is a save");
+        assert_eq!(watch.check(now), WatchState::Unchanged, "uploaded once");
 
         // Editors that write and rename (or touch the file) change the stamp
         // without changing the length.
         std::thread::sleep(Duration::from_millis(20));
         std::fs::write(dir.0.join("notes.txt"), "TWO!").unwrap();
-        assert_eq!(watch.check(), WatchState::Changed, "a second save");
+        assert_eq!(watch.check(now), WatchState::Changed, "a second save");
 
         // A vanished file is tolerated for a moment (atomic save)...
         std::fs::remove_file(dir.0.join("notes.txt")).unwrap();
-        assert_eq!(watch.check(), WatchState::Unchanged);
+        assert_eq!(watch.check(now), WatchState::Unchanged);
         // ...and the watch is dropped once it stays gone.
-        for _ in 0..WATCH_GONE_CHECKS {
-            watch.check();
+        assert_eq!(
+            watch.check(now + EDIT_GONE_GRACE + Duration::from_secs(1)),
+            WatchState::Gone
+        );
+    }
+
+    #[test]
+    fn save_events_wait_for_the_debounce() {
+        let dir = TempDir::new("edit-debounce");
+        std::fs::write(dir.0.join("a.txt"), "a").unwrap();
+        let mut watch = watch_for(&dir, "a.txt");
+        let now = Instant::now();
+        assert!(!watch.settled(now), "nothing happened yet");
+
+        watch.touch(now);
+        assert!(!watch.settled(now), "an event just arrived");
+        assert!(watch.settled(now + EDIT_DEBOUNCE), "quiet period elapsed");
+        assert_eq!(watch.check(now + EDIT_DEBOUNCE), WatchState::Unchanged);
+        assert!(!watch.settled(now + EDIT_DEBOUNCE), "settled check clears");
+    }
+
+    #[test]
+    fn watcher_reports_a_write_to_the_watched_file() {
+        let dir = TempDir::new("edit-notify");
+        let local = dir.0.join("live.txt");
+        std::fs::write(&local, "one").unwrap();
+
+        let mut notifier = EditNotifier::new(None).expect("watch support");
+        assert!(notifier.watch_parent(&local));
+        std::fs::write(&local, "two").unwrap();
+
+        // inotify delivery is asynchronous; retry briefly.
+        let mut seen = false;
+        for _ in 0..100 {
+            while let Ok(event) = notifier.events.try_recv() {
+                if event.paths.iter().any(|path| path == &local) {
+                    seen = true;
+                }
+            }
+            if seen {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(watch.check(), WatchState::Gone);
+        assert!(seen, "no event for {}", local.display());
+    }
+
+    #[test]
+    fn journal_syncs_only_files_changed_since_the_last_upload() {
+        let dir = TempDir::new("edit-journal");
+        let local = dir.0.join("notes.txt");
+        std::fs::write(&local, "one").unwrap();
+        let mut journal = EditJournal::for_profile("me@host:22");
+        let now = Instant::now();
+        journal.record(&local, "/remote/notes.txt", "notes.txt");
+        assert!(journal.pending(now).is_empty(), "nothing changed yet");
+
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&local, "two").unwrap();
+        let pending = journal.pending(now);
+        assert_eq!(pending.len(), 1, "the save is pending");
+        assert_eq!(pending[0].2, "notes.txt");
+
+        // Once the server has the new version, nothing is pending any more.
+        journal.mark_uploaded(&local);
+        assert!(journal.pending(now).is_empty());
+    }
+
+    #[test]
+    fn journal_keeps_changes_when_the_file_is_reopened() {
+        let dir = TempDir::new("edit-journal-reopen");
+        let local = dir.0.join("notes.txt");
+        std::fs::write(&local, "one").unwrap();
+        let mut journal = EditJournal::for_profile("me@host:22");
+        let now = Instant::now();
+        journal.record(&local, "/remote/notes.txt", "notes.txt");
+
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&local, "two").unwrap();
+        // Re-opening the same path must not adopt the changed file as the
+        // "uploaded" state, or the offline edit would be lost.
+        journal.record(&local, "/remote/notes.txt", "notes.txt");
+        assert_eq!(journal.pending(now).len(), 1);
+    }
+
+    #[test]
+    fn journal_expires_after_the_window() {
+        let dir = TempDir::new("edit-journal-expiry");
+        let local = dir.0.join("notes.txt");
+        std::fs::write(&local, "one").unwrap();
+        let mut journal = EditJournal::for_profile("me@host:22");
+        let now = Instant::now();
+        journal.record(&local, "/remote/notes.txt", "notes.txt");
+        journal.mark_offline(now);
+
+        // Still inside the window.
+        assert!(journal.expire(now + EDIT_SYNC_WINDOW / 2).is_empty());
+        // Past it.
+        let expired = journal.expire(now + EDIT_SYNC_WINDOW + Duration::from_secs(1));
+        assert_eq!(expired, ["notes.txt"]);
+        assert!(journal.is_empty());
+    }
+
+    #[test]
+    fn journal_ignores_files_that_vanished_locally() {
+        let dir = TempDir::new("edit-journal-gone");
+        let local = dir.0.join("notes.txt");
+        std::fs::write(&local, "one").unwrap();
+        let mut journal = EditJournal::for_profile("me@host:22");
+        journal.record(&local, "/remote/notes.txt", "notes.txt");
+        std::fs::remove_file(&local).unwrap();
+        assert!(journal.pending(Instant::now()).is_empty());
+        assert!(journal.is_empty(), "a deleted copy is dropped");
+    }
+
+    #[test]
+    fn journal_is_only_installed_for_the_same_profile() {
+        let mut explorer = SftpExplorer::default();
+        let journal = EditJournal::for_profile("me@host:22");
+        explorer.install_journal(journal);
+        // The explorer's own journal has an empty profile, so nothing is adopted.
+        assert!(explorer.journal.is_empty());
+        assert_eq!(explorer.journal.profile(), "");
+    }
+
+    #[test]
+    fn journal_offers_a_local_copy_only_while_changes_are_unsynced() {
+        let dir = TempDir::new("edit-journal-reuse");
+        let local = dir.0.join("notes.txt");
+        std::fs::write(&local, "one").unwrap();
+        let mut journal = EditJournal::for_profile("me@host:22");
+        journal.record(&local, "/remote/notes.txt", "notes.txt");
+        assert!(journal.local_copy("/remote/notes.txt").is_none());
+
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&local, "two").unwrap();
+        assert_eq!(journal.local_copy("/remote/notes.txt"), Some(local.clone()));
+
+        journal.mark_uploaded(&local);
+        assert!(journal.local_copy("/remote/notes.txt").is_none());
     }
 
     #[test]

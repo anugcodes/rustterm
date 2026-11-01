@@ -518,11 +518,16 @@ pub mod icons {
     pub const RECONNECT: &str = "⚡";
     pub const GO: &str = "➡";
     pub const CLOSE: &str = "×";
+    pub const SORT_ASC: &str = "⏶";
+    pub const SORT_DESC: &str = "⏷";
+    pub const BACK: &str = "‹";
+    pub const FORWARD: &str = "›";
 
     /// Every icon above, for the font-coverage test.
     #[cfg(test)]
     pub const ALL: &[&str] = &[
         HOME, UP, REFRESH, NEW_FOLDER, COPY, PASTE, DOWNLOAD, UPLOAD, HIDDEN, RECONNECT, GO, CLOSE,
+        SORT_ASC, SORT_DESC, BACK, FORWARD,
     ];
 }
 

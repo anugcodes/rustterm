@@ -235,9 +235,175 @@ impl alacritty_terminal::event::EventListener for EventProxy {
     }
 }
 
+/// Longest OSC 7 body kept. A real `file://` URL is far shorter; the cap stops
+/// a broken or hostile stream from growing the buffer without bound.
+const OSC7_MAX: usize = 4096;
+
+/// Streaming scanner for OSC 7 (`ESC ] 7 ; file://host/path BEL|ST`).
+///
+/// `alacritty_terminal` does not expose OSC 7, so the directory is read from
+/// the raw byte stream in parallel with the VTE parser. State is kept between
+/// `feed` calls: a sequence split across two network chunks is still seen.
+#[derive(Debug, Default)]
+struct Osc7Scanner {
+    state: Osc7State,
+    /// Digits after `ESC ]`, up to the first `;`.
+    code: Vec<u8>,
+    /// The `file://…` body once the code is known to be 7.
+    body: Vec<u8>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum Osc7State {
+    #[default]
+    Ground,
+    /// Saw `ESC`.
+    Esc,
+    /// Saw `ESC ]`.
+    Osc,
+    /// Reading the numeric code before `;`.
+    Code,
+    /// Reading the body after `ESC ] 7 ;`.
+    Body,
+    /// Saw `ESC` inside the body, waiting for `\` (the ST terminator).
+    BodyEsc,
+}
+
+impl Osc7Scanner {
+    /// Feed one byte; returns a decoded path when a complete sequence ends.
+    fn advance(&mut self, byte: u8) -> Option<String> {
+        match self.state {
+            Osc7State::Ground => {
+                if byte == 0x1b {
+                    self.state = Osc7State::Esc;
+                }
+            }
+            Osc7State::Esc => match byte {
+                b']' => {
+                    self.code.clear();
+                    self.state = Osc7State::Osc;
+                }
+                0x1b => {}
+                _ => self.state = Osc7State::Ground,
+            },
+            Osc7State::Osc => match byte {
+                b'0'..=b'9' => {
+                    self.code.push(byte);
+                    self.state = Osc7State::Code;
+                }
+                0x07 => self.state = Osc7State::Ground,
+                0x1b => self.state = Osc7State::Esc,
+                _ => self.state = Osc7State::Ground,
+            },
+            Osc7State::Code => match byte {
+                b'0'..=b'9' => {
+                    // A huge code can never be 7; bail out early.
+                    if self.code.len() >= 8 {
+                        self.state = Osc7State::Ground;
+                    } else {
+                        self.code.push(byte);
+                    }
+                }
+                b';' => {
+                    if self.code == b"7" {
+                        self.body.clear();
+                        self.state = Osc7State::Body;
+                    } else {
+                        self.state = Osc7State::Ground;
+                    }
+                }
+                0x07 => self.state = Osc7State::Ground,
+                0x1b => self.state = Osc7State::Esc,
+                _ => self.state = Osc7State::Ground,
+            },
+            Osc7State::Body => match byte {
+                0x07 | 0x9c => return self.finish(),
+                0x1b => self.state = Osc7State::BodyEsc,
+                _ => {
+                    if self.body.len() < OSC7_MAX {
+                        self.body.push(byte);
+                    } else {
+                        // Too long to be a path we would act on.
+                        self.state = Osc7State::Ground;
+                    }
+                }
+            },
+            Osc7State::BodyEsc => {
+                if byte == b'\\' {
+                    return self.finish();
+                }
+                // Some other escape aborted the OSC.
+                self.state = Osc7State::Ground;
+            }
+        }
+        None
+    }
+
+    fn finish(&mut self) -> Option<String> {
+        self.state = Osc7State::Ground;
+        parse_osc7(&self.body)
+    }
+}
+
+/// Decode an OSC 7 body (`file://host/path`, percent-encoded) into a path.
+///
+/// The host is ignored: the panel only ever browses the session's own server.
+/// A bare absolute path is accepted too, because a few shells emit one.
+fn parse_osc7(body: &[u8]) -> Option<String> {
+    let body = std::str::from_utf8(body).ok()?;
+    let path = if let Some(rest) = body.strip_prefix("file://") {
+        // `file:///path` has an empty host; `file://host/path` has a name.
+        let slash = rest.find('/')?;
+        &rest[slash..]
+    } else if body.starts_with('/') {
+        body
+    } else {
+        return None;
+    };
+    let path = percent_decode(path.as_bytes());
+    if path.is_empty() || !path.starts_with('/') {
+        None
+    } else {
+        Some(path)
+    }
+}
+
+/// Percent-decode a path, leaving malformed escapes as literal text.
+fn percent_decode(bytes: &[u8]) -> String {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = hex_value(bytes[i + 1]);
+            let lo = hex_value(bytes[i + 2]);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push(hi << 4 | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 pub struct TerminalView {
     term: Term<EventProxy>,
     processor: Processor<StdSyncHandler>,
+    /// OSC 7 extractor; runs alongside the VTE parser.
+    osc7: Osc7Scanner,
+    /// Most recent directory reported by the shell, waiting for the app.
+    pending_cwd: Option<String>,
     cols: usize,
     rows: usize,
     font_size: f32,
@@ -276,6 +442,8 @@ impl TerminalView {
         Self {
             term,
             processor: Processor::new(),
+            osc7: Osc7Scanner::default(),
+            pending_cwd: None,
             cols,
             rows,
             font_size: 14.0,
@@ -296,7 +464,15 @@ impl TerminalView {
     pub fn feed(&mut self, bytes: &[u8]) {
         for &byte in bytes {
             self.processor.advance(&mut self.term, byte);
+            if let Some(cwd) = self.osc7.advance(byte) {
+                self.pending_cwd = Some(cwd);
+            }
         }
+    }
+
+    /// Take the latest working directory reported by the shell via OSC 7.
+    pub fn take_cwd(&mut self) -> Option<String> {
+        self.pending_cwd.take()
     }
 
     pub fn resize(&mut self, cols: usize, rows: usize) {
@@ -1182,5 +1358,106 @@ mod tests {
     fn wheel_button_codes_are_64_and_65() {
         assert_eq!(wheel_button_code(true), 64);
         assert_eq!(wheel_button_code(false), 65);
+    }
+
+    fn osc7(body: &str, bell: bool) -> Vec<u8> {
+        let mut bytes = b"\x1b]7;".to_vec();
+        bytes.extend_from_slice(body.as_bytes());
+        if bell {
+            bytes.push(0x07);
+        } else {
+            bytes.extend_from_slice(b"\x1b\\");
+        }
+        bytes
+    }
+
+    fn scan(bytes: &[u8]) -> Option<String> {
+        let mut scanner = Osc7Scanner::default();
+        bytes.iter().find_map(|&byte| scanner.advance(byte))
+    }
+
+    #[test]
+    fn osc7_is_decoded_with_both_terminators() {
+        assert_eq!(
+            scan(&osc7("file://host/home/me", true)).as_deref(),
+            Some("/home/me")
+        );
+        assert_eq!(
+            scan(&osc7("file://host/home/me", false)).as_deref(),
+            Some("/home/me")
+        );
+        // An empty host is the common form from many shells.
+        assert_eq!(scan(&osc7("file:///tmp", true)).as_deref(), Some("/tmp"));
+    }
+
+    #[test]
+    fn osc7_survives_every_chunk_split() {
+        let sequence = osc7("file://host/home/me/my%20dir", true);
+        for split in 0..=sequence.len() {
+            let mut scanner = Osc7Scanner::default();
+            let mut found = None;
+            for &byte in &sequence[..split] {
+                found = scanner.advance(byte).or(found);
+            }
+            for &byte in &sequence[split..] {
+                found = scanner.advance(byte).or(found);
+            }
+            assert_eq!(
+                found.as_deref(),
+                Some("/home/me/my dir"),
+                "split at byte {split}"
+            );
+        }
+    }
+
+    #[test]
+    fn osc7_percent_decodes_utf8_and_keeps_bad_escapes() {
+        assert_eq!(
+            scan(&osc7("file://h/tmp/caf%C3%A9", true)).as_deref(),
+            Some("/tmp/café")
+        );
+        assert_eq!(
+            scan(&osc7("file://h/a%zzb", true)).as_deref(),
+            Some("/a%zzb")
+        );
+        // A bare absolute path is accepted as a lenient fallback.
+        assert_eq!(scan(&osc7("/var/log", true)).as_deref(), Some("/var/log"));
+    }
+
+    #[test]
+    fn osc7_ignores_other_osc_sequences() {
+        // Window title and clipboard: neither is a directory.
+        assert_eq!(scan(b"\x1b]0;my title\x07"), None);
+        assert_eq!(scan(b"\x1b]52;c;Zm9v\x07"), None);
+        // OSC 7 without a path is dropped rather than navigating somewhere odd.
+        assert_eq!(scan(&osc7("file://host", true)), None);
+        assert_eq!(scan(&osc7("not-a-url", true)), None);
+        // Plain text that merely mentions the sequence is not enough.
+        assert_eq!(scan(b"echo ESC ] 7 ; file://host/tmp"), None);
+    }
+
+    #[test]
+    fn osc7_rejects_an_oversized_body() {
+        let mut body = String::from("file://h/");
+        body.push_str(&"a".repeat(OSC7_MAX + 100));
+        let mut sequence = b"\x1b]7;".to_vec();
+        sequence.extend_from_slice(body.as_bytes());
+        sequence.push(0x07);
+        assert_eq!(scan(&sequence), None);
+    }
+
+    #[test]
+    fn terminal_view_reports_the_shell_directory_once() {
+        let mut view = test_view();
+        view.feed(&osc7("file://host/home/me/project", true));
+        assert_eq!(view.take_cwd().as_deref(), Some("/home/me/project"));
+        assert_eq!(view.take_cwd(), None);
+
+        // A later prompt moves it again, and a split chunk still works.
+        let sequence = osc7("file://host/srv", false);
+        let (first, second) = sequence.split_at(5);
+        view.feed(first);
+        view.feed(second);
+        assert_eq!(view.take_cwd().as_deref(), Some("/srv"));
     }
 }

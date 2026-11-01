@@ -495,44 +495,67 @@ left. It opens at 450 px, can be dragged between 340 px and 55% of the window
 login directory (`canonicalize(".")`, usually `$HOME`) and lists entries in a
 table with a fixed header: **Name**, **Modified**, **Size** and **Owner**. The
 **Files** toggle in the tab bar shows/hides it, and the panel's **×** hides it
-too. Each tab keeps its own width, directory and selection.
+too. Each tab keeps its own width, directory, selection, column widths and sort.
 
-- Entries are sorted **directories first**, then case-insensitive name. The
-  font-safe icons are `🗀` for a directory, `🗋` for a regular file and `🔗` for a
-  symlink (displayed but not followed yet).
-- Rows are striped and stay on one line. **Name** starts at exactly half the
-  table width and keeps that share when the panel is resized. **Modified**,
-  **Size** and **Owner** share the other half and are hidden — Owner first,
-  then Size, then Modified — when they would be too narrow to read; their share
-  goes to the name. Only then does a long file name elide.
+The table is its own **fixed 430 px canvas**. The panel is only a window onto it:
+shrinking the panel clips the table and adds a horizontal scrollbar; growing it
+reveals more of the canvas (or blank space past Owner). Resizing the panel never
+reflows the columns or hides one.
+
+- Entries are **folders first**, then ordered by the active column. Click a
+  header to sort by it; click it again to reverse. The active column shows a
+  ⏶/⏷ arrow and an underline. Name is the default (ascending,
+  case-insensitive).
+- The font-safe icons are `🗀` for a directory, `🗋` for a regular file and `🔗`
+  for a symlink. Double-clicking a symlink follows it: a folder target is
+  listed through the link path (so `/tmp/rt-link` stays the breadcrumb) and a
+  file target opens the **Open with…** picker.
+- Rows are striped and stay on one line. Column widths are stored in pixels and
+  never depend on the panel width. A long name elides inside its column; the
+  full path is always available in the details strip.
 - The header uses the same font size as the rows and nothing is bold.
 - Column dividers exist only in the header. Drag one to resize the two columns
-  around it; the divider snaps to **12 px steps**, so it moves one notch at a
+  around it; the divider snaps to **24 px steps**, so it moves one notch at a
   time instead of following the pointer freely. A column cannot be dragged
-  below its minimum readable width, and hidden columns have no handle. File
-  rows never show resize handles.
-- Hover a row for its full path, type, size, owner, exact timestamp and relative
-  age.
+  below its minimum readable width. File rows never show resize handles.
+- Selecting a row shows a **two-line details strip** above the status bar with
+  the full remote path, type, exact size, owner, exact timestamp and relative
+  age. It disappears when nothing is selected, giving the height back to the
+  table.
+- Hovering a row still shows a compact tooltip with its path, size, owner and
+  timestamp.
 - **Single click** selects a row. **Double click** opens it: folders navigate,
-  files open the **Open with…** picker. A single click never opens a menu.
+  symlinks are followed, files open the **Open with…** picker. A single click
+  never opens a menu.
 - **Right-click** selects the row and opens its menu. File: **Open with…**,
   **Rename…**, **Copy path**, **Delete…**. Folder: **Open**, **Paste into this
   folder** (when something has been copied), **Rename…**, **Copy path**,
-  **Delete…**.
+  **Delete…**. A symlink also gets **Follow link** at the top of its menu.
 - The icon toolbar (hover for a tooltip) provides 🏠 **Home** (login directory),
   📂 **Up one level**, 🔄 **Refresh**, ➕ **New folder**, 🗐 **Copy**,
   📋 **Paste**, 📥 **Download**, 📤 **Upload**, 👁 **Hidden** (dotfiles, per
   tab), ⚡ **Reconnect** and × **Hide**. Every icon is checked against the
   bundled fonts by `theme::tests::icons_have_glyphs`, so a missing glyph cannot
-  come back as an empty box.
+  come back as an empty box. The toolbar no longer draws a spinner next to
+  **Reconnect**; the status bar reports the reconnect attempt.
 - **Status bar:** the bottom of the panel always shows the latest message with a
   colour-coded icon. While a listing or file operation runs it shows a spinner
   and the operation label; a transfer's queue depth is appended there as
   `(+N queued)`. The ☰ button opens the last 50 messages with timestamps, plus
-  **Clear messages**. There is no selected-file footer; row tooltips carry the
-  details.
+  **Clear messages**.
 - Type a remote path in the **Path** box and press **Enter** (or click ➡).
   Relative paths are resolved by the server against the login directory.
+- **‹ / ›** step through the directories you have visited (up to 100). History
+  is committed only after a listing succeeds, so a typo or a permission error
+  never leaves Back pointing at a folder that would not open. A new navigation
+  after going back discards the forward stack.
+- The **Follow** chip sits at the right of the path row. It is on by default:
+  the panel follows the shell's working directory. Any manual move (path box,
+  **Up**, **Home**, a folder click, **Back/Forward**) pauses following until
+  **Follow** is clicked again. While the path box has focus, following waits so
+  a prompt cannot overwrite what you are typing. Right-click the chip for
+  **Set up directory tracking…**, which reopens the setup dialog after the hint
+  has been dismissed.
 - **Hidden** shows or hides dotfiles (default hidden). The setting is per tab and
   survives refresh/navigation. If the selected row becomes hidden, the selection
   is cleared.
@@ -558,9 +581,37 @@ too. Each tab keeps its own width, directory and selection.
 - If the SSH server has no SFTP subsystem, the panel says **SFTP is unavailable**
   with the reason in the status bar and offers **Reconnect SFTP**. Only the SFTP
   channel is retried; the terminal is unaffected.
-- **Limitations:** the panel does **not** follow `cd` in the shell yet (handoff
-  F26). Use **Refresh**/the path box to change directory. Symlinks are
-  shown/copied but double-clicking one does not navigate.
+- **Limitations:** following the shell needs a cooperating shell (see below).
+  Without it the panel still works; use **Refresh** or the path box to move.
+  Symlinks are followed on demand rather than automatically during a listing.
+
+### Following the shell (OSC 7)
+
+A shell announces its directory with an OSC 7 escape sequence
+(`ESC ] 7 ; file://host/path BEL`). The terminal view scans the byte stream for
+it (split chunks included, percent-decoded), so the panel can move whenever you
+`cd`, including inside `tmux` or over a slow link.
+
+Most stock shells do not send it. About three seconds after the first listing,
+if no directory has been reported, a small strip under the path row offers three
+choices:
+
+- **Enable now** types a one-line snippet into the current shell. It installs a
+  `__rustterm_cwd` prompt hook for this session only (bash `PROMPT_COMMAND` or
+  zsh `precmd_functions`); nothing is written to disk. It takes effect at the
+  next prompt. Pressing it twice is harmless.
+- **Install…** detects your login shell from `/etc/passwd`, then asks before
+  editing `~/.bashrc` or `~/.zshrc`. The block is wrapped in
+  `# >>> rustterm directory tracking >>>` / `# <<< ... <<<` markers. The first
+  install writes a one-time `<file>.rustterm-backup`; installing again replaces
+  the block instead of appending a second one. The dialog's **Remove** deletes
+  the marked block and leaves the rest of the file byte-for-byte intact.
+  Fish and other shells are not supported and report that in the status bar.
+- **×** dismisses the hint for this session.
+
+The hint disappears as soon as any OSC 7 report arrives. Only bash and zsh are
+handled; the snippet is syntax-checked with `bash -n` in the test suite. Nothing
+is ever written without clicking **Install…** and confirming in the dialog.
 
 **Verify**
 
@@ -574,12 +625,18 @@ so delete/copy tests cannot touch real data.
       same font size as the rows, is not bold and stays visible while scrolling.
       Name is about half the table. Owner and local `YYYY-MM-DD HH:MM` match
       `stat -c '%U %y' file`; folders show an em dash for size. Drag a divider
-      in the header: it moves in ~12 px steps and only the two neighbouring
+      in the header: it moves in **24 px** steps and only the two neighbouring
       columns change (dividers are not drawn on file rows). Narrow the panel to
-      ~340 px: **Name stays readable and grows**, Owner/Size/Modified disappear
-      in that order, and the header remains readable.
-- [ ] **Sorting**: directories come first; names are case-insensitive
-      alphabetical within each group.
+      ~340 px: the table keeps its column widths, is clipped at the panel edge
+      and gains a horizontal scrollbar; widen the panel and the same table is
+      revealed again.
+- [ ] **Sorting**: directories come first, then the active column. Click
+      **Size** / **Modified** / **Owner** in the header → the arrow (⏶/⏷)
+      appears, the order changes, and a second click reverses it. Click
+      **Name** to restore the default case-insensitive name order.
+- [ ] **Details strip**: select a row → two lines above the status bar show the
+      full path, type, size, owner, exact timestamp and age. Click a different
+      row → it updates; refresh/navigate → it disappears with the selection.
 - [ ] **Select vs open**: one click highlights a row without navigating; double
       click a folder → path and listing update; double click a file → the
       **Open with…** modal appears.
@@ -643,9 +700,41 @@ so delete/copy tests cannot touch real data.
       one that refuses a second channel) → **SFTP is unavailable** with a reason;
       the status bar repeats it. The terminal still works. If the channel can be
       opened later, **Reconnect SFTP** recovers without reconnecting SSH.
-- [ ] **Symlink**: create `ln -s /etc /tmp/rt-link` and list `/tmp` → the link is
-      shown with `🔗`; clicking selects it, double-clicking does not navigate.
-      Copy/paste it → the duplicate is still a symlink to `/etc`.
+- [ ] **Symlink**: create `ln -s /etc /tmp/rt-link` and
+      `ln -s /etc/hostname /tmp/rt-hn`, then list `/tmp` → both show `🔗`.
+      Double-click the folder link → `/tmp/rt-link` is listed and the path box
+      keeps the link name; double-click the file link → the **Open with…**
+      picker. Right-click → **Follow link** behaves the same. Copy/paste a link
+      → the duplicate is still a symlink to the original target. A dangling link
+      reports `broken symlink …` in the status bar.
+- [ ] **History**: visit `/tmp`, `/etc`, `/usr` → ‹ is enabled and › is
+      disabled. ‹ twice → `/tmp`; › → `/etc`; then navigate to `/var` → › is
+      disabled again. A failed path (e.g. `/no-such-dir`) must not add a history
+      entry.
+- [ ] **Follow (default)**: with the shell hook active, `cd /var/log` → the
+      panel follows the terminal. `cd` into a directory you cannot list → one
+      error, then the panel does not retry it on every prompt.
+- [ ] **Manual pause**: click **Up**, type a path, or use ‹/› → the **Follow**
+      chip turns off and later `cd`s do not move the panel. Click **Follow** →
+      it jumps to the shell's current directory (not its directory at the time
+      following stopped).
+- [ ] **Typing guard**: focus the path box, run `cd /etc` in the terminal → the
+      panel stays put. Click elsewhere (blur) → the next directory report moves
+      it again.
+- [ ] **Hook hint**: in a session with no hook, wait ~3 s at the first listing →
+      the strip appears under the path row. **×** hides it for the session.
+      **Enable now** types the snippet; press **Enter** if needed, then `cd` →
+      the panel follows and the strip disappears. After dismissing with **×**,
+      right-click the **Follow** chip → **Set up directory tracking…** opens the
+      same dialog.
+- [ ] **Install / Remove**: **Install…** → the dialog names `~/.bashrc` (or
+      `~/.zshrc`) and the detected shell. **Install** → the block is appended, a
+      `.rustterm-backup` is created and the status bar confirms it. Install
+      again → no duplicate block. **Remove** → the block is gone and the rest of
+      the file is unchanged. A new login still has tracking (open a new tab).
+- [ ] **Unsupported shell**: connect as an account whose login shell is `fish`
+      (or `/bin/sh`) → **Install…** reports that only bash and zsh are
+      supported; no file is written.
 - [ ] **Toggle**: **Files** hides the panel; click again to show it. The panel
       **×** also hides it. Switching tabs shows the other tab's directory,
       clipboard, message history and hidden-file state.
@@ -654,8 +743,6 @@ so delete/copy tests cannot touch real data.
 - [ ] **Responsiveness**: navigate to a very large directory (e.g. `/usr/bin`),
       start a large folder copy, and keep typing in the terminal → keystrokes echo
       and output flows while the listing/copy runs.
-- [ ] **No auto-follow (expected)**: `cd /var/log` in the terminal → the panel
-      stays where it was until you navigate/refresh manually.
 - [ ] **Teardown**: close the tab with the panel open, and disconnect via the
       **Disconnect** bar at the bottom of the terminal → no crash, no stuck
       thread.
@@ -849,9 +936,11 @@ remote path.
 
 - The editor starts only after the download finishes; the status bar says
   `Opened notes.txt in Zed — saving uploads it back`.
-- Saves are detected by comparing the local copy's size and modification time
-  every 600 ms. This needs no file-watching dependency and also catches editors
-  that save by writing a temp file and renaming it.
+- Saves are detected with **filesystem events** (`notify`/inotify): the folder
+  containing the temp copy is watched, so write-and-rename saves are caught too.
+  Events are debounced for 150 ms and confirmed by size+mtime before uploading,
+  so one `:w` produces exactly one upload. A 5-second safety pass covers events
+  inotify can miss; there is no 600 ms polling loop.
 - The upload uses the normal transfer queue: the transfer row shows
   `Uploading notes.txt…`, the status bar ends with `Uploaded …/notes.txt`, and
   the listing refreshes.
@@ -861,14 +950,21 @@ remote path.
   the newest content wins.
 - Unticking the checkbox opens the file without watching it, and the status bar
   names the temp copy instead.
-- If the connection is lost, editing continues locally and the tab shows the
-  **Connection lost** banner; the watcher is dropped with the session.
+- **Offline edits are kept for 15 minutes.** If SFTP or SSH drops while a file
+  is open, the local save still happens. On **⚡ Reconnect** (or on a new session
+  to the same `user@host:port`), every copy whose local contents differ from
+  what the server last received is uploaded automatically with the status note
+  `changes kept from before the disconnect`. Re-opening that file before
+  reconnecting opens the local copy with its changes instead of downloading over
+  them. After 15 minutes the pending entry is dropped with a status message.
+- A full SSH loss still ends the tab (**Connection lost** + **Close tab**); the
+  journal is handed to the next session when that tab is closed.
 
 **Verify**
 
-- [ ] **Edit and save**: open `notes.txt` in gvim, append a line, `:w` → within
-      about a second the status bar says `Uploaded /…/notes.txt` and
-      `cat` in the terminal shows the new line.
+- [ ] **Edit and save**: open `notes.txt` in gvim, append a line, `:w` → the
+      status bar says `Uploaded /…/notes.txt` almost immediately and `cat` in
+      the terminal shows the new line.
 - [ ] **Rapid saves**: change and save twice quickly → both uploads appear in
       order and the remote copy ends with the second version.
 - [ ] **Same-size save**: replace one word with a word of the same length, save
@@ -878,5 +974,11 @@ remote path.
 - [ ] **Failed upload**: remove write permission on the remote file
       (`chmod 444`) and save → the status bar shows the error, the remote file
       is untouched (no `.part` left) and the session stays connected.
-- [ ] **Connection lost while editing**: stop sshd, save again → no hang; the
-      tab shows the banner and **Close tab**.
+- [ ] **Offline edit**: with `notes.txt` open, click ⚡ **Reconnect**, edit and
+      save while the channel is down, then reconnect within 15 minutes →
+      the change is uploaded automatically.
+- [ ] **Reconnect in a new tab**: stop sshd while editing, close the dead tab,
+      start sshd, connect again with the same profile → the pending change is
+      uploaded.
+- [ ] **Expiry**: leave a pending file unsynced for more than 15 minutes → the
+      journal drops it and the status bar says so.

@@ -6,9 +6,10 @@
 > password in the OS keyring, public-key / ssh-agent authentication works, and
 > the SFTP side panel is implemented with reconnect, file operations, hidden-file
 > filtering, copy/paste, open-in-local-editor and owner/modified rows. File
-> transfers are next. Read section 12 before writing any code.
+> transfers and edit-and-upload-on-save (event-driven, reconnect-safe) are done.
+> Read section 12 before writing any code.
 
-Last updated: 2026-10-30
+Last updated: 2026-10-31
 Repo: `~/Desktop/VsTerm` (local) — remote may be `rustterm` on GitHub
 Owner: anurag (Linux Mint 22)
 
@@ -34,9 +35,9 @@ open protocols.
 | 1 | SSH terminal with colors, resize, copy/paste | **Done** — colors, resize, scrollback, bg colors, copy/paste. |
 | 2 | Multiple SSH sessions in tabs | **Done** |
 | 3 | Saved profiles, key auth, keyring passwords | **Done** — profiles, optional keyring passwords, key file + ssh-agent auth. |
-| 4 | SFTP side panel following the active session's path | **Done except shell-cd following** — per-tab browsing, Name/Modified/Size/Owner table with proportional, stepped columns, reconnect, right-click menu, hidden toggle, copy/paste, status bar with history. The panel does not follow shell `cd` (no OSC 7), and symlinks are not navigated. |
+| 4 | SFTP side panel following the active session's path | **Done** — per-tab browsing, fixed-width Name/Modified/Size/Owner table (panel is a viewport, sortable headers, 24 px stepped columns), selection details strip, reconnect, right-click menu, hidden toggle, copy/paste, status bar with history. Follows the shell's `cd` via OSC 7 (default on, paused by manual navigation), with ‹/› history, symlink following and a reversible shell hook for bash/zsh. |
 | 5 | Upload/download, drag & drop, progress | **Done** — file/folder upload and download with a serialised queue, conflict prompts, `.part`+rename safety, progress bar, drag & drop and cancel. |
-| 6 | Open remote file in local editor, auto-upload on save | **Done** — the **Open with…** picker downloads to a temp file, launches `$VISUAL`/`$EDITOR`, Zed, gvim, VS Code, the desktop default or a custom command, and uploads the file back to the same remote path on every save (opt-out checkbox). |
+| 6 | Open remote file in local editor, auto-upload on save | **Done** — the **Open with…** picker downloads to a temp file, launches `$VISUAL`/`$EDITOR`, Zed, gvim, VS Code, the desktop default or a custom command, and uploads the file back to the same remote path on every save (opt-out checkbox). Saves arrive as debounced inotify events; unsynced copies survive a drop for 15 minutes and sync on reconnect or in a new session for the same profile. |
 | 7 | GUI tools via X11 forwarding (`ssh -X`) or VNC-over-tunnel | Not started |
 
 ---
@@ -59,8 +60,8 @@ open protocols.
 
 `eframe` uses `default-features = false, features = ["glow", "default_fonts"]`.
 
-**Not yet added but will be needed:** `notify` (file watching for auto-upload),
-`rfd` (native file dialogs), `dirs` or `directories` (config/temp paths).
+**Added for edit-and-upload-on-save:** `notify` (inotify save events). Still
+likely needed later: `dirs` or `directories` (config/temp paths).
 
 ---
 
@@ -342,8 +343,19 @@ the far right of the tab bar.
   editor is launched asynchronously. Save-watching/auto-upload is still V2.
 - The **Files** toggle in the tab bar, or the panel's **×**, hides the panel. Each
   tab keeps its own directory. Servers without SFTP show a clear unavailable
-  message; terminal I/O is never blocked by a slow listing. Symlinks are shown but
-  not followed, and the panel does not follow shell `cd` (see F26).
+  message; terminal I/O is never blocked by a slow listing.
+- **Shell following (F26)**: the panel follows the shell's `cd` through a custom
+  OSC 7 scanner in `terminal.rs` (alacritty_terminal 0.24 has no
+  `current_directory`). Following is on by default; any manual move pauses it
+  until the **Follow** chip is clicked. **‹ / ›** browse a 100-entry history that
+  is committed only after a successful listing. Symlinks are followed on
+  double-click or via **Follow link**: folder targets are listed through the link
+  path, file targets open the picker.
+- **Shell hook**: after 3 s without an OSC 7 report the panel offers
+  **Enable now** (types an idempotent one-liner into the live shell) and
+  **Install…** (a consent modal that writes a marked block to `~/.bashrc` or
+  `~/.zshrc`, with a one-time `.rustterm-backup`, and can remove it again).
+  bash and zsh only.
 - **File transfers**: uploads and downloads stream in 64 KiB chunks over the
   existing `SftpSession`, write to a sibling `.part` file and rename only on
   success. One transfer runs per session and the rest queue; byte/file progress
@@ -408,6 +420,7 @@ Severity: **A** = must fix before MVP, **B** = should fix, **C** = polish/later.
 **F22** — Application cursor keys (DECCKM) ✅ `?1h` is honoured: cursor/Home/End are sent as SS3 (`ESC O A`) when the app enables application cursor keys, CSI (`ESC [ A`) otherwise. ncurses programs (htop, vim, mc) enable `?1h` via terminfo's `smkx` and only understand the SS3 form — sending CSI makes them see a stray Escape plus literal characters.
 **F27** — Uploads silently killed the SSH connection ✅ Root cause was **not** the SFTP crate: `russh 0.45.0`'s outbound zlib compressor reserves `input.len() + 10` bytes and breaks its loop as soon as `flate2` returns `Ok`, even when the output buffer filled and input remains. The tail of an incompressible packet (PDF, PNG, zip) was dropped, the server saw a malformed packet and closed the transport; the SFTP request map then produced `sender dropped`. Text uploads only worked because their compressed output fit. Upstream fixed this later (russh ≥ 0.65, test `incompressible_packets_round_trip`). The client now advertises `compression::NONE` (unit test `client_config_advertises_no_compression`). **Tech debt:** once russh is upgraded, compression can be re-enabled; `russh-sftp 3.0.1` is transport-agnostic, so the upgrade is independent of the SFTP crate. Dead sessions are now detected via `SshSession::is_alive()` and the tab shows a **Connection lost** banner + **Close tab**.
 **F28** — Connect attempts could not be cancelled and failures were cryptic ✅ `SshSession::connect` takes an optional `oneshot` cancellation receiver and races it against the handshake, so the ✕ next to *Connecting to…* (or `Esc`) drops the socket immediately. A 15 s TCP connect timeout turns blackholed hosts into *Connection timed out*. `ssh::explain_connect_error` maps the chained library text to *Login failed*, *Connection refused*, *Host not found*, etc., and is unit-tested. Keepalives (15 s, max 3) plus the wake-on-exit `SessionGuard` make a wedged session surface as the dead-tab banner instead of freezing silently. SFTP request timeout raised to 30 s for slow network mounts; a timeout now offers **Reconnect SFTP**.
+**F26** — SFTP panel did not follow the shell's `cd` ✅ `terminal.rs` scans the VTE byte stream for OSC 7 itself (alacritty_terminal 0.24 exposes no `current_directory`), tolerating split chunks, BEL/ST and percent-encoded UTF-8. The explorer follows by default, remembers the latest report, and pauses on any manual move until the **Follow** chip is clicked. Navigation is recorded in a 100-entry, browser-style history that commits only after a successful listing; `NavIntent` distinguishes user/follow/refresh/back/forward. Symlinks are followed on demand (folder → listing through the link path, file → picker). A hint offers a per-session one-liner or a reversible marked block in `~/.bashrc`/`~/.zshrc` (backup kept, remove supported); bash and zsh only.
 
 ### Active
 
@@ -437,7 +450,7 @@ Hardcoded `80x24` until the first `ui()` frame. Produces a small reflow on conne
 Read once per frame rather than per event.
 
 **F18 — Tests (B)**
-`terminal.rs` has unit tests for `bg_runs`, the colour mapping and the mouse encoding; `input.rs` has tests for the key encoding incl. DECCKM; `sessions.rs` covers persistence, validation and profile defaults; `sftp.rs` covers path join/parent, sorting, formatting, name validation, copy guard and editor resolution; `ssh.rs` covers `/etc/passwd` parsing, remote path joining, the no-compression config, connection-loss classification, connect-error explanations and keepalive settings. `theme.rs` asserts that every toolbar icon has a real glyph in the bundled fonts. `sftp.rs` covers editor-save detection. **69 tests**, run with `cargo test`. Still missing: automated network tests for public-key auth and the SFTP transport (both were verified with temporary russh-server probes, not committed tests).
+`terminal.rs` has unit tests for `bg_runs`, the colour mapping, the mouse encoding and the OSC 7 scanner; `input.rs` has tests for the key encoding incl. DECCKM; `sessions.rs` covers persistence, validation and profile defaults; `sftp.rs` covers path join/parent/normalization, sorting, formatting, name validation, copy guard, editor resolution, history stacks, the one-line hook syntax, the inotify watcher, debounce, the reconnect journal and its 15-minute expiry; `ssh.rs` covers `/etc/passwd` parsing (owners and login shell), remote path joining, hook-block install/remove, the no-compression config, connection-loss classification, connect-error explanations and keepalive settings. `theme.rs` asserts that every toolbar icon has a real glyph in the bundled fonts. `app.rs` covers the fixed table canvas, 24 px divider snapping, sort order and a headless header render. **95 tests**, run with `cargo test`. Still missing: automated network tests for public-key auth and the SFTP transport (both were verified with temporary russh-server probes, not committed tests).
 
 **F19 — Password storage / memory hygiene (B, mostly resolved)**
 Passwords are never written to `sessions.toml`. Opt-in keyring storage is
@@ -467,18 +480,6 @@ them would need a SHA-1 signing path, which is deliberately not a priority.
 **F25 — Agent identity errors (C)**
 An agent signing error aborts the remaining identities instead of trying the
 next one. Rare in practice; revisit if it shows up with hardware tokens.
-
-**F26 — SFTP panel does not follow the shell's working directory (B)**
-The panel starts at the login home and navigates independently. There is no
-OSC 7 parsing (`Term::current_directory` is not exposed by alacritty_terminal
-0.24), so `cd` in the terminal does not move the panel. Automatic following will
-need either an OSC 7 hook in the VTE event stream or a periodic remote `pwd`
-query, plus a "follow / manual" mode so user navigation is not overridden.
-Other limits: no general upload/download/drag & drop yet (copy and editor
-downloads use streaming helpers that transfers can reuse), symlinks are displayed
-but not navigated, and a server that allows only one session channel will make
-SFTP unavailable while the terminal still works. **Reconnect** can retry the SFTP
-channel in that case.
 
 ---
 
@@ -625,8 +626,8 @@ through a `pty` so the byte sequences can be injected.
    manual password entry. In-memory zeroization is still tracked under F19.
 5. **Key auth** ✅ done — key files + ssh-agent before the password.
 6. **SFTP panel** ✅ done — `russh-sftp` on a second channel, per-tab directory
-   listing, Home/Up/Refresh + editable path. Shell-cwd following is tracked as
-   F26.
+   listing, Home/Up/Refresh + editable path. Shell-cwd following (F26) is done:
+   OSC 7 scanner, 100-entry history, symlink following and a bash/zsh hook.
 7. **SFTP panel follow-ups** ✅ done.
    - **Reconnect** — toolbar and unavailable-state buttons reopen only the
      SFTP channel/subsystem on the existing SSH connection. The terminal is never
@@ -665,7 +666,8 @@ through a `pty` so the byte sequences can be injected.
 
 ### V2
 
-10. Edit-and-auto-upload. Watch the **folder**, not the file.
+10. Edit-and-auto-upload. ✅ done — inotify folder watch, debounced saves,
+    15-minute reconnect journal.
 11. X11 forwarding via system `ssh -X`.
 12. VNC over SSH tunnel + external viewer.
 
@@ -733,9 +735,9 @@ Verified with 36 tests, clippy/fmt clean, and a temporary in-process russh SFTP
 server probe: `canonicalize(".")` → `/probe`, `read_dir` returned a directory and
 a regular file with the expected `is_dir`, `len` and `modified` values.
 
-Limits (F26): the panel does not follow shell `cd` (no OSC 7), symlinks are not
-navigated, and transfers are not implemented. Manual GUI checklist in
-`USAGE.md` §14.
+Limits at the time: the panel did not follow shell `cd` (no OSC 7), symlinks were
+not navigated, and transfers were not implemented. All three have since been
+added (F26 step). Manual GUI checklist in `USAGE.md` §14.
 
 **Step 6 — SFTP panel follow-ups.** ✅ done.
 `ssh.rs` now exposes `sftp_reconnect`, `sftp_rename`, `sftp_delete`,
@@ -790,9 +792,9 @@ a progress bar above the status bar, a conflict modal and desktop drag & drop.
 Local pickers use `rfd` (`xdg-portal` + `tokio`). Verified with 53 tests in both
 feature sets; live GUI checks are listed in `USAGE.md` §17.
 
-**Step 9 — Edit-and-auto-upload (V2).** ← next
-Watch the **folder** a temp download was opened from, not just the file, and push
-changes back over SFTP with the same transfer backend.
+**Step 9 — Edit-and-auto-upload (V2).** ✅ done — inotify folder watches,
+150 ms debounce, 5 s safety pass, and a 15-minute `EditJournal` that syncs on
+reconnect or in a new session for the same profile.
 
 ### Working agreement — direct repo access
 
@@ -905,6 +907,8 @@ Maintained by the assistant. Update after each successful `cargo build`.
 | Transfer hardening | `ssh.rs`, `sftp.rs`, `app.rs` | `SshSession::{is_alive,alive}`, `SessionGuard`, `compression::NONE`, `CONNECTION_LOST`, `is_connection_loss`, `normalise_transfer_error`, `collect_upload` via `spawn_blocking`, always-close loops, `SftpExplorer::{mark_unavailable_with,mark_closed}`, `ActiveSession::connection_lost`, status-bar progress, `Delete “name”` heading | ✅ done (55 tests both feature sets; clippy/fmt clean; needs live re-test of PDF/folder upload) |
 | Connect/UI polish | `ssh.rs`, `app.rs`, `sftp.rs`, `theme.rs` | `SshSession::connect(..., cancel)`, `ConnectingState::cancel_tx`, `RustTermApp::cancel_connect`, `explain_connect_error`, TCP `timeout`, keepalive, `SessionGuard::wake`, `theme::{modal_heading,modal_path,modal_close,DIALOG_HEADING_SIZE}`, `SftpColumns::fitted`, `NAME_SHARE`, status-bar `(+N queued)`, `↑`/`⇧` icons, `collect_download` reuses listing metadata, `SFTP_TIMEOUT` | ✅ done (60 tests both feature sets; clippy/fmt clean; GUI-unverified) |
 | Table/icons polish + edit-and-auto-upload | `theme.rs`, `app.rs`, `sftp.rs`, `ssh.rs` | `theme::icons` (📂/📥/📤/×) + `icons_have_glyphs`, `SftpColumns` proportional shares (`name` 50 %, `COLUMN_STEP` snapping, `drag_divider`), `SftpLayout` rects for Name/Modified/Size/Owner, `EditWatch`/`FileStamp`, `SftpExplorer::{poll_edits,watches_edits}`, `TransferKind::UploadOne`, `SshSession::sftp_upload_one`, `SftpAction::UploadOne`, `EditorPicker::auto_upload` | ✅ done (69 tests both feature sets, including a headless egui header render; clippy/fmt clean; GUI-unverified — `USAGE.md` §14/§18, `TESTING.md` §2.7/§2.12) |
+| Fixed table canvas + event-driven saves + reconnect sync | `app.rs`, `sftp.rs`, `theme.rs`, `Cargo.toml` | `SftpColumns` pixel widths on `TABLE_WIDTH`, shared horizontal scroll, 24 px `COLUMN_STEP`, `SftpSort`/`sorted_indices`, `sftp_details_bar`, `theme::icons::{SORT_ASC,SORT_DESC}`, removed toolbar spinner, `EditNotifier` (notify/inotify), `EditWatch::{touch,settled}`, `pending_edit_settle`, `EditJournal` + `EDIT_SYNC_WINDOW`, `sync_journal`, app-level `detached_edits`, `ActiveTransfer::local` | ✅ done (79 tests both feature sets; clippy/fmt clean; GUI-unverified — `USAGE.md` §14/§18, `TESTING.md` §2.7/§2.12) |
+| Shell follow + symlinks + history + hook (F26) | `terminal.rs`, `ssh.rs`, `sftp.rs`, `app.rs`, `theme.rs` | `Osc7Scanner`/`Osc7State`/`parse_osc7`/`percent_decode`, `TerminalView::take_cwd`, `ResolvedLink`/`HookResult`, `SshSession::{sftp_resolve,sftp_login_shell,sftp_edit_hook}`, `SftpAction::{Resolve,LoginShell,EditHook}`, `resolve_link`/`login_shell`/`shell_from_passwd`/`edit_hook`/`hook_block`/`strip_hook_block`/`install_hook_block`, `HOOK_BEGIN`/`HOOK_END`/`HOOK_BODY`, `NavIntent`/`SftpHistory`/`HookPrompt`, `SftpExplorer::{follow_shell_cwd,set_follow,go_home,back,forward,open_link,link_target,begin_hook_prompt,submit_hook_prompt,cancel_hook_prompt,send_session_hook,wants_hook_hint,dismiss_hook_hint}`, `SESSION_HOOK`, `normalize_shell_path`, `theme::icons::{BACK,FORWARD}`, `RustTermApp::sftp_hook_dialog_ui` | ✅ done (95 tests both feature sets; clippy/fmt clean; GUI-unverified — `USAGE.md` §14, `TESTING.md` §2.7 F12–F15) |
 ⚙
 
 ---

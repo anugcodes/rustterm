@@ -195,7 +195,8 @@ ssh-keygen -R localhost
 Use a scratch directory so nothing real is touched.
 
 - [ ] **F1 — initial listing.** After Connect the pane opens at `/home/sshuser`,
-      directories first, then files; headers are Name/Owner/Modified/Size.
+      directories first, then files; headers read **Name · Modified · Size ·
+      Owner**.
 - [ ] **F2 — hidden files.** Toggle **👁 Hidden**; dotfiles appear; the selection
       clears if the selected row becomes hidden.
 - [ ] **F3 — path box.** Type `/tmp` and press Enter; the listing changes.
@@ -210,15 +211,20 @@ Use a scratch directory so nothing real is touched.
 - [ ] **F8 — delete.** Right-click `b.txt` → **Delete…**; `Esc` cancels. Repeat
       and confirm; the file disappears. The modal names the file and warns that
       it cannot be undone.
-- [ ] **F9 — column order and sizing.** The header reads **Name · Modified ·
-      Size · Owner**, and Name occupies about half the table. Drag a divider:
-      it moves in ~12 px notches, never continuously, and only the two columns
-      around it change width. Drag Name/Modified far right → Modified stops at
-      its minimum. Drag the panel edge (clamped to 340 px…55 %, max 720 px):
-      the proportions are kept and the terminal stays visible. Narrow the
-      panel: Owner disappears first, then Size, then Modified, and the name
-      grows instead of eliding. Switch tabs → each tab keeps its own width and
-      directory.
+- [ ] **F9 — table canvas.** Name occupies about half of the table. Drag a
+      divider: it moves in **24 px** notches, never continuously, and only the
+      two columns around it change width. Drag Name/Modified far right →
+      Modified stops at its minimum. Now drag the panel edge (clamped to
+      340 px…55 %, max 720 px) narrower than the table → the columns keep their
+      pixel widths, the table is clipped and a horizontal scrollbar appears;
+      widen the panel → the same table is revealed again, nothing reflows or
+      disappears. The terminal stays visible. Switch tabs → each tab keeps its
+      own width, column widths and sort.
+- [ ] **F9b — sortable header and details.** Click **Size** → files order by
+      size with ⏶ and an underline; click again → ⏷. Folders stay grouped first.
+      Click **Name** again → back to name order. Select a row → a two-line strip
+      appears above the status bar with the full path, type, size, owner, exact
+      time and age; deselect (or refresh) and it disappears.
 - [ ] **F10 — open with.** Double-click a file → the **Open “file”** modal lists
       editors; entries not on `PATH` are disabled. Its heading is the smaller
       modal style and a long path wraps. It has an
@@ -227,12 +233,43 @@ Use a scratch directory so nothing real is touched.
 - [ ] **F11a — toolbar icons.** Every button in the SFTP toolbar draws a real
       icon — no empty/hollow boxes, no two buttons sharing one glyph. **Up one
       level** is 📂, **Download** is 📥 and **Upload** is 📤; hover each for its
-      tooltip.
+      tooltip. **⚡ Reconnect** draws no spinner beside it; the status bar
+      reports the attempt.
 - [ ] **F11b — messages.** The ☰ button shows the last 50 messages with
       timestamps; **Clear messages** empties it.
-- [ ] **F12 — hide/show.** **Files** in the tab bar and the panel's `×` hide it;
+- [ ] **F12 — follow the shell (default).** On a server whose shell already
+      emits OSC 7 (or after **Enable now** / **Install…** below), run
+      `cd /var/log` in the terminal → the panel follows the prompt. Run
+      `cd` inside `tmux` → it still follows. `cd` into a directory you cannot
+      list (e.g. `cd /root` as a non-root user) → one error appears and the
+      panel keeps its previous listing without retrying on every prompt.
+- [ ] **F13 — pause, resume and history.** Click **Up**, type a path, or open a
+      folder → the **Follow** chip goes off and later `cd`s leave the panel
+      alone. Visit `/tmp`, `/etc`, `/usr` → **‹** enabled, **›** disabled;
+      **‹** twice returns to `/tmp`; **›** returns to `/etc`; navigate to
+      `/var` → **›** becomes disabled. Type `/no-such-dir` + Enter → an error
+      and **‹** does not gain that path. Click **Follow** → the panel jumps to
+      the shell's *current* directory. Focus the path box and `cd /etc` → the
+      panel waits; blur the box → following resumes.
+- [ ] **F14 — symlinks.** Create `ln -s /etc ~/sftp-test/link-dir` and
+      `ln -s /etc/hostname ~/sftp-test/link-file`. Double-click `link-dir` →
+      its contents are listed and the path box keeps the link name.
+      Double-click `link-file` → the **Open with…** picker. Right-click either
+      → **Follow link** at the top of the menu does the same. The details strip
+      shows `→ target` after a link has been followed. A dangling link reports
+      `broken symlink …`.
+- [ ] **F15 — hook hint and startup file.** In a session with no tracking, wait
+      ~3 s at the first listing → the **Track the shell's folder?** strip
+      appears. **×** hides it for that tab. **Enable now** types the snippet;
+      run `cd` → the panel follows and the strip is gone. Reopen a tab and
+      choose **Install…** → the dialog names `~/.bashrc` or `~/.zshrc` and the
+      detected shell; **Install** appends the marked block and creates
+      `<file>.rustterm-backup`; installing twice does not duplicate it;
+      **Remove** deletes the block and leaves the rest of the file unchanged.
+      A `fish` login reports that only bash and zsh are supported.
+- [ ] **F16 — hide/show.** **Files** in the tab bar and the panel's `×` hide it;
       the terminal reflows. Showing it restores the previous directory.
-- [ ] **F13 — cleanup.** In the terminal: `rm -rf ~/sftp-test`; **🔄 Refresh**.
+- [ ] **F17 — cleanup.** In the terminal: `rm -rf ~/sftp-test`; **🔄 Refresh**.
 
 ### 2.8 Appearance
 
@@ -261,19 +298,19 @@ Use a scratch directory so nothing real is touched.
 
 ### 2.11 File transfers
 
-- [ ] **T1 — download file.** Select a remote file, click **📥**, choose a local
+- [x] **T1 — download file.** Select a remote file, click **📥**, choose a local
       folder → progress bar advances, status says `Downloaded …`, and
       `cmp` reports the local copy identical. No `.part` file remains.
-- [ ] **T2 — download folder.** Right-click a folder with sub-folders and a
+- [x] **T2 — download folder.** Right-click a folder with sub-folders and a
       symlink → **Download…** → the tree is recreated locally and the symlink
       still points at the same target.
-- [ ] **T3 — upload.** Click **📤**, pick two files → both appear in the remote
+- [x] **T3 — upload.** Click **📤**, pick two files → both appear in the remote
       listing after the automatic refresh.
-- [ ] **T4 — upload into folder.** Right-click a sub-folder → **Upload folder
+- [x] **T4 — upload into folder.** Right-click a sub-folder → **Upload folder
       here…** → the tree appears inside that folder, not in the current one.
-- [ ] **T5 — drag & drop.** Drop a file from the file manager onto the panel →
+- [x] **T5 — drag & drop.** Drop a file from the file manager onto the panel →
       it uploads into the visible directory.
-- [ ] **T6 — conflict.** Upload an existing file → the modal appears. **Replace**
+- [x] **T6 — conflict.** Upload an existing file → the modal appears. **Replace**
       overwrites it; **Keep both** creates `name (copy)`; **Cancel** and `Esc`
       change nothing.
 - [ ] **T7 — queue and cancel.** Start two large downloads → the status bar
@@ -284,7 +321,7 @@ Use a scratch directory so nothing real is touched.
       (`/remote/...`) → the first click starts within 30 s without a redundant
       `stat`; if the server really does not answer, the panel offers
       **Reconnect SFTP** instead of a bare `Timeout` error.
-- [ ] **T9 — upload a PDF.** Upload a large scanned PDF (incompressible). The
+- [x] **T9 — upload a PDF.** Upload a large scanned PDF (incompressible). The
       status bar advances, `ls -l` matches the local size, `cmp` succeeds, and
       the session stays connected. This is the regression that used to end with
       `sender dropped` / a silent tab.
@@ -300,27 +337,39 @@ Use a scratch directory so nothing real is touched.
 
 Use a scratch file, e.g. `~/sftp-test/notes.txt`.
 
-- [ ] **E1 — open and watch.** Right-click `notes.txt` → **Open with…** → gvim →
+- [x] **E1 — open and watch.** Right-click `notes.txt` → **Open with…** → gvim →
       there is a short download, the editor opens, and the status bar says
       `Opened notes.txt in gvim — saving uploads it back`.
-- [ ] **E2 — save uploads.** Append a line in gvim and `:w`. Within ~1 s the
-      transfer row shows `Uploading notes.txt…`, then the status bar says
-      `Uploaded …/notes.txt`. In the terminal, `cat notes.txt` shows the new
-      line without pressing Refresh.
-- [ ] **E3 — same-length edit.** Replace a word with one of equal length, save →
+- [x] **E2 — save uploads.** Append a line in gvim and `:w`. The event-driven
+      watcher uploads almost immediately: the transfer row shows
+      `Uploading notes.txt…`, then the status bar says `Uploaded …/notes.txt`.
+      In the terminal, `cat notes.txt` shows the new line without pressing
+      Refresh.
+- [x] **E3 — same-length edit.** Replace a word with one of equal length, save →
       the upload still runs (mtime changed).
 - [ ] **E4 — rapid saves.** Save three times in a row → the uploads run in
       order and the remote file matches the last save (`cmp`).
-- [ ] **E5 — opt out.** Untick **Upload changes automatically…** in the picker,
+- [x] **E5 — opt out.** Untick **Upload changes automatically…** in the picker,
       open, edit and save → nothing is uploaded; the remote file keeps its old
       contents and only the local temp copy changed.
 - [ ] **E6 — failed save-upload.** `chmod 444 notes.txt` on the server, then save
       in the editor → the status bar shows the permission error, the remote file
       is unchanged, no `notes.txt.part` remains, and the session stays
       connected. `chmod 644` afterwards.
-- [ ] **E7 — connection loss while editing.** Stop sshd, save in the editor → the
-      UI does not freeze; the tab shows **Connection lost** + **Close tab**.
-      Other tabs keep working.
+- [ ] **E7 — SFTP channel loss while editing.** Keep the SSH session alive but
+      make the channel fail (e.g. `/etc/init.d/ssh reload` is not enough — use
+      an `iptables`/`tc` stall or kill the server's sftp subsystem). Save in the
+      editor → no upload is attempted in a loop; the panel shows the SFTP error
+      with **⚡ Reconnect**. Click it within 15 minutes → the pending change is
+      uploaded automatically with `changes kept from before the disconnect`.
+- [ ] **E8 — full connection loss and a new tab.** With `notes.txt` open, stop
+      sshd, edit and save, then close the dead tab. Start sshd and connect again
+      with the same profile → after the listing loads the pending change is
+      uploaded. Re-opening `notes.txt` before that upload shows the local copy,
+      not a fresh download.
+- [ ] **E9 — expiry.** Leave a pending change without reconnecting for more than
+      15 minutes → the entry is dropped and the status bar reports that it was
+      not synced in time.
 
 ---
 
@@ -357,7 +406,7 @@ Host key:         H1–H4:  __ / 4
 Terminal:         T1–T8:  __ / 8
 Scrollback:       SC1–SC4:__ / 4
 Resize:           R1–R4:  __ / 4
-SFTP:             F1–F13: __ / 13
+SFTP:             F1–F17: __ / 17
 Appearance:       A1–A3:  __ / 3
 Title/bell:       B1–B2:  __ / 2
 New Session:      N1–N3:  __ / 3

@@ -907,3 +907,128 @@ because compression happens on the server side.
 - `cargo fmt --check` ✅
 - GUI checks: `USAGE.md` §14/§17/§18, `TESTING.md` §2.7 (F9/F10/F11a) and the
   new §2.12.
+
+# Step: fixed table canvas, event-driven saves, reconnect sync
+
+## What changed
+
+**Table (`src/app.rs`, `src/theme.rs`).**
+- `SftpColumns` stores **pixel widths** instead of shares. The table is drawn on
+  a fixed 430 px canvas (`TABLE_WIDTH`); the side panel is only a viewport, so
+  resizing it clips/reveals the table without reflowing or hiding a column.
+- The header and rows share one horizontal `ScrollArea` and both allocate the
+  same canvas width, removing the header/row drift caused by the old
+  `available_width()`/`inner_rect.width()` mix.
+- Column drags snap to **24 px** steps (was 12) and clamp in whole steps, so the
+  grid can never break at a minimum width.
+- Column headers are **sortable** (Name/Modified/Size/Owner, click to toggle
+  direction, folders stay first). The active column is underlined and shows a
+  ⏶/⏷ arrow from `theme::icons` (`SORT_ASC`/`SORT_DESC`), covered by the glyph
+  test.
+- A **selected-entry details strip** above the status bar shows the full path,
+  type, size, owner, exact timestamp and relative age; it only takes height
+  while a row is selected.
+- The toolbar **spinner next to Reconnect is gone**; the status bar already
+  reports the attempt.
+
+**Edit and auto-upload (`src/sftp.rs`, `src/app.rs`, `Cargo.toml`).**
+- Replaced the 600 ms polling loop with **inotify events** (`notify = "6.1"`).
+  Each open copy watches its parent folder (editors save by write+rename),
+  events are matched by path, debounced for 150 ms and confirmed by size+mtime.
+  A save now uploads almost immediately; a 5-second safety pass only covers
+  watcher misses and deleted temp copies.
+- The watcher wakes egui directly through a `Wake` callback, so there is no
+  permanent poll timer. A short repaint is requested only while a debounce is
+  pending.
+- Added `EditJournal` (app-level): it records every opened file's last uploaded
+  stamp and **survives** SFTP-channel loss, SSH loss, tab close and a new session
+  to the same `user@host:port` (bounded to **15 minutes**). On `Reconnect` or
+  first use of an installed journal, changed copies are uploaded automatically;
+  re-opening a file with unsynced changes reuses the local copy instead of
+  downloading over it.
+- Journal stamps advance only when the upload actually succeeds
+  (`ActiveTransfer` remembers the local path). While the channel is down,
+  save-upload attempts are skipped instead of failing in a loop.
+
+## Verified
+
+- `cargo build` ✅
+- `cargo clippy --all-targets -- -D warnings` ✅
+- `cargo test` ✅ **79 passed** (default and `--no-default-features`)
+- `cargo fmt --check` ✅
+- GUI checks: `USAGE.md` §14/§18, `TESTING.md` §2.7 (F9/F9b/F11a) and §2.12
+  (E2–E9). Not yet run on a live server.
+
+# Step: follow the shell's folder, symlink navigation, history and shell hook
+
+## What changed
+
+**`src/terminal.rs` — OSC 7 scanner.**
+- `TerminalView` now scans every incoming chunk for `ESC ] 7 ; file://host/path`
+  in parallel with the terminal parser, because `alacritty_terminal 0.24` has no
+  `current_directory` support (checked in the crate source).
+- `Osc7Scanner` is a small state machine: it survives arbitrary chunk splits,
+  accepts BEL, ST and `0x9C`, percent-decodes UTF-8, ignores the host, and caps
+  the body at `OSC7_MAX = 4096`. Other OSC numbers are ignored.
+- `TerminalView::take_cwd()` returns the latest report exactly once.
+
+**`src/ssh.rs` — SFTP-side helpers.**
+- New request/action pairs: `Resolve` (follow a link), `LoginShell` (read the
+  seventh `/etc/passwd` field) and `EditHook` (install/remove the startup block).
+- `ResolvedLink` uses `metadata` (i.e. `stat`, which follows links) to report
+  whether the *target* is a directory, plus the raw target. A dangling link
+  becomes `broken symlink 'x' -> 'y'`.
+- The hook is a marked block (`HOOK_BEGIN`/`HOOK_END`) that emits OSC 7 before
+  every prompt in bash (`PROMPT_COMMAND`) and zsh (`precmd_functions`). Install
+  is idempotent and keeps a one-time `<file>.rustterm-backup`; remove deletes
+  exactly the marked lines. Only bash and zsh are offered.
+
+**`src/sftp.rs` — explorer behaviour.**
+- `follow` (default on) drives `follow_shell_cwd`. The latest report is always
+  remembered, but navigation happens only while following is on, the panel is
+  available and the path box does not have focus. A directory that failed to
+  open is not retried on every prompt (`follow_denied`).
+- Manual navigation (`navigate`, `up`, `go_home`, `back`, `forward`, folder
+  clicks, link following) turns following off; connect/reconnect/refresh keep it.
+  The **Follow** chip calls `set_follow`, which catches up to the shell at once.
+- `SftpHistory` is browser-style, capped at `HISTORY_LIMIT = 100`. `NavIntent`
+  records why a listing started, and history is committed **only after a
+  successful listing**, so a failed navigation cannot corrupt the stacks.
+  Refresh never touches history; a new move after Back clears Forward.
+- `open_link` resolves a symlink and either lists the target through the link
+  path (keeping the link name in the path box) or opens the file picker. Resolved
+  targets are remembered for the details strip.
+- Shell hook: `begin_hook_prompt` detects the login shell when needed,
+  `submit_hook_prompt` installs or removes the block, and `send_session_hook`
+  types the idempotent one-liner into the live shell. The hint appears after
+  `HOOK_HINT_DELAY = 3 s` without an OSC 7 report and disappears once one arrives
+  or the user dismisses it.
+
+**`src/app.rs` — wiring.**
+- The pump drains `terminal.take_cwd()` after feeding output and calls
+  `follow_shell_cwd`.
+- The path row is now **‹ / ›** + path box + **➡ Go** + **Follow** chip, sized to
+  fit the 340 px minimum panel width.
+- The **Track the shell's folder?** strip offers **Enable now**, **Install…** and
+  dismiss; **Install…** opens a dedicated consent modal with **Install**,
+  **Remove** and **Cancel**.
+- Symlink rows get **Follow link** in the context menu; double-click resolves the
+  link instead of going straight to the picker. The details strip shows
+  `→ target` once known.
+
+**`src/theme.rs`** — added `BACK = "‹"` and `FORWARD = "›"` to `icons` (covered
+by `icons_have_glyphs`).
+
+**Docs** — `USAGE.md` §14, `TESTING.md` §2.7 (F12–F15, renumbered hide/cleanup)
+and `handoff.md` (F26 closed).
+
+## Verified
+
+- `cargo build` ✅
+- `cargo clippy --all-targets -- -D warnings` ✅
+- `cargo test` ✅ **95 passed** (default and `--no-default-features`)
+- `cargo fmt --check` ✅
+- New unit tests: 5 OSC 7 scanner/`take_cwd`, 4 hook block/passwd/`bash -n`,
+  5 history/normalization/one-line snippet.
+- GUI checks: `USAGE.md` §14 and `TESTING.md` §2.7 (F12–F15). Not yet run on a
+  live server.

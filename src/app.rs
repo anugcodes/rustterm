@@ -22,7 +22,7 @@
 use std::path::PathBuf;
 use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 
@@ -32,7 +32,7 @@ use crate::sessions::{SessionProfile, SessionStore};
 use crate::settings::Settings;
 use crate::sftp::{
     command_available, editor_program, format_age, format_owner, format_size, format_timestamp,
-    EditorChoice, SftpDialogKind, SftpExplorer, StatusKind,
+    EditJournal, EditorChoice, SftpDialogKind, SftpExplorer, StatusKind,
 };
 use crate::ssh::{ConflictPolicy, HostKeyPrompt, RemoteEntry, SshConfig, SshSession, Wake};
 use crate::terminal::{TermAction, TerminalView};
@@ -46,10 +46,12 @@ const DEFAULT_ROWS: usize = 24;
 /// connected, the SSH thread wakes the UI itself when output arrives.
 const CONNECT_POLL_MS: u64 = 8;
 
-/// Delay between checks of files opened in a local editor. Saving in the
-/// editor is detected by polling, so the UI keeps a slow timer alive while a
-/// file is watched for auto-upload.
-const EDIT_WATCH_POLL_MS: u64 = 600;
+/// Slow safety pass behind the file watcher. Saves arrive as inotify events and
+/// wake the UI immediately; this timer only catches events the watcher missed.
+const EDIT_SAFETY_MS: u64 = 5000;
+
+/// Repaint delay while a save event waits out the debounce (150 ms + margin).
+const EDIT_DEBOUNCE_MS: u64 = 170;
 
 /// Upper bound on remote bytes decoded in a single frame. This keeps a large
 /// burst from stalling the UI while still allowing tens of MiB/s sustained.
@@ -250,10 +252,11 @@ fn tab_button(
 
 /// Column layout of the SFTP table, persisted per session.
 ///
-/// Columns are ordered **Name, Modified, Size, Owner**. Each one owns a share
-/// of the table width instead of a fixed pixel width, so the proportions
-/// survive a panel resize and `Name` stays at half the table. Dividers move in
-/// whole `COLUMN_STEP` pixels rather than following the pointer freely.
+/// Columns are ordered **Name, Modified, Size, Owner** and each one owns a
+/// fixed number of pixels on a table canvas that never changes width. The side
+/// panel is only a viewport on top of that canvas: resizing it clips or reveals
+/// the table instead of reflowing it. Dividers move in whole `COLUMN_STEP`
+/// pixels rather than following the pointer freely.
 #[derive(Debug, Clone, Copy)]
 struct SftpColumns {
     name: f32,
@@ -262,14 +265,21 @@ struct SftpColumns {
     owner: f32,
 }
 
+/// Width of the table canvas, in pixels.
+///
+/// This is deliberately independent of the side panel: the panel may shrink
+/// below it (the table then scrolls horizontally) or grow past it (blank space
+/// appears to the right), but the columns themselves never move.
+const TABLE_WIDTH: f32 = 430.0;
+
 impl Default for SftpColumns {
     fn default() -> Self {
-        // `Name` gets half the table; the metadata columns share the rest.
+        // `Name` gets half the canvas; the metadata columns share the rest.
         Self {
-            name: 0.50,
-            modified: 0.22,
-            size: 0.10,
-            owner: 0.18,
+            name: TABLE_WIDTH * 0.50,
+            modified: TABLE_WIDTH * 0.22,
+            size: TABLE_WIDTH * 0.10,
+            owner: TABLE_WIDTH * 0.18,
         }
     }
 }
@@ -278,107 +288,67 @@ const NAME_MIN_WIDTH: f32 = 90.0;
 const MIN_MODIFIED_WIDTH: f32 = 64.0;
 const MIN_SIZE_WIDTH: f32 = 36.0;
 const MIN_OWNER_WIDTH: f32 = 44.0;
-/// A divider only ever sits on a multiple of this many pixels.
-const COLUMN_STEP: f32 = 12.0;
+/// A divider only ever moves by this many pixels per step.
+const COLUMN_STEP: f32 = 24.0;
+
+const COLUMN_MINS: [f32; 4] = [
+    NAME_MIN_WIDTH,
+    MIN_MODIFIED_WIDTH,
+    MIN_SIZE_WIDTH,
+    MIN_OWNER_WIDTH,
+];
 
 impl SftpColumns {
-    /// Shares normalised to sum to 1.
-    fn shares(self) -> [f32; 4] {
-        let raw = [self.name, self.modified, self.size, self.owner].map(|w| w.max(0.0));
-        let sum: f32 = raw.iter().sum();
-        if sum <= 0.0 {
-            return [0.50, 0.22, 0.10, 0.18];
-        }
-        raw.map(|share| share / sum)
+    /// Pixel widths in column order.
+    fn widths(self) -> [f32; 4] {
+        [self.name, self.modified, self.size, self.owner].map(|w| w.max(0.0))
     }
 
-    fn from_shares(shares: [f32; 4]) -> Self {
+    fn from_widths(widths: [f32; 4]) -> Self {
         Self {
-            name: shares[0],
-            modified: shares[1],
-            size: shares[2],
-            owner: shares[3],
+            name: widths[0],
+            modified: widths[1],
+            size: widths[2],
+            owner: widths[3],
         }
-    }
-
-    /// Pixel widths to paint at `total`, in column order.
-    ///
-    /// A column that would be too narrow to read is hidden — Owner first,
-    /// then Size, then Modified — and its share is handed to `Name`, which is
-    /// the column that must stay readable.
-    fn fitted(self, total: f32) -> [f32; 4] {
-        let total = total.max(0.0);
-        let mut shares = self.shares();
-        let mut visible = [true; 4];
-        let mins = [
-            NAME_MIN_WIDTH,
-            MIN_MODIFIED_WIDTH,
-            MIN_SIZE_WIDTH,
-            MIN_OWNER_WIDTH,
-        ];
-
-        let widths = |shares: &[f32; 4], visible: &[bool; 4]| {
-            let shown: f32 = (0..4).filter(|&i| visible[i]).map(|i| shares[i]).sum();
-            let shown = if shown > 0.0 { shown } else { 1.0 };
-            let mut out = [0.0_f32; 4];
-            for (i, width) in out.iter_mut().enumerate() {
-                if visible[i] {
-                    *width = shares[i] / shown * total;
-                }
-            }
-            out
-        };
-
-        for column in [3, 2, 1] {
-            let current = widths(&shares, &visible);
-            if current[column] > 0.0 && current[column] < mins[column] {
-                visible[column] = false;
-                shares[0] += shares[column];
-                shares[column] = 0.0;
-            }
-        }
-        widths(&shares, &visible)
     }
 
     /// Move the divider left of column `boundary` to `offset` pixels from the
     /// table's left edge.
     ///
-    /// The divider only ever lands on a multiple of `COLUMN_STEP`, and only the
-    /// two neighbours change, so every other column keeps its width. Hidden
-    /// columns are not draggable.
-    fn drag_divider(&mut self, total: f32, boundary: usize, offset: f32) {
-        if !(1..4).contains(&boundary) || total <= 0.0 {
+    /// The pointer is only advisory: the divider jumps to the nearest whole
+    /// `COLUMN_STEP` from its current position, and only the two neighbours
+    /// change, so every other column keeps its width.
+    fn drag_divider(&mut self, boundary: usize, offset: f32) {
+        if !(1..4).contains(&boundary) {
             return;
         }
-        let widths = self.fitted(total);
+        let widths = self.widths();
         let (left, right) = (boundary - 1, boundary);
         if widths[left] <= 0.0 || widths[right] <= 0.0 {
             return;
         }
-        let mins = [
-            NAME_MIN_WIDTH,
-            MIN_MODIFIED_WIDTH,
-            MIN_SIZE_WIDTH,
-            MIN_OWNER_WIDTH,
-        ];
         let current: f32 = widths[..boundary].iter().sum();
-        // Work in pixels: how far the divider may travel before either
-        // neighbour drops below its minimum.
-        let left_slack = (widths[left] - mins[left]).max(0.0);
-        let right_slack = (widths[right] - mins[right]).max(0.0);
-        let min_pos = ((current - left_slack) / COLUMN_STEP).ceil() * COLUMN_STEP;
-        let max_pos = ((current + right_slack) / COLUMN_STEP).floor() * COLUMN_STEP;
-        if min_pos > max_pos {
-            // No whole step fits between the two minimum widths.
+        // How far the divider may travel before either neighbour drops below
+        // its minimum, expressed in whole steps so the grid is never broken.
+        let left_slack = (widths[left] - COLUMN_MINS[left]).max(0.0);
+        let right_slack = (widths[right] - COLUMN_MINS[right]).max(0.0);
+        let min_steps = -(left_slack / COLUMN_STEP).floor();
+        let max_steps = (right_slack / COLUMN_STEP).floor();
+        if min_steps > max_steps {
             return;
         }
-        let target =
-            ((offset.max(0.0) / COLUMN_STEP).round() * COLUMN_STEP).clamp(min_pos, max_pos);
-        let delta = (target - current) / total;
-        let mut shares = self.shares();
-        shares[left] += delta;
-        shares[right] -= delta;
-        *self = Self::from_shares(shares);
+        let steps = ((offset - current) / COLUMN_STEP)
+            .round()
+            .clamp(min_steps, max_steps);
+        let delta = steps * COLUMN_STEP;
+        if delta == 0.0 {
+            return;
+        }
+        let mut next = widths;
+        next[left] += delta;
+        next[right] -= delta;
+        *self = Self::from_widths(next);
     }
 }
 
@@ -392,7 +362,7 @@ struct SftpLayout {
 
 impl SftpLayout {
     fn new(rect: egui::Rect, columns: SftpColumns) -> Self {
-        let widths = columns.fitted(rect.width());
+        let widths = columns.widths();
         let mut x = rect.left();
         let mut cell = |width: f32| {
             let column = egui::Rect::from_x_y_ranges(x..=(x + width), rect.y_range());
@@ -406,6 +376,40 @@ impl SftpLayout {
             owner: cell(widths[3]),
         }
     }
+}
+
+/// Two compact lines describing the selected entry.
+///
+/// The table columns stay scannable; anything that would not fit there (the
+/// full path, the exact timestamps, the entry type) lives here.
+fn sftp_details_bar(ui: &mut egui::Ui, theme: &Theme, entry: &RemoteEntry, link: Option<&str>) {
+    let mut second = String::new();
+    if entry.is_dir {
+        second.push_str("folder");
+    } else {
+        second.push_str(&format_size(entry.size));
+    }
+    if entry.is_symlink {
+        match link {
+            Some(target) => second.push_str(&format!(" → {target}")),
+            None => second.push_str(" · symlink"),
+        }
+    }
+    second.push_str(&format!(" · owner {}", format_owner(entry)));
+    second.push_str(&format!(" · {}", format_timestamp(entry.modified)));
+    if let Some(modified) = entry.modified {
+        second.push_str(&format!(" ({})", format_age(modified)));
+    }
+
+    let font = theme::body_font(theme);
+    let body = |ui: &mut egui::Ui, text: &str, color: egui::Color32| {
+        ui.add(
+            egui::Label::new(egui::RichText::new(text).font(font.clone()).color(color)).truncate(),
+        )
+        .on_hover_text(text);
+    };
+    body(ui, &entry.path, theme.palette.text);
+    body(ui, &second, theme.palette.muted);
 }
 
 /// Latest SFTP message, operation state, queue depth and message history.
@@ -607,66 +611,163 @@ fn pick_upload_folder() -> Option<Vec<PathBuf>> {
         .map(|path| vec![path])
 }
 
+/// Which column the SFTP table is ordered by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum SftpSortKey {
+    #[default]
+    Name,
+    Modified,
+    Size,
+    Owner,
+}
+
+/// Current sort of the SFTP table, kept per session.
+#[derive(Debug, Clone, Copy)]
+struct SftpSort {
+    key: SftpSortKey,
+    ascending: bool,
+}
+
+impl Default for SftpSort {
+    fn default() -> Self {
+        Self {
+            key: SftpSortKey::Name,
+            ascending: true,
+        }
+    }
+}
+
+impl SftpSort {
+    /// Clicking a header selects it, or flips the direction if already active.
+    fn toggle(&mut self, key: SftpSortKey) {
+        if self.key == key {
+            self.ascending = !self.ascending;
+        } else {
+            self.key = key;
+            self.ascending = true;
+        }
+    }
+
+    fn arrow(&self) -> &'static str {
+        if self.ascending {
+            theme::icons::SORT_ASC
+        } else {
+            theme::icons::SORT_DESC
+        }
+    }
+}
+
+/// Indices of `entries` in display order: hidden files filtered out, folders
+/// first, then the active sort key.
+fn sorted_indices(entries: &[RemoteEntry], show_hidden: bool, sort: SftpSort) -> Vec<usize> {
+    let mut indices: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| show_hidden || !entry.name.starts_with('.'))
+        .map(|(index, _)| index)
+        .collect();
+    indices.sort_by(|&a, &b| {
+        let (a, b) = (&entries[a], &entries[b]);
+        // Folders always stay grouped above files, whatever the key.
+        b.is_dir.cmp(&a.is_dir).then_with(|| {
+            let order = match sort.key {
+                SftpSortKey::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                SftpSortKey::Modified => a.modified.cmp(&b.modified),
+                SftpSortKey::Size => a.size.cmp(&b.size),
+                SftpSortKey::Owner => a.owner.to_lowercase().cmp(&b.owner.to_lowercase()),
+            };
+            let order = if sort.ascending {
+                order
+            } else {
+                order.reverse()
+            };
+            // Stable, predictable order for equal keys.
+            order.then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        })
+    });
+    indices
+}
+
 /// Draw the SFTP column header and its resize handles.
 ///
 /// The handles live only in the header row, never on the file rows. Each one
 /// adjusts the column that starts at its divider, so the divider always
-/// follows the pointer.
+/// follows the pointer. Clicking a column name sorts by it. Returns `true` when
+/// the sort changed.
 fn sftp_header(
     ui: &mut egui::Ui,
     theme: &Theme,
     columns: &mut SftpColumns,
+    sort: &mut SftpSort,
     index: usize,
     rect: egui::Rect,
     width: f32,
-) {
+) -> bool {
     let rect = egui::Rect::from_min_size(rect.min, egui::vec2(width, rect.height()));
     let layout = SftpLayout::new(rect, *columns);
     let font = theme::body_font(theme);
     let painter = ui.painter().clone();
     painter.rect_filled(rect, egui::Rounding::ZERO, theme.palette.panel);
 
-    let name_rect = egui::Rect::from_min_max(
-        egui::pos2(rect.left() + 22.0, rect.top()),
-        egui::pos2(layout.name.right() - 2.0, rect.bottom()),
-    );
-    paint_cell(
-        ui,
-        name_rect,
-        "Name",
-        font.clone(),
-        theme.palette.muted,
-        egui::Align::Min,
-    );
-    if layout.modified.width() > 0.0 {
+    let mut sort_changed = false;
+    // (cell rect, left inset, sort key, label). The inset keeps the label clear
+    // of the type icon and of the divider handles.
+    for (cell, inset, key, label) in [
+        (layout.name, 22.0, SftpSortKey::Name, "Name"),
+        (layout.modified, 6.0, SftpSortKey::Modified, "Modified"),
+        (layout.size, 6.0, SftpSortKey::Size, "Size"),
+        (layout.owner, 6.0, SftpSortKey::Owner, "Owner"),
+    ] {
+        if cell.width() <= inset + 4.0 {
+            continue;
+        }
+        let label_rect = egui::Rect::from_min_max(
+            egui::pos2(cell.left() + inset, cell.top()),
+            egui::pos2(cell.right() - 2.0, cell.bottom()),
+        );
+        let active = sort.key == key;
+        let text = if active {
+            format!("{label} {}", sort.arrow())
+        } else {
+            label.to_string()
+        };
+        let align = if key == SftpSortKey::Size {
+            egui::Align::Max
+        } else {
+            egui::Align::Min
+        };
         paint_cell(
             ui,
-            layout.modified.shrink2(egui::vec2(4.0, 0.0)),
-            "Modified",
+            label_rect,
+            &text,
             font.clone(),
-            theme.palette.muted,
-            egui::Align::Min,
+            if active {
+                theme.palette.text
+            } else {
+                theme.palette.muted
+            },
+            align,
         );
-    }
-    if layout.size.width() > 0.0 {
-        paint_cell(
-            ui,
-            layout.size.shrink2(egui::vec2(4.0, 0.0)),
-            "Size",
-            font.clone(),
-            theme.palette.muted,
-            egui::Align::Max,
+
+        let response = ui.interact(
+            label_rect,
+            egui::Id::new(("sftp_sort", index, label)),
+            egui::Sense::click(),
         );
-    }
-    if layout.owner.width() > 0.0 {
-        paint_cell(
-            ui,
-            layout.owner.shrink2(egui::vec2(4.0, 0.0)),
-            "Owner",
-            font,
-            theme.palette.muted,
-            egui::Align::Min,
-        );
+        if response
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .clicked()
+        {
+            sort.toggle(key);
+            sort_changed = true;
+        }
+        if active {
+            painter.hline(
+                cell.x_range(),
+                rect.bottom() - 1.0,
+                egui::Stroke::new(1.0_f32, theme.palette.border_strong),
+            );
+        }
     }
 
     // A divider is only drawn — and only draggable — in front of a column that
@@ -692,7 +793,6 @@ fn sftp_header(
         egui::Stroke::new(1.0_f32, theme.palette.border_strong),
     );
 
-    let total = rect.width();
     for (boundary, x) in separators {
         let handle = egui::Rect::from_min_max(
             egui::pos2(x - 3.0, rect.top()),
@@ -713,12 +813,17 @@ fn sftp_header(
             continue;
         };
         // Snapshots to fixed steps, so the divider jumps one notch at a time.
-        columns.drag_divider(total, boundary, pointer.x - rect.left());
+        columns.drag_divider(boundary, pointer.x - rect.left());
     }
+
+    sort_changed
 }
 
 pub struct RustTermApp {
     sessions: Vec<ActiveSession>,
+    /// Edit journals detached from closed tabs, waiting for a session with the
+    /// same profile so unsynced local changes can be uploaded.
+    detached_edits: Vec<EditJournal>,
     /// 0 = New Session form; `i > 0` = `sessions[i - 1]`.
     active: usize,
     form: ConnectForm,
@@ -751,6 +856,8 @@ struct ActiveSession {
     sftp: SftpExplorer,
     /// Resized column widths of the file table.
     sftp_columns: SftpColumns,
+    /// Sort order of the file table.
+    sftp_sort: SftpSort,
     /// Set once so the terminal takes focus on first appearance.
     focus_requested: bool,
     /// Set when the session thread exits; the tab then shows a closed banner
@@ -812,6 +919,7 @@ impl Default for RustTermApp {
 
         Self {
             sessions: Vec::new(),
+            detached_edits: Vec::new(),
             active: NEW_SESSION_TAB,
             form: ConnectForm::default(),
             connecting: None,
@@ -966,13 +1074,23 @@ impl RustTermApp {
                 let state = self.connecting.take().expect("checked above");
                 let input_tx = ssh.input_sender();
                 // Resolve the remote home before `ssh` is moved into the session.
-                let sftp = SftpExplorer::start(&ssh);
+                let mut sftp = SftpExplorer::start(&ssh, &state.label);
+                // A new tab to the same host picks up edits left unsynced by a
+                // dropped session.
+                if let Some(pos) = self
+                    .detached_edits
+                    .iter()
+                    .position(|journal| journal.profile() == state.label)
+                {
+                    sftp.install_journal(self.detached_edits.remove(pos));
+                }
                 self.sessions.push(ActiveSession {
                     title: state.label,
                     ssh,
                     terminal: TerminalView::new(DEFAULT_COLS, DEFAULT_ROWS, input_tx),
                     sftp,
                     sftp_columns: SftpColumns::default(),
+                    sftp_sort: SftpSort::default(),
                     focus_requested: false,
                     connection_lost: false,
                 });
@@ -1094,8 +1212,13 @@ impl RustTermApp {
         if i >= self.sessions.len() {
             return;
         }
-        let removed = self.sessions.remove(i);
+        let mut removed = self.sessions.remove(i);
         removed.ssh.disconnect();
+        // Keep any unsynced editor copies for a later session to the same host.
+        let journal = removed.sftp.take_journal();
+        if !journal.is_empty() {
+            self.detached_edits.push(journal);
+        }
 
         if self.active == i + 1 {
             self.active = NEW_SESSION_TAB;
@@ -1126,6 +1249,26 @@ impl RustTermApp {
     fn pump_sessions(&mut self, ctx: &egui::Context) -> bool {
         let mut activity = false;
         let mut budget = MAX_OUTPUT_PER_FRAME;
+        // File-save events arrive on a watcher thread; give each panel a way to
+        // wake egui instead of relying on a polling timer.
+        let wake: Wake = Arc::new({
+            let ctx = ctx.clone();
+            move || ctx.request_repaint()
+        });
+
+        // Journals from closed tabs are only useful for a short while.
+        let now = Instant::now();
+        let had_detached = !self.detached_edits.is_empty();
+        self.detached_edits.retain_mut(|journal| {
+            for name in journal.expire(now) {
+                log::info!("dropped stale edit journal for {name}");
+            }
+            !journal.is_empty()
+        });
+        if had_detached && !self.detached_edits.is_empty() {
+            // Wake up occasionally so an idle app still expires old entries.
+            ctx.request_repaint_after(Duration::from_secs(60));
+        }
 
         for session in &mut self.sessions {
             // A dead thread used to be invisible: reads returned `None`, input
@@ -1138,6 +1281,7 @@ impl RustTermApp {
             // SFTP replies arrive asynchronously; polling them for every tab
             // keeps a listing ready even if the sidebar is currently hidden.
             if !session.connection_lost {
+                session.sftp.attach_wake(wake.clone());
                 if session.sftp.poll(&session.ssh) {
                     activity = true;
                 }
@@ -1145,10 +1289,15 @@ impl RustTermApp {
                     // The bar is polled; keep frames coming while bytes flow.
                     ctx.request_repaint_after(Duration::from_millis(100));
                 }
+                if session.sftp.pending_edit_settle() {
+                    // An event arrived; wake once the debounce has elapsed so
+                    // the upload does not wait for the slow safety pass.
+                    ctx.request_repaint_after(Duration::from_millis(EDIT_DEBOUNCE_MS));
+                }
                 if session.sftp.watches_edits() {
-                    // A save in the editor only changes a local file, so
-                    // nothing pushes a repaint; poll it on a slow timer.
-                    ctx.request_repaint_after(Duration::from_millis(EDIT_WATCH_POLL_MS));
+                    // Save events wake egui through the watcher itself; this
+                    // slow tick is only the safety pass.
+                    ctx.request_repaint_after(Duration::from_millis(EDIT_SAFETY_MS));
                 }
             }
             while budget > 0 {
@@ -1158,6 +1307,14 @@ impl RustTermApp {
                 budget = budget.saturating_sub(chunk.len());
                 session.terminal.feed(&chunk);
                 activity = true;
+            }
+            // The shell reports its directory through OSC 7; following is
+            // decided in the explorer, which also ignores it while paused.
+            if let Some(cwd) = session.terminal.take_cwd() {
+                if !session.connection_lost {
+                    session.sftp.follow_shell_cwd(&session.ssh, &cwd);
+                    activity = true;
+                }
             }
             if let Some(title) = session.terminal.take_title() {
                 session.title = title;
@@ -1752,6 +1909,7 @@ impl RustTermApp {
         // requests.
         let (ssh, explorer) = (&session.ssh, &mut session.sftp);
         let columns = &mut session.sftp_columns;
+        let sort = &mut session.sftp_sort;
         let mut activity = false;
         let mut hide = false;
 
@@ -1776,7 +1934,7 @@ impl RustTermApp {
             )
             .clicked()
             {
-                explorer.load_home(ssh);
+                explorer.go_home(ssh);
                 activity = true;
             }
             if theme::icon_button(ui, theme, theme::icons::UP, "Up one level", can_up && !busy)
@@ -1888,9 +2046,6 @@ impl RustTermApp {
                 explorer.reconnect(ssh);
                 activity = true;
             }
-            if explorer.loading {
-                ui.spinner();
-            }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if theme::icon_button(ui, theme, theme::icons::CLOSE, "Hide the file panel", true)
@@ -1902,12 +2057,44 @@ impl RustTermApp {
         });
 
         ui.horizontal(|ui| {
-            let go_width = theme.metrics.control_height;
-            let width = (ui.available_width() - go_width - 4.0).max(80.0);
+            let control = theme.metrics.control_height;
+            if theme::icon_button(
+                ui,
+                theme,
+                theme::icons::BACK,
+                "Back to the previous folder",
+                explorer.can_back() && !busy,
+            )
+            .clicked()
+            {
+                explorer.back(ssh);
+                activity = true;
+            }
+            if theme::icon_button(
+                ui,
+                theme,
+                theme::icons::FORWARD,
+                "Forward to the next folder",
+                explorer.can_forward() && !busy,
+            )
+            .clicked()
+            {
+                explorer.forward(ssh);
+                activity = true;
+            }
+
+            // Reserve room for Go and Follow so the field cannot push them
+            // outside a 340 px panel.
+            let follow_width = 58.0;
+            let reserved = control + follow_width + 8.0;
+            let width = (ui.available_width() - reserved).max(80.0);
             let edit = ui.add_sized(
-                [width, theme.metrics.control_height],
+                [width, control],
                 text_field(theme, &mut explorer.path_edit).hint_text("Remote path"),
             );
+            // Following waits while the box has focus, so a prompt cannot
+            // overwrite a path that is being typed.
+            explorer.path_focused = edit.has_focus();
             if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                 let path = explorer.path_edit.clone();
                 explorer.navigate(ssh, path);
@@ -1918,7 +2105,78 @@ impl RustTermApp {
                 explorer.navigate(ssh, path);
                 activity = true;
             }
+            let follow = ui
+                .add(
+                    egui::Button::new(egui::RichText::new("Follow").size(11.0))
+                        .selected(explorer.follow)
+                        .min_size(egui::vec2(0.0, control))
+                        .rounding(egui::Rounding::ZERO),
+                )
+                .on_hover_text(
+                    "Follow the shell's folder (OSC 7). Manual navigation pauses it. Right-click to set up tracking.",
+                );
+            follow.context_menu(|ui| {
+                theme::menu_style(ui);
+                if theme::menu_item(ui, "Set up directory tracking…", true, None).clicked() {
+                    if explorer.begin_hook_prompt(ssh) {
+                        explorer.dismiss_hook_hint();
+                    }
+                    ui.close_menu();
+                }
+            });
+            if follow.clicked() {
+                let next = !explorer.follow;
+                explorer.set_follow(ssh, next);
+                activity = true;
+            }
         });
+
+        if explorer.wants_hook_hint() {
+            egui::Frame::none()
+                .fill(theme.palette.surface)
+                .stroke(egui::Stroke::new(1.0_f32, theme.palette.border))
+                .inner_margin(egui::Margin::symmetric(6.0, 3.0))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("Track the shell's folder?")
+                                .size(11.0)
+                                .color(theme.palette.muted),
+                        );
+                        if ui
+                            .add(egui::Button::new("Enable now").small())
+                            .on_hover_text(
+                                "At a shell prompt, runs a one-line snippet in this shell. It applies from the next prompt and is not saved.",
+                            )
+                            .clicked()
+                        {
+                            explorer.send_session_hook(ssh);
+                            explorer.dismiss_hook_hint();
+                            activity = true;
+                        }
+                        if ui
+                            .add(egui::Button::new("Install…").small())
+                            .on_hover_text(
+                                "Adds a marked block to your startup file so tracking survives new sessions.",
+                            )
+                            .clicked()
+                        {
+                            if explorer.begin_hook_prompt(ssh) {
+                                explorer.dismiss_hook_hint();
+                            }
+                            activity = true;
+                        }
+                        if ui
+                            .add(egui::Button::new(theme::icons::CLOSE).small())
+                            .on_hover_text("Dismiss for this session")
+                            .clicked()
+                        {
+                            explorer.dismiss_hook_hint();
+                            activity = true;
+                        }
+                    });
+                });
+        }
 
         // Fixed message bar at the bottom. Declared before the table so the
         // table gets the remaining height.
@@ -1967,13 +2225,7 @@ impl RustTermApp {
             return activity || hide;
         }
 
-        let visible_indices: Vec<usize> = explorer
-            .entries
-            .iter()
-            .enumerate()
-            .filter(|(_, entry)| explorer.show_hidden || !entry.name.starts_with('.'))
-            .map(|(index, _)| index)
-            .collect();
+        let visible_indices = sorted_indices(&explorer.entries, explorer.show_hidden, *sort);
         let has_clipboard = explorer.clipboard.is_some();
         let empty_message = if explorer.loading {
             "Loading…"
@@ -1991,6 +2243,7 @@ impl RustTermApp {
         // borrow the explorer mutably while the table is iterated.
         enum RowAction {
             Navigate(String),
+            FollowLink(RemoteEntry),
             OpenWith(RemoteEntry),
             Rename(RemoteEntry),
             Delete(RemoteEntry),
@@ -2002,223 +2255,263 @@ impl RustTermApp {
         let mut row_action: Option<RowAction> = None;
         let mut select_row: Option<usize> = None;
 
+        // Selected-entry summary. Declared before the table so the table keeps
+        // the rest of the height, and after the status/transfer bars so it
+        // stacks above them.
+        if let Some(entry) = &selected {
+            egui::TopBottomPanel::bottom(egui::Id::new(("sftp_details", index)))
+                .exact_height(theme.metrics.row_height * 2.0 + 6.0)
+                .frame(
+                    egui::Frame::none()
+                        .fill(theme.palette.surface)
+                        .stroke(egui::Stroke::new(1.0_f32, theme.palette.border))
+                        .inner_margin(egui::Margin::symmetric(6.0, 2.0)),
+                )
+                .show_inside(ui, |ui| {
+                    let link = explorer.link_target(&entry.path);
+                    sftp_details_bar(ui, theme, entry, link);
+                });
+        }
+
         let row_height = theme.metrics.row_height;
-        let (header_rect, _) = ui.allocate_exact_size(
-            egui::vec2(ui.available_width(), row_height),
-            egui::Sense::hover(),
-        );
-
-        let row_count = visible_indices.len().max(1);
-        let output = egui::ScrollArea::vertical()
-            .id_salt(("sftp_scroll", index))
+        let table_width = TABLE_WIDTH;
+        egui::ScrollArea::horizontal()
+            .id_salt(("sftp_hscroll", index))
             .auto_shrink([false, false])
-            .show_rows(ui, row_height, row_count, |ui, range| {
-                for visible_index in range {
-                    let (rect, response) = ui.allocate_exact_size(
-                        egui::vec2(ui.available_width(), row_height),
-                        egui::Sense::click(),
-                    );
+            .show(ui, |ui| {
+                // The table never reflows: it is always painted at `table_width`
+                // and the panel is only the window onto it.
+                ui.set_width(table_width);
+                let (header_rect, _) = ui
+                    .allocate_exact_size(egui::vec2(table_width, row_height), egui::Sense::hover());
 
-                    if visible_indices.is_empty() {
-                        paint_cell(
-                            ui,
-                            rect.shrink2(egui::vec2(4.0, 0.0)),
-                            empty_message,
-                            theme::body_font(theme),
-                            theme.palette.muted,
-                            egui::Align::Min,
-                        );
-                        continue;
-                    }
+                let row_count = visible_indices.len().max(1);
+                egui::ScrollArea::vertical()
+                    .id_salt(("sftp_scroll", index))
+                    .auto_shrink([false, false])
+                    .show_rows(ui, row_height, row_count, |ui, range| {
+                        for visible_index in range {
+                            let (rect, response) = ui.allocate_exact_size(
+                                egui::vec2(table_width, row_height),
+                                egui::Sense::click(),
+                            );
 
-                    let entry_index = visible_indices[visible_index];
-                    let entry = &explorer.entries[entry_index];
-                    let is_selected = explorer.selected == Some(entry_index);
-                    let fill = if is_selected {
-                        theme.palette.selection
-                    } else if response.hovered() {
-                        theme.palette.surface_hover
-                    } else if visible_index % 2 == 1 {
-                        theme.palette.stripe
-                    } else {
-                        theme.palette.panel
-                    };
-                    ui.painter().rect_filled(rect, egui::Rounding::ZERO, fill);
+                            if visible_indices.is_empty() {
+                                paint_cell(
+                                    ui,
+                                    rect.shrink2(egui::vec2(4.0, 0.0)),
+                                    empty_message,
+                                    theme::body_font(theme),
+                                    theme.palette.muted,
+                                    egui::Align::Min,
+                                );
+                                continue;
+                            }
 
-                    let layout = SftpLayout::new(rect, *columns);
-                    let font = theme::body_font(theme);
-                    let icon = if entry.is_dir {
-                        "🗀"
-                    } else if entry.is_symlink {
-                        "🔗"
-                    } else {
-                        "🗋"
-                    };
-                    let icon_rect = egui::Rect::from_min_max(
-                        egui::pos2(rect.left() + 4.0, rect.top()),
-                        egui::pos2(rect.left() + 22.0, rect.bottom()),
-                    );
-                    paint_cell(
-                        ui,
-                        icon_rect,
-                        icon,
-                        theme::body_font(theme),
-                        theme.palette.muted,
-                        egui::Align::Center,
-                    );
-                    let name_rect = egui::Rect::from_min_max(
-                        egui::pos2(rect.left() + 22.0, rect.top()),
-                        egui::pos2(layout.name.right() - 2.0, rect.bottom()),
-                    );
-                    paint_cell(
-                        ui,
-                        name_rect,
-                        &entry.name,
-                        font.clone(),
-                        theme.palette.text,
-                        egui::Align::Min,
-                    );
-                    if layout.modified.width() > 0.0 {
-                        paint_cell(
-                            ui,
-                            layout.modified.shrink2(egui::vec2(4.0, 0.0)),
-                            &format_timestamp(entry.modified),
-                            font.clone(),
-                            theme.palette.muted,
-                            egui::Align::Min,
-                        );
-                    }
-                    if layout.size.width() > 0.0 {
-                        let size = if entry.is_dir {
-                            "—".to_string()
-                        } else {
-                            format_size(entry.size)
-                        };
-                        paint_cell(
-                            ui,
-                            layout.size.shrink2(egui::vec2(4.0, 0.0)),
-                            &size,
-                            font.clone(),
-                            theme.palette.muted,
-                            egui::Align::Max,
-                        );
-                    }
-                    if layout.owner.width() > 0.0 {
-                        paint_cell(
-                            ui,
-                            layout.owner.shrink2(egui::vec2(4.0, 0.0)),
-                            format_owner(entry),
-                            font,
-                            theme.palette.muted,
-                            egui::Align::Min,
-                        );
-                    }
+                            let entry_index = visible_indices[visible_index];
+                            let entry = &explorer.entries[entry_index];
+                            let is_selected = explorer.selected == Some(entry_index);
+                            let fill = if is_selected {
+                                theme.palette.selection
+                            } else if response.hovered() {
+                                theme.palette.surface_hover
+                            } else if visible_index % 2 == 1 {
+                                theme.palette.stripe
+                            } else {
+                                theme.palette.panel
+                            };
+                            ui.painter().rect_filled(rect, egui::Rounding::ZERO, fill);
 
-                    let mut details = entry.path.clone();
-                    if entry.is_dir {
-                        details.push_str("\ndirectory");
-                    } else {
-                        details.push_str(&format!("\n{}", format_size(entry.size)));
-                    }
-                    if entry.is_symlink {
-                        details.push_str(" · symlink");
-                    }
-                    details.push_str(&format!(
-                        "\nowner {} · modified {}",
-                        format_owner(entry),
-                        format_timestamp(entry.modified)
-                    ));
-                    if let Some(modified) = entry.modified {
-                        details.push_str(&format!("\n{}", format_age(modified)));
-                    }
+                            let layout = SftpLayout::new(rect, *columns);
+                            let font = theme::body_font(theme);
+                            let icon = if entry.is_dir {
+                                "🗀"
+                            } else if entry.is_symlink {
+                                "🔗"
+                            } else {
+                                "🗋"
+                            };
+                            let icon_rect = egui::Rect::from_min_max(
+                                egui::pos2(rect.left() + 4.0, rect.top()),
+                                egui::pos2(rect.left() + 22.0, rect.bottom()),
+                            );
+                            paint_cell(
+                                ui,
+                                icon_rect,
+                                icon,
+                                theme::body_font(theme),
+                                theme.palette.muted,
+                                egui::Align::Center,
+                            );
+                            let name_rect = egui::Rect::from_min_max(
+                                egui::pos2(rect.left() + 22.0, rect.top()),
+                                egui::pos2(layout.name.right() - 2.0, rect.bottom()),
+                            );
+                            paint_cell(
+                                ui,
+                                name_rect,
+                                &entry.name,
+                                font.clone(),
+                                theme.palette.text,
+                                egui::Align::Min,
+                            );
+                            if layout.modified.width() > 0.0 {
+                                paint_cell(
+                                    ui,
+                                    layout.modified.shrink2(egui::vec2(4.0, 0.0)),
+                                    &format_timestamp(entry.modified),
+                                    font.clone(),
+                                    theme.palette.muted,
+                                    egui::Align::Min,
+                                );
+                            }
+                            if layout.size.width() > 0.0 {
+                                let size = if entry.is_dir {
+                                    "—".to_string()
+                                } else {
+                                    format_size(entry.size)
+                                };
+                                paint_cell(
+                                    ui,
+                                    layout.size.shrink2(egui::vec2(4.0, 0.0)),
+                                    &size,
+                                    font.clone(),
+                                    theme.palette.muted,
+                                    egui::Align::Max,
+                                );
+                            }
+                            if layout.owner.width() > 0.0 {
+                                paint_cell(
+                                    ui,
+                                    layout.owner.shrink2(egui::vec2(4.0, 0.0)),
+                                    format_owner(entry),
+                                    font,
+                                    theme.palette.muted,
+                                    egui::Align::Min,
+                                );
+                            }
 
-                    let response = response.on_hover_text(details);
-                    if response.clicked() {
-                        select_row = Some(entry_index);
-                    }
-                    if response.double_clicked() {
-                        if entry.is_dir {
-                            row_action = Some(RowAction::Navigate(entry.path.clone()));
-                        } else {
-                            row_action = Some(RowAction::OpenWith(entry.clone()));
-                        }
-                    }
-                    if response.secondary_clicked() {
-                        select_row = Some(entry_index);
-                    }
-                    response.context_menu(|ui| {
-                        theme::menu_style(ui);
-                        // The header is the only variable-length text, so it is
-                        // truncated; fixed-width items alone would still let a
-                        // long filename widen the whole popup.
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(&entry.name).color(theme.palette.text),
-                            )
-                            .truncate(),
-                        )
-                        .on_hover_text(&entry.path);
-                        ui.separator();
-                        if entry.is_dir {
-                            if theme::menu_item(ui, "Open", true, None).clicked() {
-                                row_action = Some(RowAction::Navigate(entry.path.clone()));
-                                ui.close_menu();
+                            let mut details = entry.path.clone();
+                            if entry.is_dir {
+                                details.push_str("\ndirectory");
+                            } else {
+                                details.push_str(&format!("\n{}", format_size(entry.size)));
                             }
-                            if theme::menu_item(ui, "Paste into this folder", has_clipboard, None)
-                                .clicked()
-                            {
-                                row_action = Some(RowAction::Paste(entry.path.clone()));
-                                ui.close_menu();
+                            if entry.is_symlink {
+                                details.push_str(" · symlink");
                             }
-                            if theme::menu_item(ui, "Download…", true, None).clicked() {
-                                row_action = Some(RowAction::Download(entry.clone()));
-                                ui.close_menu();
+                            details.push_str(&format!(
+                                "\nowner {} · modified {}",
+                                format_owner(entry),
+                                format_timestamp(entry.modified)
+                            ));
+                            if let Some(modified) = entry.modified {
+                                details.push_str(&format!("\n{}", format_age(modified)));
                             }
-                            if theme::menu_item(ui, "Upload files here…", true, None).clicked() {
-                                row_action = Some(RowAction::UploadHere(entry.path.clone(), false));
-                                ui.close_menu();
+
+                            let response = response.on_hover_text(details);
+                            if response.clicked() {
+                                select_row = Some(entry_index);
                             }
-                            if theme::menu_item(ui, "Upload folder here…", true, None).clicked() {
-                                row_action = Some(RowAction::UploadHere(entry.path.clone(), true));
-                                ui.close_menu();
+                            if response.double_clicked() {
+                                if entry.is_symlink {
+                                    row_action = Some(RowAction::FollowLink(entry.clone()));
+                                } else if entry.is_dir {
+                                    row_action = Some(RowAction::Navigate(entry.path.clone()));
+                                } else {
+                                    row_action = Some(RowAction::OpenWith(entry.clone()));
+                                }
                             }
-                        } else {
-                            if theme::menu_item(ui, "Open with…", true, None).clicked() {
-                                row_action = Some(RowAction::OpenWith(entry.clone()));
-                                ui.close_menu();
+                            if response.secondary_clicked() {
+                                select_row = Some(entry_index);
                             }
-                            if theme::menu_item(ui, "Download…", true, None).clicked() {
-                                row_action = Some(RowAction::Download(entry.clone()));
-                                ui.close_menu();
-                            }
-                        }
-                        if theme::menu_item(ui, "Rename…", true, None).clicked() {
-                            row_action = Some(RowAction::Rename(entry.clone()));
-                            ui.close_menu();
-                        }
-                        if theme::menu_item(ui, "Copy path", true, None).clicked() {
-                            row_action = Some(RowAction::CopyPath(entry.clone()));
-                            ui.close_menu();
-                        }
-                        ui.separator();
-                        if theme::menu_item(ui, "Delete…", true, Some(theme.palette.danger))
-                            .clicked()
-                        {
-                            row_action = Some(RowAction::Delete(entry.clone()));
-                            ui.close_menu();
+                            response.context_menu(|ui| {
+                                theme::menu_style(ui);
+                                // The header is the only variable-length text, so it is
+                                // truncated; fixed-width items alone would still let a
+                                // long filename widen the whole popup.
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(&entry.name).color(theme.palette.text),
+                                    )
+                                    .truncate(),
+                                )
+                                .on_hover_text(&entry.path);
+                                ui.separator();
+                                if entry.is_symlink {
+                                    if theme::menu_item(ui, "Follow link", true, None).clicked() {
+                                        row_action = Some(RowAction::FollowLink(entry.clone()));
+                                        ui.close_menu();
+                                    }
+                                    ui.separator();
+                                }
+                                if entry.is_dir {
+                                    if theme::menu_item(ui, "Open", true, None).clicked() {
+                                        row_action = Some(RowAction::Navigate(entry.path.clone()));
+                                        ui.close_menu();
+                                    }
+                                    if theme::menu_item(
+                                        ui,
+                                        "Paste into this folder",
+                                        has_clipboard,
+                                        None,
+                                    )
+                                    .clicked()
+                                    {
+                                        row_action = Some(RowAction::Paste(entry.path.clone()));
+                                        ui.close_menu();
+                                    }
+                                    if theme::menu_item(ui, "Download…", true, None).clicked() {
+                                        row_action = Some(RowAction::Download(entry.clone()));
+                                        ui.close_menu();
+                                    }
+                                    if theme::menu_item(ui, "Upload files here…", true, None)
+                                        .clicked()
+                                    {
+                                        row_action =
+                                            Some(RowAction::UploadHere(entry.path.clone(), false));
+                                        ui.close_menu();
+                                    }
+                                    if theme::menu_item(ui, "Upload folder here…", true, None)
+                                        .clicked()
+                                    {
+                                        row_action =
+                                            Some(RowAction::UploadHere(entry.path.clone(), true));
+                                        ui.close_menu();
+                                    }
+                                } else {
+                                    if theme::menu_item(ui, "Open with…", true, None).clicked() {
+                                        row_action = Some(RowAction::OpenWith(entry.clone()));
+                                        ui.close_menu();
+                                    }
+                                    if theme::menu_item(ui, "Download…", true, None).clicked() {
+                                        row_action = Some(RowAction::Download(entry.clone()));
+                                        ui.close_menu();
+                                    }
+                                }
+                                if theme::menu_item(ui, "Rename…", true, None).clicked() {
+                                    row_action = Some(RowAction::Rename(entry.clone()));
+                                    ui.close_menu();
+                                }
+                                if theme::menu_item(ui, "Copy path", true, None).clicked() {
+                                    row_action = Some(RowAction::CopyPath(entry.clone()));
+                                    ui.close_menu();
+                                }
+                                ui.separator();
+                                if theme::menu_item(ui, "Delete…", true, Some(theme.palette.danger))
+                                    .clicked()
+                                {
+                                    row_action = Some(RowAction::Delete(entry.clone()));
+                                    ui.close_menu();
+                                }
+                            });
                         }
                     });
+
+                if sftp_header(ui, theme, columns, sort, index, header_rect, table_width) {
+                    activity = true;
                 }
             });
-
-        sftp_header(
-            ui,
-            theme,
-            columns,
-            index,
-            header_rect,
-            output.inner_rect.width(),
-        );
 
         if let Some(index) = select_row {
             explorer.selected = Some(index);
@@ -2227,6 +2520,9 @@ impl RustTermApp {
         if let Some(action) = row_action {
             match action {
                 RowAction::Navigate(path) => explorer.navigate(ssh, path),
+                RowAction::FollowLink(entry) => {
+                    explorer.open_link(ssh, &entry);
+                }
                 RowAction::OpenWith(entry) => {
                     explorer.begin_open_with(&entry);
                 }
@@ -2429,6 +2725,102 @@ impl RustTermApp {
         }
         if submit {
             return explorer.submit_dialog(ssh);
+        }
+        false
+    }
+
+    /// Consent dialog for writing directory tracking into a startup file.
+    fn sftp_hook_dialog_ui(&mut self, ctx: &egui::Context, index: usize) -> bool {
+        let theme = self.theme.theme();
+        let Some(session) = self.sessions.get_mut(index) else {
+            return false;
+        };
+        let (ssh, explorer) = (&session.ssh, &mut session.sftp);
+        let Some(prompt) = explorer.hook_prompt.clone() else {
+            return false;
+        };
+
+        let mut install = false;
+        let mut remove = false;
+        let mut cancel = false;
+        let control = theme.metrics.control_height;
+
+        egui::Window::new("Directory tracking")
+            .id(egui::Id::new(("sftp_hook", index)))
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .default_size(theme::dialog_size(theme))
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .frame(theme::modal_frame(theme))
+            .show(ctx, |ui| {
+                ui.set_width(theme::dialog_inner_width(theme));
+                ui.horizontal(|ui| {
+                    theme::modal_heading(ui, theme, "Directory tracking");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if theme::modal_close(ui) {
+                            cancel = true;
+                        }
+                    });
+                });
+                theme::muted(
+                    ui,
+                    theme,
+                    "Let the file panel follow the shell's folder as you change directory.",
+                );
+                ui.add_space(theme.metrics.pad);
+
+                theme::muted(ui, theme, "Startup file");
+                theme::modal_path(ui, theme, &prompt.path);
+                ui.add_space(4.0);
+                theme::muted(ui, theme, format!("Detected shell: {}", prompt.shell));
+                ui.add_space(6.0);
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(
+                            "Install adds a marked block, keeping a one-time backup beside the file. Remove deletes the block and leaves the rest of the file untouched.",
+                        )
+                        .color(theme.palette.muted)
+                        .size(theme.metrics.small_size),
+                    )
+                    .wrap(),
+                );
+
+                ui.add_space(theme.metrics.card_padding);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add(
+                            theme::primary_button(theme, "Install")
+                                .min_size(egui::vec2(92.0, control)),
+                        )
+                        .clicked()
+                    {
+                        install = true;
+                    }
+                    if ui
+                        .add(egui::Button::new("Remove").min_size(egui::vec2(92.0, control)))
+                        .on_hover_text("Delete the marked block from this file")
+                        .clicked()
+                    {
+                        remove = true;
+                    }
+                    if ui
+                        .add(egui::Button::new("Cancel").min_size(egui::vec2(92.0, control)))
+                        .clicked()
+                    {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            cancel = true;
+        }
+        if cancel {
+            return explorer.cancel_hook_prompt();
+        }
+        if install || remove {
+            return explorer.submit_hook_prompt(ssh, install);
         }
         false
     }
@@ -2810,6 +3202,7 @@ impl eframe::App for RustTermApp {
                             activity |= self.sftp_ui(ui, idx);
                         });
                     activity |= self.sftp_dialogs_ui(ctx, idx);
+                    activity |= self.sftp_hook_dialog_ui(ctx, idx);
                     activity |= self.sftp_conflict_ui(ctx, idx);
                     activity |= self.editor_picker_ui(ctx, idx);
                 }
@@ -2859,14 +3252,32 @@ impl eframe::App for RustTermApp {
 #[cfg(test)]
 mod tests {
     use super::{
-        sftp_header, SftpColumns, SftpLayout, COLUMN_STEP, MIN_MODIFIED_WIDTH, MIN_OWNER_WIDTH,
-        MIN_SIZE_WIDTH, NAME_MIN_WIDTH,
+        sftp_header, sorted_indices, RemoteEntry, SftpColumns, SftpLayout, SftpSort, SftpSortKey,
+        COLUMN_STEP, MIN_MODIFIED_WIDTH, MIN_OWNER_WIDTH, MIN_SIZE_WIDTH, NAME_MIN_WIDTH,
+        TABLE_WIDTH,
     };
     use crate::theme::ThemeId;
+    use std::time::{Duration, SystemTime};
+
+    fn entry(name: &str, is_dir: bool, size: u64, owner: &str, age_secs: u64) -> RemoteEntry {
+        RemoteEntry {
+            name: name.to_string(),
+            path: format!("/remote/{name}"),
+            is_dir,
+            is_symlink: false,
+            size,
+            owner: owner.to_string(),
+            modified: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(age_secs)),
+        }
+    }
+
+    fn folder(name: &str) -> RemoteEntry {
+        entry(name, true, 0, "root", 100)
+    }
 
     #[test]
     fn layout_orders_the_columns_left_to_right() {
-        let rect = egui::Rect::from_min_size(egui::pos2(10.0, 0.0), egui::vec2(600.0, 20.0));
+        let rect = egui::Rect::from_min_size(egui::pos2(10.0, 0.0), egui::vec2(TABLE_WIDTH, 20.0));
         let layout = SftpLayout::new(rect, SftpColumns::default());
         assert!((layout.name.left() - 10.0).abs() < 0.01);
         assert!((layout.name.right() - layout.modified.left()).abs() < 0.01);
@@ -2875,103 +3286,77 @@ mod tests {
         assert!((layout.owner.right() - rect.right()).abs() < 0.01);
     }
 
-    /// Paints the real header through egui at several widths, so inverted or
-    /// zero-width cell rects (hidden columns) cannot panic.
+    /// The panel is only a viewport: the same columns must land on the same
+    /// pixels no matter how wide the space they are drawn in.
+    #[test]
+    fn panel_width_does_not_move_the_columns() {
+        for width in [120.0, 340.0, 520.0, 900.0] {
+            let rect = egui::Rect::from_min_size(egui::pos2(10.0, 0.0), egui::vec2(width, 20.0));
+            let layout = SftpLayout::new(rect, SftpColumns::default());
+            let expected = SftpColumns::default().widths();
+            assert!(
+                (layout.name.width() - expected[0]).abs() < 0.01,
+                "w {width}"
+            );
+            assert!(
+                (layout.owner.width() - expected[3]).abs() < 0.01,
+                "w {width}"
+            );
+            // The table itself keeps its canvas width; it is merely clipped.
+            assert!(
+                (layout.owner.right() - rect.left() - TABLE_WIDTH).abs() < 0.01,
+                "w {width}"
+            );
+        }
+    }
+
+    /// Paints the real header through egui at every width, so the resize
+    /// handles and sort targets cannot panic.
     #[test]
     fn header_paints_at_every_panel_width() {
         let theme = ThemeId::Midnight.theme();
         let mut columns = SftpColumns::default();
+        let mut sort = SftpSort::default();
         let ctx = egui::Context::default();
         for width in [90.0, 160.0, 320.0, 480.0, 720.0] {
             let _ = ctx.run(egui::RawInput::default(), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     let rect =
                         egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(width, 24.0));
-                    sftp_header(ui, theme, &mut columns, 0, rect, width);
+                    sftp_header(ui, theme, &mut columns, &mut sort, 0, rect, width);
                 });
             });
         }
     }
 
-    /// Column widths in table order: Name, Modified, Size, Owner.
-    fn widths(columns: SftpColumns, total: f32) -> [f32; 4] {
-        columns.fitted(total)
-    }
-
     #[test]
-    fn default_layout_gives_the_name_half_the_table() {
-        let w = widths(SftpColumns::default(), 640.0);
-        assert!((w[0] - 320.0).abs() < 0.01, "name {}", w[0]);
+    fn default_layout_gives_the_name_half_the_canvas() {
+        let w = SftpColumns::default().widths();
+        assert!((w[0] - TABLE_WIDTH / 2.0).abs() < 0.01, "name {}", w[0]);
         assert!(w[1] >= MIN_MODIFIED_WIDTH);
         assert!(w[2] >= MIN_SIZE_WIDTH);
         assert!(w[3] >= MIN_OWNER_WIDTH);
-        assert!((w.iter().sum::<f32>() - 640.0).abs() < 0.01);
+        assert!((w.iter().sum::<f32>() - TABLE_WIDTH).abs() < 0.01);
     }
 
     #[test]
-    fn proportions_survive_a_panel_resize() {
-        let columns = SftpColumns::default();
-        for total in [400.0, 520.0, 900.0] {
-            let w = widths(columns, total);
-            assert!(
-                (w[0] - total / 2.0).abs() < 0.5,
-                "total {total}: name {} is not half",
-                w[0]
-            );
-        }
-    }
-
-    #[test]
-    fn narrow_panels_hide_metadata_before_the_name() {
-        let columns = SftpColumns::default();
-        // Owner disappears first, then Size, then Modified.
-        let mut expected_visible = [true; 4];
-        for total in [640.0, 420.0, 360.0, 300.0, 240.0, 180.0, 120.0] {
-            let w = widths(columns, total);
-            for (column, min) in [
-                (1, MIN_MODIFIED_WIDTH),
-                (2, MIN_SIZE_WIDTH),
-                (3, MIN_OWNER_WIDTH),
-            ] {
-                assert!(
-                    w[column] == 0.0 || w[column] >= min - 0.01,
-                    "total {total}: column {column} width {} is below {min}",
-                    w[column]
-                );
-            }
-            // Hidden columns stay hidden as the panel shrinks, and once hidden
-            // their share goes to the name.
-            for column in 1..4 {
-                if !expected_visible[column] {
-                    assert_eq!(w[column], 0.0, "total {total}: column {column}");
-                }
-                if w[column] == 0.0 {
-                    expected_visible[column] = false;
-                }
-            }
-            assert!(w[0] >= NAME_MIN_WIDTH.min(total));
-        }
-    }
-
-    #[test]
-    fn dividers_move_in_fixed_steps() {
-        let total = 600.0;
+    fn dividers_move_in_24_pixel_steps() {
         let mut columns = SftpColumns::default();
-        let before = widths(columns, total);
+        let before = columns.widths();
         // Dragging the Name/Modified divider 23 px right lands on 24 px.
-        columns.drag_divider(total, 1, before[0] + 23.0);
-        let after = widths(columns, total);
+        columns.drag_divider(1, before[0] + 23.0);
+        let after = columns.widths();
         assert!(
-            (after[0] - before[0] - 24.0).abs() < 0.01,
+            (after[0] - before[0] - COLUMN_STEP).abs() < 0.01,
             "name moved by {}",
             after[0] - before[0]
         );
         // Every move is a whole step, never an arbitrary pixel.
-        for offset in [137.0, 251.0, 333.0, 401.0] {
-            let mut probe = columns;
-            let prior = widths(probe, total);
-            probe.drag_divider(total, 1, offset);
-            let moved = (widths(probe, total)[0] - prior[0]) / COLUMN_STEP;
+        for offset in [37.0, 151.0, 233.0, 401.0] {
+            let mut probe = SftpColumns::default();
+            let prior = probe.widths();
+            probe.drag_divider(1, offset);
+            let moved = (probe.widths()[0] - prior[0]) / COLUMN_STEP;
             assert!(
                 (moved - moved.round()).abs() < 0.01,
                 "offset {offset}: moved {moved} steps"
@@ -2981,25 +3366,120 @@ mod tests {
 
     #[test]
     fn dividers_stop_at_the_column_minimum() {
-        let total = 600.0;
         let mut columns = SftpColumns::default();
         // Drag the Name/Modified divider far right: Modified cannot collapse.
-        columns.drag_divider(total, 1, total);
-        let w = widths(columns, total);
+        columns.drag_divider(1, TABLE_WIDTH);
+        let w = columns.widths();
         assert!(w[1] >= MIN_MODIFIED_WIDTH - 0.01, "modified {}", w[1]);
         // And far left: the name keeps a readable width.
-        columns.drag_divider(total, 1, 0.0);
-        let w = widths(columns, total);
+        columns.drag_divider(1, 0.0);
+        let w = columns.widths();
         assert!(w[0] >= NAME_MIN_WIDTH - 0.01, "name {}", w[0]);
+        assert!(w.iter().all(|&width| width > 0.0), "no column is hidden");
     }
 
     #[test]
-    fn hidden_columns_are_not_draggable() {
-        let total = 300.0;
+    fn dragging_never_changes_the_canvas_width() {
         let mut columns = SftpColumns::default();
-        let before = widths(columns, total);
-        // The Owner column is hidden at this width, so its divider is a no-op.
-        columns.drag_divider(total, 3, 120.0);
-        assert_eq!(widths(columns, total), before);
+        for boundary in [1, 2, 3, 1, 2] {
+            columns.drag_divider(boundary, 900.0);
+            let total: f32 = columns.widths().iter().sum();
+            assert!((total - TABLE_WIDTH).abs() < 0.01, "total {total}");
+        }
+        // A boundary outside 1..4 is ignored.
+        let before = columns.widths();
+        columns.drag_divider(0, 100.0);
+        columns.drag_divider(4, 100.0);
+        assert_eq!(columns.widths(), before);
+    }
+
+    fn names(entries: &[RemoteEntry], shown: &[usize]) -> Vec<String> {
+        shown.iter().map(|&i| entries[i].name.clone()).collect()
+    }
+
+    #[test]
+    fn sorting_keeps_folders_first_then_orders_by_key() {
+        let entries = vec![
+            entry("beta.txt", false, 300, "bob", 30),
+            folder("Docs"),
+            entry("Alpha.txt", false, 100, "alice", 10),
+            entry("z.bin", false, 200, "carol", 20),
+        ];
+
+        let ascending = SftpSort::default();
+        let shown = sorted_indices(&entries, false, ascending);
+        assert_eq!(
+            names(&entries, &shown),
+            ["Docs", "Alpha.txt", "beta.txt", "z.bin"]
+        );
+
+        let descending = SftpSort {
+            key: SftpSortKey::Name,
+            ascending: false,
+        };
+        let shown = sorted_indices(&entries, false, descending);
+        // Folders stay on top; only the files reverse.
+        assert_eq!(
+            names(&entries, &shown),
+            ["Docs", "z.bin", "beta.txt", "Alpha.txt"]
+        );
+
+        let by_size = SftpSort {
+            key: SftpSortKey::Size,
+            ascending: false,
+        };
+        let shown = sorted_indices(&entries, false, by_size);
+        assert_eq!(
+            names(&entries, &shown),
+            ["Docs", "beta.txt", "z.bin", "Alpha.txt"]
+        );
+
+        let by_owner = SftpSort {
+            key: SftpSortKey::Owner,
+            ascending: true,
+        };
+        let shown = sorted_indices(&entries, false, by_owner);
+        assert_eq!(
+            names(&entries, &shown),
+            ["Docs", "Alpha.txt", "beta.txt", "z.bin"]
+        );
+
+        let by_age = SftpSort {
+            key: SftpSortKey::Modified,
+            ascending: true,
+        };
+        let shown = sorted_indices(&entries, false, by_age);
+        assert_eq!(
+            names(&entries, &shown),
+            ["Docs", "Alpha.txt", "z.bin", "beta.txt"]
+        );
+    }
+
+    #[test]
+    fn sorting_skips_hidden_files_unless_enabled() {
+        let entries = vec![
+            entry(".bashrc", false, 10, "root", 1),
+            entry("visible.txt", false, 20, "root", 2),
+        ];
+        let sort = SftpSort::default();
+        assert_eq!(
+            names(&entries, &sorted_indices(&entries, false, sort)),
+            ["visible.txt"]
+        );
+        assert_eq!(
+            names(&entries, &sorted_indices(&entries, true, sort)),
+            [".bashrc", "visible.txt"]
+        );
+    }
+
+    #[test]
+    fn sort_click_toggles_direction_then_switches_key() {
+        let mut sort = SftpSort::default();
+        assert_eq!(sort.key, SftpSortKey::Name);
+        assert!(sort.ascending);
+        sort.toggle(SftpSortKey::Name);
+        assert!(sort.key == SftpSortKey::Name && !sort.ascending);
+        sort.toggle(SftpSortKey::Size);
+        assert!(sort.key == SftpSortKey::Size && sort.ascending);
     }
 }

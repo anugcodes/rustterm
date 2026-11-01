@@ -196,10 +196,12 @@ async fn connect_local(display: &Display) -> Result<LocalX11, String> {
         host
     };
     let port = 6000 + display.number as u16;
-    TcpStream::connect((host.as_str(), port))
+let stream = TcpStream::connect((host.as_str(), port))
         .await
-        .map(LocalX11::Tcp)
-        .map_err(|err| format!("could not reach the X server at {host}:{port}: {err}"))
+        .map_err(|err| format!("could not reach the X server at {host}:{port}: {err}"))?;
+    // X11 is chatty; disable Nagle on the local leg too.
+    let _ = stream.set_nodelay(true);
+    Ok(LocalX11::Tcp(stream))
 }
 
 enum LocalX11 {

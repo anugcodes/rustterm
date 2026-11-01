@@ -59,6 +59,24 @@ const EDIT_DEBOUNCE_MS: u64 = 170;
 /// burst from stalling the UI while still allowing tens of MiB/s sustained.
 const MAX_OUTPUT_PER_FRAME: usize = 256 * 1024;
 
+/// Wake egui from a background thread, but coalesce calls that arrive within
+/// ~8 ms so a fast link cannot flood the UI thread with repaint requests.
+fn debounced_wake(ctx: egui::Context) -> Wake {
+    let last = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    std::sync::Arc::new(move || {
+        use std::sync::atomic::Ordering;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let prev = last.load(Ordering::Relaxed);
+        if now.saturating_sub(prev) >= 8 {
+            last.store(now, Ordering::Relaxed);
+            ctx.request_repaint();
+        }
+    })
+}
+
 /// Whether this build includes the optional OS-keyring support.
 const KEYRING_ENABLED: bool = cfg!(feature = "keyring-secrets");
 
@@ -1047,10 +1065,7 @@ impl RustTermApp {
         // The SSH thread wakes egui as soon as output arrives. Without this,
         // remote echo on a high-latency link was only displayed on the next
         // keyboard/mouse event (the previous 8 ms polling tail had long expired).
-        let wake: Wake = {
-            let ctx = ctx.clone();
-            Arc::new(move || ctx.request_repaint())
-        };
+        let wake: Wake = debounced_wake(ctx.clone());
 
         let (tx, rx) = std_mpsc::channel();
         let (prompt_tx, prompt_rx) = std_mpsc::channel();
@@ -1102,10 +1117,7 @@ impl RustTermApp {
         config.x11 = enable_x11 || self.settings.x11;
         let label = session.title.clone();
 
-        let wake: Wake = {
-            let ctx = ctx.clone();
-            Arc::new(move || ctx.request_repaint())
-        };
+        let wake: Wake = debounced_wake(ctx.clone());
         let (tx, rx) = std_mpsc::channel();
         let (_prompt_tx, prompt_rx) = std_mpsc::channel();
         let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
@@ -1415,10 +1427,7 @@ impl RustTermApp {
         let mut budget = MAX_OUTPUT_PER_FRAME;
         // File-save events arrive on a watcher thread; give each panel a way to
         // wake egui instead of relying on a polling timer.
-        let wake: Wake = Arc::new({
-            let ctx = ctx.clone();
-            move || ctx.request_repaint()
-        });
+        let wake: Wake = debounced_wake(ctx.clone());
 
         // Journals from closed tabs are only useful for a short while.
         let now = Instant::now();

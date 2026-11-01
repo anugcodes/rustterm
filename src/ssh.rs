@@ -150,6 +150,14 @@ impl VncTarget {
         format!("{}:{}", self.host, self.port)
     }
 
+    /// The VNC display number (`:1` for port 5901), when the port is in the
+    /// standard range.
+    pub fn display_number(&self) -> Option<u16> {
+        (5900..=5999)
+            .contains(&self.port)
+            .then_some(self.port - 5900)
+    }
+
     /// Parse the editable setting: `host`, `host:port`, or blank.
     pub fn parse(value: &str, default_port: u16) -> Option<Self> {
         let value = value.trim();
@@ -175,6 +183,7 @@ impl VncTarget {
 enum DisplayAction {
     /// Find a VNC listener in the server's shell.
     Probe {
+        auto_create: bool,
         reply: std_mpsc::Sender<Result<Option<VncTarget>, String>>,
     },
     /// Open a local TCP listener tunneled to `host:port`.
@@ -576,12 +585,15 @@ impl SshSession {
         self.x11_requested
     }
 
-    /// Look for a VNC listener on the server.
-    pub fn vnc_probe(&self) -> Option<std_mpsc::Receiver<Result<Option<VncTarget>, String>>> {
+    /// Look for a VNC listener on the server, creating one if requested.
+    pub fn vnc_probe(
+        &self,
+        auto_create: bool,
+    ) -> Option<std_mpsc::Receiver<Result<Option<VncTarget>, String>>> {
         let (reply, rx) = std_mpsc::channel();
         self.display_tx
             .send(DisplayRequest {
-                action: DisplayAction::Probe { reply },
+                action: DisplayAction::Probe { auto_create, reply },
                 wake: self.wake.clone(),
             })
             .ok()?;
@@ -1407,10 +1419,10 @@ async fn run_session(
                 let Some(request) = maybe_display else { break };
                 let DisplayRequest { action, wake: request_wake } = request;
                 match action {
-                    DisplayAction::Probe { reply } => {
+                    DisplayAction::Probe { auto_create, reply } => {
                         let session = Arc::clone(&session);
                         tokio::spawn(async move {
-                            let result = probe_vnc(&session).await;
+                            let result = probe_vnc(&session, auto_create).await;
                             let _ = reply.send(result);
                             if let Some(wake) = request_wake {
                                 wake();
@@ -1484,32 +1496,154 @@ async fn run_session(
     }
 }
 
-/// Look for a VNC listener on the server.
-async fn probe_vnc(session: &Handle<ClientHandler>) -> Result<Option<VncTarget>, String> {
-    let channel = session
-        .channel_open_session()
-        .await
-        .map_err(|err| format!("could not open a probe channel: {err}"))?;
-    // Force /bin/sh: the login shell may be csh and the server may be old.
-    // Both `ss` and `netstat` are tried; `-an` is the last resort for a very
-    // old netstat without `-l`.
+/// Look for a VNC session on the server, in tiers.
+///
+/// 1. `vncserver -list` — the user's own VNC sessions (TigerVNC/TightVNC/
+///    TurboVNC all provide this). If none exists and `auto_create` is set,
+///    `vncserver` creates one.
+/// 2. `ss`/`netstat` — any listener in the 5900-5999 range, for servers that
+///    run VNC without the `vncserver` wrapper.
+///
+/// Returns `None` when nothing was found; the caller then falls back to the
+/// configured address.
+async fn probe_vnc(
+    session: &Handle<ClientHandler>,
+    auto_create: bool,
+) -> Result<Option<VncTarget>, String> {
+    let mut first_error: Option<String> = None;
+
+    // Tier 1: the `vncserver` family.
+    if let Some(output) = run_remote_script(session, "vncserver -list 2>/dev/null", 10).await {
+        if let Some(display) = parse_vncserver_list(&output) {
+            return Ok(Some(vnc_target_for_display(display)));
+        }
+        if auto_create {
+            // `vncserver` blocks on a password prompt when ~/.vnc/passwd is
+            // missing, so check for it first.
+            let output = run_remote_script(
+                session,
+                r#"if [ -f "$HOME/.vnc/passwd" ]; then vncserver 2>&1; else echo "__RUSTTERM_NO_PASSWD__"; fi"#,
+                20,
+            )
+            .await
+            .unwrap_or_default();
+            if output.contains("__RUSTTERM_NO_PASSWD__") {
+                first_error = Some(
+                    "no VNC session found and ~/.vnc/passwd is missing — run `vncpasswd` on the server first"
+                        .to_string(),
+                );
+            } else if let Some(display) = parse_vncserver_create(&output) {
+                return Ok(Some(vnc_target_for_display(display)));
+            } else {
+                log::debug!("could not parse vncserver output: {}", output.trim());
+            }
+        }
+    }
+
+    // Tier 2: any listening VNC port.
+    if let Some(output) = run_remote_script(
+        session,
+        "ss -ltn 2>/dev/null || netstat -ltn 2>/dev/null || netstat -an 2>/dev/null",
+        10,
+    )
+    .await
+    {
+        if let Some(target) = parse_vnc_listener(&output) {
+            return Ok(Some(target));
+        }
+    }
+
+    match first_error {
+        Some(err) => Err(err),
+        None => Ok(None),
+    }
+}
+
+/// Run a shell snippet on the server and return its output.
+///
+/// The snippet is executed through `/bin/sh` so it works when the login shell
+/// is csh and on very old systems. A timeout is not fatal: whatever arrived is
+/// returned so the caller can still parse it.
+async fn run_remote_script(
+    session: &Handle<ClientHandler>,
+    script: &str,
+    timeout_secs: u64,
+) -> Option<String> {
+    let channel = session.channel_open_session().await.ok()?;
     channel
-        .exec(
-            true,
-            "/bin/sh -c 'ss -ltn 2>/dev/null || netstat -ltn 2>/dev/null || netstat -an 2>/dev/null'",
-        )
+        .exec(true, format!("/bin/sh -c '{script}'"))
         .await
-        .map_err(|err| format!("could not run the VNC probe: {err}"))?;
+        .ok()?;
     let mut stream = channel.into_stream();
     let mut output = Vec::new();
-    let read = tokio::time::timeout(Duration::from_secs(8), stream.read_to_end(&mut output)).await;
-    match read {
-        Ok(Ok(_)) => {}
-        Ok(Err(err)) => return Err(format!("VNC probe failed: {err}")),
-        // A slow or silent server is not fatal: parse what arrived.
-        Err(_) => {}
+    // A timeout or a read error is not fatal: whatever arrived is returned so
+    // the caller can still parse it.
+    let _ = tokio::time::timeout(
+        Duration::from_secs(timeout_secs),
+        stream.read_to_end(&mut output),
+    )
+    .await;
+    Some(String::from_utf8_lossy(&output).into_owned())
+}
+
+/// The target for a VNC display number (`:1` is port 5901 on the server).
+fn vnc_target_for_display(display: u16) -> VncTarget {
+    VncTarget {
+        host: "127.0.0.1".to_string(),
+        port: 5900 + display,
     }
-    Ok(parse_vnc_listener(&String::from_utf8_lossy(&output)))
+}
+
+/// Parse `vncserver -list` output and return the lowest display number.
+///
+/// TigerVNC prints a table whose first column is the display; TightVNC and
+/// TurboVNC use the same shape.
+fn parse_vncserver_list(text: &str) -> Option<u16> {
+    let mut best: Option<u16> = None;
+    for line in text.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix(':') else {
+            continue;
+        };
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        let Ok(display) = digits.parse::<u16>() else {
+            continue;
+        };
+        if display == 0 || display > 99 {
+            continue;
+        }
+        best = Some(match best {
+            Some(current) if current <= display => current,
+            _ => display,
+        });
+    }
+    best
+}
+
+/// Parse the output of a `vncserver` start and return the new display number.
+///
+/// TigerVNC prints `New 'host:1 (user)' desktop is host:1.`
+fn parse_vncserver_create(text: &str) -> Option<u16> {
+    for line in text.lines() {
+        let Some(index) = line.find("desktop is ") else {
+            continue;
+        };
+        let rest = &line[index + "desktop is ".len()..];
+        // `host:1` or `host:1 (user)` — the display number follows the colon.
+        let Some(colon) = rest.rfind(':') else {
+            continue;
+        };
+        let digits: String = rest[colon + 1..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        if let Ok(display) = digits.parse::<u16>() {
+            if display > 0 && display <= 99 {
+                return Some(display);
+            }
+        }
+    }
+    None
 }
 
 /// Find a listening VNC port (5900-5999) in `ss`/`netstat` output.
@@ -3577,6 +3711,64 @@ short:x:1
         let _ = std::fs::remove_dir_all(&dir);
         assert!(status.success(), "{csh} rejected the hook snippet");
         assert!(one_line.success(), "{csh} rejected the session hook");
+    }
+
+    #[test]
+    fn parses_vncserver_list_output() {
+        // TigerVNC
+        let tiger = "\
+TigerVNC server sessions:
+
+X DISPLAY #     PROCESS ID
+:1              12345
+:2              12346
+";
+        assert_eq!(parse_vncserver_list(tiger), Some(1));
+
+        // TightVNC / TurboVNC print the same table shape.
+        let turbo = "\
+     DISPLAY #    PID
+    :3         22222
+";
+        assert_eq!(parse_vncserver_list(turbo), Some(3));
+
+        // No sessions.
+        assert_eq!(parse_vncserver_list(""), None);
+        assert_eq!(
+            parse_vncserver_list("TigerVNC server sessions:\n\nX DISPLAY #     PROCESS ID\n"),
+            None
+        );
+        // A header line that merely contains a colon is not a display.
+        assert_eq!(
+            parse_vncserver_list("Creating VNC server for user@host:\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn parses_vncserver_create_output() {
+        let tiger = "New 'host:1 (user)' desktop is host:1.\n\
+                      Log file is /home/user/.vnc/host:1.log\n";
+        assert_eq!(parse_vncserver_create(tiger), Some(1));
+
+        let tight = "Desktop 'host:12' started on port 5912\n";
+        assert_eq!(parse_vncserver_create(tight), None);
+
+        assert_eq!(parse_vncserver_create("command not found\n"), None);
+    }
+
+    #[test]
+    fn vnc_display_number_follows_the_port() {
+        let target = VncTarget {
+            host: "127.0.0.1".into(),
+            port: 5901,
+        };
+        assert_eq!(target.display_number(), Some(1));
+        let custom = VncTarget {
+            host: "10.0.0.1".into(),
+            port: 6000,
+        };
+        assert_eq!(custom.display_number(), None);
     }
 
     #[test]

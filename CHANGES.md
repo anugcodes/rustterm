@@ -1111,3 +1111,62 @@ and `handoff.md` (F26 closed).
   forms.
 - GUI / live-server checks: `USAGE.md` §19 and `TESTING.md` §2.10 (G1–G11).
   Not yet run.
+
+# Step: Robust VNC auto-detection, display number and quick launch
+
+## Why
+
+The first VNC implementation only scanned `ss`/`netstat` output for a port in
+5900–5999. On the user's server a `vncserver` service was available, but the
+scan could pick a stale listener belonging to another user, and when no session
+existed at all the app silently tunneled to a guessed address — the viewer then
+prompted for a VNC password that was never going to match the SSH one. The
+`vnc-panther` shell function showed the right approach: ask `vncserver` for the
+account's own sessions, create one if needed, and derive the port from the
+display number.
+
+## What changed
+
+**`src/ssh.rs`.**
+- `probe_vnc` now works in tiers: `vncserver -list` (the account's own
+  sessions) → `vncserver` to create one (only when *Create a VNC session if
+  none exists* is on) → `ss`/`netstat` for any listener in 5900–5999 → the
+  editable address. Every command runs through `/bin/sh` and has its own
+  timeout, so a csh login shell and a slow server are both fine.
+- Before creating a session, `~/.vnc/passwd` is checked. If it is missing the
+  probe reports "run `vncpasswd` on the server first" instead of blocking on
+  `vncserver`'s password prompt.
+- New parsers `parse_vncserver_list` (lowest display in a TigerVNC/TightVNC/
+  TurboVNC table) and `parse_vncserver_create` (the display in "desktop is
+  host:N"). Both are unit-tested.
+- `VncTarget::display_number()` maps a port back to `:N` (5901 → `:1`).
+- `DisplayAction::Probe` carries the auto-create flag.
+
+**`src/app.rs`.**
+- The bottom bar shows both ends of the tunnel: `VNC :1 → 127.0.0.1:37941`.
+  `:1` is the remote display, `37941` the local listener the viewer uses.
+- **Run on :N** types `DISPLAY=:N ` into the shell so a GUI program opens on
+  the VNC desktop. It is disabled while an alternate screen (vim, htop) is up,
+  because the text would go to that program instead of the shell.
+- When the viewer process exits, the tunnel is closed and the bar cleared
+  ("Viewer closed — VNC tunnel stopped").
+- A probe error (for example a missing `~/.vnc/passwd`) is now reported and no
+  tunnel is opened; previously it silently fell back to the configured address.
+- Settings gained **Create a VNC session if none exists** (on by default).
+
+**`src/settings.rs`.** New `vnc_auto_create` field, default `true`, loaded and
+saved with per-field fallback like the other options.
+
+**`src/terminal.rs`.** `TerminalView::is_alt_screen()` so the app can tell a
+shell prompt from a full-screen program.
+
+## Verified
+
+- `cargo build` ✅
+- `cargo clippy --all-targets -- -D warnings` ✅
+- `cargo test` ✅ **110 passed** (default and `--no-default-features`)
+- `cargo fmt --check` ✅
+- New unit tests: `vncserver -list` parsing, `vncserver` create parsing,
+  display-number mapping, settings round trip and old-file defaults.
+- GUI / live-server checks: `USAGE.md` §19 and `TESTING.md` §2.10 (G1–G16).
+  Not yet run.

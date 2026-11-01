@@ -309,11 +309,12 @@ Use a scratch directory so nothing real is touched.
       X11 is enabled but not active for the session.
 - [ ] **G6 — X11 after connect.** Enable X11 without reconnecting, click
       **Display** → the bar says the session must be reconnected.
-- [ ] **G7 — VNC detection.** Run a VNC server on `:0` on the SSH host, enable
-      VNC, click **Display** → a viewer opens against `127.0.0.1:<local port>`
-      and that address is shown.
-- [ ] **G8 — VNC fallback.** With no VNC listener (or an old server without
-      `ss`/`netstat`), the editable **VNC server** address is used instead.
+- [ ] **G7 — VNC detection.** Start `vncserver :1` on the SSH host, enable VNC,
+      click **Display** → the bar shows `VNC :1 → 127.0.0.1:<local port>` and a
+      viewer opens against the local port.
+- [ ] **G8 — VNC fallback.** With no VNC session and no listener (or an old
+      server without `ss`/`netstat`), the editable **VNC server** address is
+      used instead.
 - [ ] **G9 — no viewer.** Hide the viewers from `PATH`, click **Display** → the
       bar shows the copyable tunnel address; **Copy** copies it. With X11
       active, the message says X11 is available.
@@ -322,6 +323,19 @@ Use a scratch directory so nothing real is touched.
       matching path and fall back when it is unavailable.
 - [ ] **G11 — Stop.** **Stop** closes the viewer and the tunnel; the local port
       no longer listens.
+- [ ] **G12 — auto-create.** With no VNC session, click **Display** → a new
+      display is created on the server and the bar shows its number. Clicking
+      **Display** again reuses the same display (no second session).
+- [ ] **G13 — auto-create off.** Untick *Create a VNC session if none exists*;
+      with no session, click **Display** → no session is created and the
+      editable address is used.
+- [ ] **G14 — missing vncpasswd.** Remove `~/.vnc/passwd` on the server, click
+      **Display** → the bar says to run `vncpasswd`; nothing hangs.
+- [ ] **G15 — Run on :N.** Click **Run on :1** → `DISPLAY=:1 ` is typed at the
+      prompt; type `xclock` and press Enter → the window opens in the VNC
+      viewer. The button is disabled while a full-screen program is running.
+- [ ] **G16 — viewer exit.** Close the viewer window → the tunnel stops by
+      itself and the bar clears.
 
 ### 2.11 New Session page details
 
@@ -446,7 +460,7 @@ Resize:           R1–R4:  __ / 4
 SFTP:             F1–F17: __ / 17
 Appearance:       A1–A3:  __ / 3
 Title/bell:       B1–B2:  __ / 2
-Settings/display: G1–G11: __ / 11
+Settings/display: G1–G16: __ / 16
 New Session:      N1–N3:  __ / 3
 Failures:         (IDs + one line each)
 Artifacts:        target/manual/run-*.log, screenshots

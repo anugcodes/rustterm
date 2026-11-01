@@ -76,6 +76,8 @@ pub struct Settings {
     pub x11: bool,
     /// Offer the VNC-over-SSH tunnel (off by default).
     pub vnc: bool,
+    /// Create a VNC session with `vncserver` if none exists (default on).
+    pub vnc_auto_create: bool,
     /// What to do when both remote-display options are enabled.
     pub display_pref: DisplayPref,
     /// VNC server address used when it cannot be detected in the shell.
@@ -91,6 +93,7 @@ impl Default for Settings {
             sftp_history: false,
             x11: false,
             vnc: false,
+            vnc_auto_create: true,
             display_pref: DisplayPref::default(),
             vnc_host: String::new(),
             vnc_port: DEFAULT_VNC_PORT,
@@ -108,6 +111,8 @@ struct SettingsFile {
     x11: Option<bool>,
     #[serde(default)]
     vnc: Option<bool>,
+    #[serde(default)]
+    vnc_auto_create: Option<bool>,
     #[serde(default)]
     display_pref: Option<String>,
     #[serde(default)]
@@ -142,6 +147,7 @@ impl Settings {
             sftp_history: file.sftp_history.unwrap_or(defaults.sftp_history),
             x11: file.x11.unwrap_or(defaults.x11),
             vnc: file.vnc.unwrap_or(defaults.vnc),
+            vnc_auto_create: file.vnc_auto_create.unwrap_or(defaults.vnc_auto_create),
             display_pref: file
                 .display_pref
                 .as_deref()
@@ -168,6 +174,7 @@ impl Settings {
             sftp_history: Some(self.sftp_history),
             x11: Some(self.x11),
             vnc: Some(self.vnc),
+            vnc_auto_create: Some(self.vnc_auto_create),
             display_pref: Some(self.display_pref.id().to_string()),
             vnc_host: Some(self.vnc_host.clone()),
             vnc_port: Some(self.vnc_port),
@@ -231,6 +238,7 @@ mod tests {
             sftp_history: true,
             x11: true,
             vnc: true,
+            vnc_auto_create: false,
             display_pref: DisplayPref::Vnc,
             vnc_host: "10.0.0.5".into(),
             vnc_port: 5902,
@@ -260,6 +268,7 @@ mod tests {
         assert!(!settings.sftp_history);
         assert!(!settings.x11);
         assert!(!settings.vnc);
+        assert!(settings.vnc_auto_create);
         assert_eq!(settings.display_pref, DisplayPref::Ask);
         assert!(settings.vnc_host.is_empty());
         assert_eq!(settings.vnc_port, DEFAULT_VNC_PORT);

@@ -486,6 +486,12 @@ impl TerminalView {
         self.pending_cwd.take()
     }
 
+    /// Whether the terminal is showing an alternate screen (vim, htop, …).
+    /// Typing into the shell is wrong while one of those is running.
+    pub fn is_alt_screen(&self) -> bool {
+        self.term.mode().contains(TermMode::ALT_SCREEN)
+    }
+
     pub fn resize(&mut self, cols: usize, rows: usize) {
         if cols == self.cols && rows == self.rows {
             return;

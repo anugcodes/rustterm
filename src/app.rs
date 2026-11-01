@@ -1672,6 +1672,17 @@ impl RustTermApp {
                     ui.add(egui::DragValue::new(&mut self.settings.vnc_port).range(1..=65535));
                     theme::muted(ui, theme, "5900 is display :0");
                 });
+                if self.settings.vnc {
+                    ui.checkbox(
+                        &mut self.settings.vnc_auto_create,
+                        "Create a VNC session if none exists",
+                    );
+                    theme::muted(
+                        ui,
+                        theme,
+                        "Runs `vncserver` on the server when no session is found.",
+                    );
+                }
             });
 
         if close {
@@ -3385,11 +3396,58 @@ impl RustTermApp {
                         }
                         if let Some(port) = session.display.tunnel_port {
                             ui.separator();
+                            // Show both ends: the remote display the tunnel
+                            // points at, and the local port a viewer uses.
+                            let remote = match session
+                                .display
+                                .target
+                                .as_ref()
+                                .and_then(|target| target.display_number())
+                            {
+                                Some(display) => format!(":{display}"),
+                                None => session
+                                    .display
+                                    .target
+                                    .as_ref()
+                                    .map(|target| target.label())
+                                    .unwrap_or_default(),
+                            };
                             ui.label(
-                                egui::RichText::new(format!("VNC 127.0.0.1:{port}"))
+                                egui::RichText::new(format!("VNC {remote} → 127.0.0.1:{port}"))
                                     .small()
                                     .color(theme.palette.text),
                             );
+                            // Type `DISPLAY=:N ` into the shell so a GUI program
+                            // opens on the VNC desktop instead of nowhere.
+                            if let Some(display) = session
+                                .display
+                                .target
+                                .as_ref()
+                                .and_then(|target| target.display_number())
+                            {
+                                // Typing is only useful at a shell prompt; while
+                                // an alternate screen (vim, htop) is up the text
+                                // would go to that program instead.
+                                let at_prompt = !session.terminal.is_alt_screen();
+                                if ui
+                                    .add_enabled(
+                                        at_prompt,
+                                        egui::Button::new(format!("Run on :{display}")),
+                                    )
+                                    .on_hover_text(if at_prompt {
+                                        format!("Type \"DISPLAY=:{display} \" into the shell")
+                                    } else {
+                                        "Not available while a full-screen program is running"
+                                            .to_string()
+                                    })
+                                    .clicked()
+                                {
+                                    let prefix = format!("DISPLAY=:{display} ");
+                                    session.ssh.write(prefix.as_bytes().to_vec());
+                                    session.display.message =
+                                        Some(format!("Typed \"{prefix}\" — now type the command"));
+                                }
+                            }
                             if ui
                                 .small_button("Open")
                                 .on_hover_text("Open the viewer again")
@@ -3714,18 +3772,25 @@ impl eframe::App for RustTermApp {
 fn poll_display(session: &mut ActiveSession, settings: &Settings) {
     if let Some(rx) = session.display.probe.take() {
         match rx.try_recv() {
-            Ok(Ok(found)) => {
-                let target = found.unwrap_or_else(|| settings_vnc_target(settings));
+            Ok(Ok(Some(found))) => {
+                session.display.target = Some(found.clone());
+                start_vnc_tunnel(session, found);
+            }
+            Ok(Ok(None)) => {
+                // Nothing was detected on the server: fall back to the
+                // configured address, which is the only way to reach a VNC
+                // server rustterm cannot see (a different host, for example).
+                let target = settings_vnc_target(settings);
+                session.display.message =
+                    Some(format!("No VNC session found — using {}", target.label()));
                 session.display.target = Some(target.clone());
                 start_vnc_tunnel(session, target);
             }
             Ok(Err(err)) => {
-                // Detection failed (an old server without `ss`/`netstat`):
-                // the editable setting still makes VNC work there.
-                let target = settings_vnc_target(settings);
-                session.display.message = Some(format!("{err} — using {}", target.label()));
-                session.display.target = Some(target.clone());
-                start_vnc_tunnel(session, target);
+                // The probe reported a problem it cannot work around (for
+                // example a missing ~/.vnc/passwd). Do not tunnel blindly.
+                session.display.busy = false;
+                session.display.message = Some(err);
             }
             Err(std_mpsc::TryRecvError::Empty) => session.display.probe = Some(rx),
             Err(std_mpsc::TryRecvError::Disconnected) => {
@@ -3761,6 +3826,8 @@ fn poll_display(session: &mut ActiveSession, settings: &Settings) {
         }
     }
 
+    // When the viewer exits, tear the tunnel down too, so nothing is left
+    // listening once the desktop is closed.
     if session
         .display
         .viewer
@@ -3768,6 +3835,10 @@ fn poll_display(session: &mut ActiveSession, settings: &Settings) {
         .is_some_and(|child| child.try_wait().ok().flatten().is_some())
     {
         session.display.viewer = None;
+        let _ = session.ssh.vnc_close();
+        session.display.tunnel_port = None;
+        session.display.target = None;
+        session.display.message = Some("Viewer closed — VNC tunnel stopped".to_string());
     }
 }
 
@@ -3779,10 +3850,10 @@ fn settings_vnc_target(settings: &Settings) -> VncTarget {
 }
 
 /// Start a probe, then tunnel to whatever it finds (or to the setting).
-fn start_vnc(session: &mut ActiveSession) {
+fn start_vnc(session: &mut ActiveSession, settings: &Settings) {
     session.display.busy = true;
     session.display.message = Some("Looking for a VNC server on the SSH host…".to_string());
-    match session.ssh.vnc_probe() {
+    match session.ssh.vnc_probe(settings.vnc_auto_create) {
         Some(rx) => session.display.probe = Some(rx),
         None => {
             session.display.busy = false;
@@ -3839,7 +3910,7 @@ fn apply_display_choice(session: &mut ActiveSession, settings: &Settings, choice
                     Some(err) => format!("X11 unavailable ({err}) — trying VNC"),
                     None => "X11 unavailable — trying VNC".to_string(),
                 });
-                start_vnc(session);
+                start_vnc(session, settings);
             } else {
                 session.display.message = Some(match status.error {
                     Some(err) => err,
@@ -3852,7 +3923,7 @@ fn apply_display_choice(session: &mut ActiveSession, settings: &Settings, choice
             if let Some(port) = session.display.tunnel_port {
                 launch_vnc_viewer(&mut session.display, port);
             } else {
-                start_vnc(session);
+                start_vnc(session, settings);
             }
         }
     }

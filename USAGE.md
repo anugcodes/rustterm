@@ -1028,28 +1028,59 @@ connected without the request, and the bar says so.
 
 ### VNC over SSH
 
-When *VNC over SSH* is on, **Display** probes the server over a second SSH
-channel:
+When *VNC over SSH* is on, **Display** looks for a VNC session on the server,
+in tiers:
 
-```
-ss -ltn || netstat -ltn || netstat -an
-```
+1. **`vncserver -list`** — the sessions belonging to your own account
+   (TigerVNC, TightVNC and TurboVNC all provide this). The lowest display
+   number wins, e.g. `:1` → port 5901.
+2. **Create one** — if no session exists and *Create a VNC session if none
+   exists* is ticked (on by default), `vncserver` is run and the new display
+   is used. The server needs `~/.vnc/passwd`; if it is missing, rustterm says
+   so instead of hanging — run `vncpasswd` on the server once.
+3. **Any listener** — `ss -ltn || netstat -ltn || netstat -an` finds a VNC
+   port in 5900–5999 even without the `vncserver` wrapper. The bind address
+   is kept, with wildcard addresses mapped to `127.0.0.1`.
+4. **The editable address** — if nothing was found, the **VNC server** field
+   is used (`host` or `host:port`; blank means `127.0.0.1:<port>`).
 
-The probe runs through `/bin/sh`, so it works when the login shell is csh and on
-very old systems without `ss`. Any listener on 5900–5999 is used (preferring
-`:0`, i.e. 5900); the bind address is kept, with wildcard addresses mapped to
-`127.0.0.1`. If the probe finds nothing or cannot run, the editable **VNC
-server** address is used (`host` or `host:port`; blank means
-`127.0.0.1:<port>`).
+Every command runs through `/bin/sh`, so it works when the login shell is csh
+and on very old systems.
 
 The tunnel is a local loopback listener whose connections are opened with
-`direct-tcpip` to the server. The bottom bar shows the address
-(`VNC 127.0.0.1:<port>`) with **Copy**, **Open** and **Stop**. The external
-viewer is the first of `vncviewer`, `xtigervncviewer`, `gvncviewer`, or
-`remmina -c`. If none is installed, the tunnel stays up and the bar shows the
-copyable address (and notes that X11 is active when it is), so a viewer on
-another machine can be pointed at it. **Stop** closes the listener, the SSH
-channels and the viewer process; closing the tab does the same.
+`direct-tcpip` to the server. The bottom bar shows **both** ends:
+
+```
+VNC :1 → 127.0.0.1:37941
+```
+
+`:1` is the remote display the tunnel points at; `37941` is the local port a
+viewer connects to (the OS picks it, so it is not necessarily in the 5900
+range). The bar has **Copy** (copies the local address, for a viewer on
+another machine), **Open**, **Stop** and **Run on :1**.
+
+The external viewer is the first of `vncviewer`, `xtigervncviewer`,
+`gvncviewer`, or `remmina -c`. If none is installed, the tunnel stays up and
+the bar shows the copyable address (and notes that X11 is active when it is).
+
+**Run on :N** types `DISPLAY=:N ` into the shell, so the next command you type
+opens on the VNC desktop:
+
+```
+DISPLAY=:1 gvim notes.txt
+```
+
+It is only typed — nothing is launched for you, and you can edit or delete it
+before pressing Enter. It is disabled while a full-screen program (vim,
+htop) is running, because the text would go to that program instead of the
+shell.
+
+**Stop** closes the listener, the SSH channels and the viewer process, and
+clears the bar. Closing the viewer does the same automatically ("Viewer closed
+— VNC tunnel stopped"); closing the tab does too.
+
+The VNC password is **not** your SSH password. The viewer's prompt asks for
+the password set by `vncpasswd` on the server.
 
 **Verify**
 
@@ -1064,18 +1095,31 @@ channels and the viewer process; closing the tab does the same.
       `X11: unavailable` with the server's reason; the terminal still works.
 - [ ] **X11 enabled mid-session**: enable it without reconnecting, click
       **Display** → the bar explains the session must be reconnected.
-- [ ] **VNC detection**: run a VNC server on `:0` on the SSH host, enable VNC,
-      click **Display** → the viewer opens against `127.0.0.1:<local port>` and
-      the bar shows that address.
+- [ ] **VNC detection**: start `vncserver :1` on the SSH host, enable VNC,
+      click **Display** → the bar shows `VNC :1 → 127.0.0.1:<port>` and the
+      viewer opens.
+- [ ] **VNC reuse**: click **Display** twice → the same display is reused; no
+      second session is created.
+- [ ] **VNC auto-create**: with no session running, click **Display** → a new
+      display is created and the bar shows its number.
+- [ ] **VNC auto-create off**: untick *Create a VNC session if none exists*;
+      with no session running, click **Display** → no session is created and
+      the editable address is used.
+- [ ] **Missing vncpasswd**: remove `~/.vnc/passwd` on the server, click
+      **Display** → the bar says to run `vncpasswd`; nothing hangs.
 - [ ] **VNC fallback address**: stop the VNC server (nothing listens) and set
       the editable address to a host that does → the tunnel uses the setting.
 - [ ] **No viewer**: temporarily hide the viewers from `PATH`, click
       **Display** → the bar shows `VNC tunnel ready at 127.0.0.1:<port>`;
       **Copy** copies it; with X11 active the message says so.
+- [ ] **Run on :N**: click **Run on :1** → `DISPLAY=:1 ` appears at the prompt;
+      type `xclock` and press Enter → the window opens in the VNC viewer.
 - [ ] **Both enabled, Ask**: click **Display** → the chooser appears; **X11**
       and **VNC** each do the right thing; **Cancel** closes it.
 - [ ] **Prefer X11 / Prefer VNC**: with both enabled, the matching path starts
       without the chooser, and an unavailable X11 falls back to VNC.
 - [ ] **Stop**: click **Stop** → the viewer closes, `ss -ltn` on the local
       machine no longer shows the port, and the bar forgets the address.
+- [ ] **Viewer exit**: close the viewer window → the tunnel stops by itself and
+      the bar clears.
 

@@ -23,8 +23,8 @@ cargo build --no-default-features
 | D1 | Low | [x] accepted | `ssh.rs:1849,693,1412` | `SftpAction::Reconnect` is used by `SshSession::sftp_reconnect()` and handled specially in `run_session`. | **Accepted:** not dead. |
 | D2 | Low | [x] accepted | `ssh.rs:2045`, `sftp.rs:823` | `SftpAction::fail` exists and is used by the SFTP panel on session-loss paths. The dispatcher also sends errors inline where it needs to transform results. | **Accepted:** keep as-is; not worth forcing everything through the helper. |
 | D3 | Low | [x] accepted | `ssh.rs:3267`, `sftp.rs:2210` | `join_remote_path` is a 9-line mirror of `sftp::join_path`. | **Accepted:** importing the UI-state module from the transport module inverts the layering; moving both into a shared helper is part of the later restructuring. |
-| D4 | Low | [ ] | `ssh.rs:2571` | `fetch_file` (editor download) removes the target on error instead of downloading to `.part` and renaming, so a failed fetch can destroy the user's existing editor copy. | Download to `.part`, rename on success, clean up on error (same as `download_file`). |
-| D5 | Low | [ ] | `ssh.rs:2770`, `ssh.rs:3047` | `.part` temp names are derived only from the target name, so a manual transfer and an editor auto-upload of the same file collide. | Give each transfer a unique suffix. |
+| D4 | Low | [x] | `ssh.rs:2571` | `fetch_file` (editor download) removed the target on error instead of downloading to `.part` and renaming, so a failed fetch could destroy the user's existing editor copy. | Now streams through `download_file_inner` into a unique `.part`, then renames. |
+| D5 | Low | [x] | `ssh.rs:2597+` | `.part` temp names were derived only from the target name, so a manual transfer and an editor auto-upload of the same file collided. | `remote_temp_path`/`local_temp_path` add pid + a monotonic counter. |
 | D6 | Low | [ ] | `main.rs:22` | Font path `assets/JetBrainsMono-Regular.ttf` does not exist in the repo; every start warns and falls back. Relative path also depends on CWD. | Resolve candidate paths, fall back quietly, warn only at debug level. |
 | D7 | Low | [x] accepted | `x11.rs:58` | `X11Config` is used by `X11Shared::config/set_config` and `ssh.rs:1170`. | **Accepted:** not dead. |
 
@@ -35,7 +35,7 @@ cargo build --no-default-features
 | B1 | High | [ ] | `sftp.rs:465,1489` | On a successful `UploadOne`, the journal re-reads the *current* `FileStamp`. A save during the upload is recorded as already uploaded and never retried. | Stamp the exact bytes that were uploaded (`FileStamp` captured at transfer start) and mark that stamp. |
 | B2 | High | [ ] | `app.rs:1180-1197` | Reconnect replaces `session.sftp` with a fresh explorer and drops `EditJournal`; `close_session` preserves it via `detached_edits`, reconnect does not. | Carry the journal across reconnect and re-sync. |
 | B3 | High | [ ] | `ssh.rs:1358`, `app.rs:1429` | Session output uses an unbounded channel; the per-frame drain budget is shared across all tabs, so a flooding background tab grows memory without bound and starves the visible tab. | Per-session byte budget with async backpressure (pause reads at a high-water mark, never drop bytes). |
-| B4 | High | [ ] | `ssh.rs:2834` | If rename fails and the target exists, the target is deleted before the retry. If the retry fails, the original remote file is gone. | Replace atomically (rename over target) or restore the original on failure; never delete first. |
+| B4 | High | [x] | `ssh.rs:2834` | If rename failed and the target existed, the target was deleted before the retry. If the retry failed, the original remote file was gone. | `replace_remote_file` moves the old file aside and restores it on failure; never deletes first. |
 | B5 | Med | [ ] | `app.rs:3784` | The VNC tunnel is torn down when the spawned viewer exits. Viewers that daemonise or hand off to an already-running instance (`remmina -c`) exit immediately, killing the tunnel. | Stop only when the viewer is gone *and* no client is connected, after a grace period. |
 | B6 | Med | [ ] | `sftp.rs:1383` | `cancel_transfer` cancels the running transfer but leaves the queue; after the cancel error, `poll_transfer` starts the next queued item. The docstring and the button both imply cancel-all. | Cancel the running transfer and clear the queue. |
 | B7 | Low | [ ] | `x11.rs:151+` | `local_auth` runs `xauth` through blocking `std::process::Command` on an async task; `encode_hex` allocates with `format!` per byte. | Run the command via `spawn_blocking`; write hex into one pre-sized `String`. |
@@ -47,7 +47,7 @@ cargo build --no-default-features
 | ID | Sev | Status | Location | Issue | Fix |
 |----|-----|--------|----------|-------|-----|
 | P1 | Med | [ ] | `app.rs:683` | `sorted_indices` runs every frame and its name/owner comparators call `to_lowercase()` twice per comparison: O(n log n) allocations per frame. | Precompute lowercase sort keys once per listing change. |
-| P2 | Med | [ ] | `ssh.rs:3057+` | `copy_file`/`fetch_file` use `tokio::io::copy` (~8 KiB) while `TRANSFER_CHUNK` is 64 KiB. | Use 64 KiB buffers on all transfer paths. |
+| P2 | Med | [x] | `ssh.rs:3057+` | `copy_file`/`fetch_file` used `tokio::io::copy` (~8 KiB) while `TRANSFER_CHUNK` is 64 KiB. | Both paths now stream in 64 KiB chunks. |
 | P3 | Med | accepted | `terminal.rs:807` | The renderer rebuilds a `LayoutJob` for every visible row every frame. | **Not fixed here:** needs a profile first; a dirty-region cache is a large, risky change. Deferred to the restructuring roadmap. |
 | P4 | Low | accepted | `app.rs`, `sftp.rs`, `ssh.rs` | 150+ `.clone()` calls. | **Not fixed here:** most are required by ownership; auditing without a profile would be speculative. Deferred. |
 

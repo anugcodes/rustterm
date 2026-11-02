@@ -2553,7 +2553,18 @@ async fn copy_file(client: &SftpClient, from: &str, to: &str) -> Result<(), Stri
         .await
         .map_err(|err| format!("could not create '{to}': {err}"))?;
 
-    let copied = tokio::io::copy(&mut source, &mut destination).await;
+    let mut buffer = vec![0u8; TRANSFER_CHUNK];
+    let copied = loop {
+        match source.read(&mut buffer).await {
+            Ok(0) => break Ok(()),
+            Ok(read) => {
+                if let Err(err) = destination.write_all(&buffer[..read]).await {
+                    break Err(err);
+                }
+            }
+            Err(err) => break Err(err),
+        }
+    };
     let flushed = destination.flush().await;
     let closed_source = source.close().await;
     let closed_destination = destination.close().await;
@@ -2569,32 +2580,46 @@ async fn copy_file(client: &SftpClient, from: &str, to: &str) -> Result<(), Stri
 }
 
 async fn fetch_file(client: &SftpClient, remote: &str, local: &Path) -> Result<String, String> {
-    let mut source = client
-        .session
-        .open(remote)
-        .await
-        .map_err(|err| format!("could not open '{remote}' for reading: {err}"))?;
-    let mut destination = tokio::fs::File::create(local)
-        .await
-        .map_err(|err| format!("could not create '{}': {err}", local.display()))?;
-
-    let copied = tokio::io::copy(&mut source, &mut destination).await;
-    let flushed = destination.flush().await;
-    let closed_source = source.close().await;
-    drop(destination);
-
-    if let Err(err) = copied {
-        let _ = tokio::fs::remove_file(local).await;
-        return Err(format!("could not download '{remote}': {err}"));
+    // Reuse the chunked downloader so the editor path gets the same 64 KiB
+    // streaming, temp-file cleanup and atomic rename as a panel download.
+    let progress = TransferProgress::new(remote);
+    let part = local_temp_path(local);
+    if let Err(err) = download_file_inner(client, remote, local, &part, &progress).await {
+        let _ = tokio::fs::remove_file(&part).await;
+        return Err(err);
     }
-    flushed.map_err(|err| format!("could not finish writing '{}': {err}", local.display()))?;
-    closed_source.map_err(|err| format!("could not close '{remote}': {err}"))?;
     Ok(local.display().to_string())
 }
 
 /// Chunk size for streamed transfers. 64 KiB matches the SFTP read/write
 /// pipeline well without making cancellation feel unresponsive.
 const TRANSFER_CHUNK: usize = 64 * 1024;
+
+/// Distinguishes concurrent transfers aimed at the same target. Without it a
+/// manual transfer and an editor auto-upload share one `.part` path and
+/// overwrite each other mid-flight.
+static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Temp sibling for a remote target. It lives in the same directory so the
+/// final `rename` never crosses a filesystem boundary.
+fn remote_temp_path(target: &str) -> String {
+    format!(
+        "{target}.rustterm-{}-{}.part",
+        std::process::id(),
+        TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Temp sibling for a local download target.
+fn local_temp_path(target: &Path) -> PathBuf {
+    let mut name = target.as_os_str().to_os_string();
+    name.push(format!(
+        ".rustterm-{}-{}.part",
+        std::process::id(),
+        TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    PathBuf::from(name)
+}
 
 /// Message used when the SSH transport disappeared mid-transfer, instead of
 /// leaking library strings such as `sender dropped` into the status bar.
@@ -2767,12 +2792,50 @@ async fn upload_file(
     remote: &str,
     progress: &TransferProgress,
 ) -> Result<(), String> {
-    let part = format!("{remote}.part");
+    let part = remote_temp_path(remote);
     let result = upload_file_inner(client, local, remote, &part, progress).await;
     if result.is_err() {
         let _ = client.session.remove_file(&part).await;
     }
     result
+}
+
+/// Move `part` onto `target` without ever leaving `target` missing.
+///
+/// OpenSSH's `rename` replaces an existing file, but not every server allows
+/// that. In that case the old file is moved aside first and restored if the
+/// new one cannot be put in place — the previous version is never deleted
+/// before the replacement is known to have succeeded.
+async fn replace_remote_file(client: &SftpClient, part: &str, target: &str) -> Result<(), String> {
+    if let Err(first) = client.session.rename(part, target).await {
+        if !client.session.try_exists(target).await.unwrap_or(false) {
+            return Err(format!("could not finalise '{target}': {first}"));
+        }
+    } else {
+        return Ok(());
+    }
+
+    let backup = remote_temp_path(target);
+    client
+        .session
+        .rename(target, &backup)
+        .await
+        .map_err(|err| format!("could not move the existing '{target}' aside: {err}"))?;
+    match client.session.rename(part, target).await {
+        Ok(()) => {
+            let _ = client.session.remove_file(&backup).await;
+            Ok(())
+        }
+        Err(err) => {
+            if client.session.rename(&backup, target).await.is_ok() {
+                Err(format!("could not finalise '{target}': {err}"))
+            } else {
+                Err(format!(
+                    "could not finalise '{target}': {err} (the previous file is kept at '{backup}')"
+                ))
+            }
+        }
+    }
 }
 
 async fn upload_file_inner(
@@ -2829,20 +2892,10 @@ async fn upload_file_inner(
     }
     closed.map_err(|err| format!("could not close '{part}': {err}"))?;
 
-    // OpenSSH's rename overwrites, but not every server does. Retry once after
-    // removing the target so an overwrite never silently fails.
-    if let Err(err) = client.session.rename(part, remote).await {
-        if client.session.try_exists(remote).await.unwrap_or(false) {
-            let _ = client.session.remove_file(remote).await;
-            client
-                .session
-                .rename(part, remote)
-                .await
-                .map_err(|err| format!("could not finalise '{remote}': {err}"))?;
-        } else {
-            return Err(format!("could not finalise '{remote}': {err}"));
-        }
-    }
+    // OpenSSH's rename replaces, but not every server does. `replace_remote_file`
+    // moves the old file aside instead of deleting it, so a failed retry can
+    // never leave the destination empty.
+    replace_remote_file(client, part, remote).await?;
     Ok(())
 }
 
@@ -3044,9 +3097,7 @@ async fn download_file(
     local: &Path,
     progress: &TransferProgress,
 ) -> Result<(), String> {
-    let mut part_os = local.as_os_str().to_os_string();
-    part_os.push(".part");
-    let part = PathBuf::from(part_os);
+    let part = local_temp_path(local);
     let result = download_file_inner(client, remote, local, &part, progress).await;
     if result.is_err() {
         let _ = tokio::fs::remove_file(&part).await;
@@ -3524,6 +3575,22 @@ bob:x:1001:1001::/home/bob:/bin/sh
         assert_eq!(remote_file_name("/home/alice/"), "alice");
         assert_eq!(remote_file_name("report.txt"), "report.txt");
         assert_eq!(remote_file_name("/"), "/");
+    }
+
+    #[test]
+    fn temp_paths_are_unique_siblings() {
+        let remote_a = remote_temp_path("/home/alice/notes.txt");
+        let remote_b = remote_temp_path("/home/alice/notes.txt");
+        assert_ne!(remote_a, remote_b);
+        assert!(remote_a.starts_with("/home/alice/notes.txt."));
+        assert!(remote_a.ends_with(".part"));
+
+        let local_a = local_temp_path(Path::new("/tmp/notes.txt"));
+        let local_b = local_temp_path(Path::new("/tmp/notes.txt"));
+        assert_ne!(local_a, local_b);
+        assert_eq!(local_a.parent(), Some(Path::new("/tmp")));
+        assert!(local_a.to_string_lossy().starts_with("/tmp/notes.txt."));
+        assert!(local_a.to_string_lossy().ends_with(".part"));
     }
 
     #[test]

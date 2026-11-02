@@ -25,7 +25,7 @@ cargo build --no-default-features
 | D3 | Low | [x] accepted | `ssh.rs:3267`, `sftp.rs:2210` | `join_remote_path` is a 9-line mirror of `sftp::join_path`. | **Accepted:** importing the UI-state module from the transport module inverts the layering; moving both into a shared helper is part of the later restructuring. |
 | D4 | Low | [x] | `ssh.rs:2571` | `fetch_file` (editor download) removed the target on error instead of downloading to `.part` and renaming, so a failed fetch could destroy the user's existing editor copy. | Now streams through `download_file_inner` into a unique `.part`, then renames. |
 | D5 | Low | [x] | `ssh.rs:2597+` | `.part` temp names were derived only from the target name, so a manual transfer and an editor auto-upload of the same file collided. | `remote_temp_path`/`local_temp_path` add pid + a monotonic counter. |
-| D6 | Low | [ ] | `main.rs:22` | Font path `assets/JetBrainsMono-Regular.ttf` does not exist in the repo; every start warns and falls back. Relative path also depends on CWD. | Resolve candidate paths, fall back quietly, warn only at debug level. |
+| D6 | Low | [x] | `main.rs:19` | Font path `assets/JetBrainsMono-Regular.ttf` does not exist in the repo; every start warned and fell back, and the relative path depended on CWD. | Tries the CWD and executable-directory copies; a missing font is logged at debug level only. |
 | D7 | Low | [x] accepted | `x11.rs:58` | `X11Config` is used by `X11Shared::config/set_config` and `ssh.rs:1170`. | **Accepted:** not dead. |
 
 ## B. Correctness and security

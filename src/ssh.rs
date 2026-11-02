@@ -20,7 +20,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
@@ -39,10 +39,16 @@ use russh::{compression, Channel, ChannelMsg};
 use russh_sftp::client::{Config as SftpConfig, SftpSession};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot, OnceCell};
+use tokio::sync::{mpsc, oneshot, Notify, OnceCell};
 
 /// Wakes the egui thread when asynchronous SSH data arrives.
 pub type Wake = Arc<dyn Fn() + Send + Sync>;
+
+/// Bytes the UI may have queued before the session thread stops reading the
+/// SSH channel. This is the terminal's only backpressure: without it a hidden
+/// tab running `yes` grows the process without bound and starves the visible
+/// tab of its per-frame drain budget.
+const OUTPUT_HIGH_WATER: usize = 2 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct SshConfig {
@@ -105,6 +111,12 @@ pub struct SshSession {
     resize_tx: mpsc::UnboundedSender<(u16, u16)>,
     disconnect_tx: mpsc::UnboundedSender<()>,
     output_rx: std_mpsc::Receiver<Vec<u8>>,
+    /// Bytes queued for the UI but not yet read. The session thread stops
+    /// reading the SSH channel while this is above [`OUTPUT_HIGH_WATER`], which
+    /// is what bounds memory when a hidden tab floods output.
+    output_backlog: Arc<AtomicUsize>,
+    /// Signalled by the UI after it drains output, so a gated session resumes.
+    output_space: Arc<Notify>,
     /// Requests for the SFTP subsystem. Always present, even when SFTP failed
     /// to open, so callers can still get a meaningful error.
     sftp_tx: mpsc::UnboundedSender<SftpRequest>,
@@ -538,12 +550,17 @@ impl SshSession {
         let (resize_tx, resize_rx) = mpsc::unbounded_channel::<(u16, u16)>();
         let (disconnect_tx, disconnect_rx) = mpsc::unbounded_channel::<()>();
         let (output_tx, output_rx) = std_mpsc::channel::<Vec<u8>>();
+        let output_backlog = Arc::new(AtomicUsize::new(0));
+        let output_space = Arc::new(Notify::new());
         let (sftp_tx, sftp_rx) = mpsc::unbounded_channel::<SftpRequest>();
         let (display_tx, display_rx) = mpsc::unbounded_channel::<DisplayRequest>();
         let session_wake = wake.clone();
         let alive = Arc::new(AtomicBool::new(true));
         let alive_thread = Arc::clone(&alive);
         let guard_wake = session_wake.clone();
+        // The loop needs its own handles; the originals stay with `SshSession`.
+        let thread_backlog = Arc::clone(&output_backlog);
+        let thread_space = Arc::clone(&output_space);
 
         std::thread::Builder::new()
             .name(format!("ssh-{}@{}", config.user, config.host))
@@ -563,6 +580,8 @@ impl SshSession {
                         sftp_rx,
                         display_rx,
                         output_tx,
+                        output_backlog: thread_backlog,
+                        output_space: thread_space,
                     },
                     wake,
                 ));
@@ -574,6 +593,8 @@ impl SshSession {
             resize_tx,
             disconnect_tx,
             output_rx,
+            output_backlog,
+            output_space,
             sftp_tx,
             display_tx,
             sftp_unavailable: sftp_error,
@@ -952,8 +973,21 @@ impl SshSession {
     }
 
     /// Drain one pending output chunk, if any.
+    ///
+    /// Reading a chunk releases that much of the session's backlog and wakes
+    /// the session thread if it had been gated by the high-water mark.
     pub fn try_read(&self) -> Option<Vec<u8>> {
-        self.output_rx.try_recv().ok()
+        let chunk = self.output_rx.try_recv().ok()?;
+        // The sender adds each chunk before queueing it, so this cannot
+        // underflow; the debug assertion catches an accounting mistake early.
+        let before = self
+            .output_backlog
+            .fetch_sub(chunk.len(), Ordering::Relaxed);
+        debug_assert!(before >= chunk.len(), "output backlog accounting underflow");
+        if before >= OUTPUT_HIGH_WATER {
+            self.output_space.notify_one();
+        }
+        Some(chunk)
     }
 
     /// Clone of the PTY input sender, for components that need to write bytes
@@ -1356,6 +1390,8 @@ struct SessionIo {
     sftp_rx: mpsc::UnboundedReceiver<SftpRequest>,
     display_rx: mpsc::UnboundedReceiver<DisplayRequest>,
     output_tx: std_mpsc::Sender<Vec<u8>>,
+    output_backlog: Arc<AtomicUsize>,
+    output_space: Arc<Notify>,
 }
 
 async fn run_session(
@@ -1372,6 +1408,8 @@ async fn run_session(
         mut sftp_rx,
         mut display_rx,
         output_tx,
+        output_backlog,
+        output_space,
     } = io;
     // The client is behind a lock so a reconnect can swap in a fresh SFTP
     // channel while the terminal loop keeps running. Locks are only held long
@@ -1481,9 +1519,13 @@ async fn run_session(
                     }
                 }
             }
-            msg = channel.wait() => {
+            // Stop reading the SSH channel while the UI is behind. The remote
+            // sees a full window and pauses, which bounds memory without
+            // dropping a single byte.
+            msg = channel.wait(), if output_backlog.load(Ordering::Relaxed) < OUTPUT_HIGH_WATER => {
                 match msg {
                     Some(ChannelMsg::Data { data }) => {
+                        output_backlog.fetch_add(data.len(), Ordering::Relaxed);
                         if output_tx.send(data.to_vec()).is_err() {
                             break;
                         }
@@ -1492,6 +1534,7 @@ async fn run_session(
                         }
                     }
                     Some(ChannelMsg::ExtendedData { data, .. }) => {
+                        output_backlog.fetch_add(data.len(), Ordering::Relaxed);
                         if output_tx.send(data.to_vec()).is_err() {
                             break;
                         }
@@ -1503,6 +1546,8 @@ async fn run_session(
                     _ => {}
                 }
             }
+            // The UI freed space; loop around so the gate above reopens.
+            _ = output_space.notified() => {}
         }
     }
 

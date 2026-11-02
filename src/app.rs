@@ -1427,13 +1427,15 @@ impl RustTermApp {
     /// make switching tabs dump a large backlog all at once. Titles/bells also
     /// arrive for background tabs, so process them here.
     ///
-    /// At most [`MAX_OUTPUT_PER_FRAME`] bytes are decoded per frame. A huge
-    /// burst (`cat` of a large file) would otherwise block painting for
-    /// hundreds of milliseconds; the remainder is picked up on the next frame
-    /// and a repaint is requested so it is not left waiting for a wake-up.
+    /// At most [`MAX_OUTPUT_PER_FRAME`] bytes are decoded per session per
+    /// frame, starting with the visible tab. A huge burst (`cat` of a large
+    /// file) would otherwise block painting for hundreds of milliseconds; the
+    /// remainder is picked up on the next frame and a repaint is requested so
+    /// it is not left waiting for a wake-up. Draining the visible tab first
+    /// means a flooding background tab cannot starve it.
     fn pump_sessions(&mut self, ctx: &egui::Context) -> bool {
         let mut activity = false;
-        let mut budget = MAX_OUTPUT_PER_FRAME;
+        let mut exhausted = false;
         // File-save events arrive on a watcher thread; give each panel a way to
         // wake egui instead of relying on a polling timer.
         let wake: Wake = debounced_wake(ctx.clone());
@@ -1452,7 +1454,15 @@ impl RustTermApp {
             ctx.request_repaint_after(Duration::from_secs(60));
         }
 
-        for session in &mut self.sessions {
+        let count = self.sessions.len();
+        let first = self.active.checked_sub(1).filter(|index| *index < count);
+        for offset in 0..count {
+            let index = match first {
+                Some(first) => (first + offset) % count,
+                None => offset,
+            };
+            let session = &mut self.sessions[index];
+            let mut budget = MAX_OUTPUT_PER_FRAME;
             // A dead thread used to be invisible: reads returned `None`, input
             // vanished and the tab looked alive forever. Detect it once here.
             if !session.connection_lost && !session.ssh.is_alive() {
@@ -1490,6 +1500,9 @@ impl RustTermApp {
                 session.terminal.feed(&chunk);
                 activity = true;
             }
+            if budget == 0 {
+                exhausted = true;
+            }
             // The shell reports its directory through OSC 7; following is
             // decided in the explorer, which also ignores it while paused.
             if let Some(cwd) = session.terminal.take_cwd() {
@@ -1507,7 +1520,7 @@ impl RustTermApp {
             }
         }
 
-        if budget == 0 {
+        if exhausted {
             // Work was left over: keep painting until every queue is empty.
             ctx.request_repaint();
         }

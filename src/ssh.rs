@@ -2924,6 +2924,7 @@ async fn upload_file_inner(
     part: &str,
     progress: &TransferProgress,
 ) -> Result<(), String> {
+    log::trace!("upload_file_inner: {} -> {}", local.display(), remote);
     let mut source = tokio::fs::File::open(local)
         .await
         .map_err(|err| format!("could not open '{}': {err}", local.display()))?;
@@ -3191,6 +3192,7 @@ async fn download_file_inner(
     part: &Path,
     progress: &TransferProgress,
 ) -> Result<(), String> {
+    log::trace!("download_file_inner: {} -> {}", remote, local.display());
     let mut source = client
         .session
         .open(remote)

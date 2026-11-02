@@ -697,6 +697,7 @@ fn cmp_lower(a: &str, b: &str) -> std::cmp::Ordering {
 /// Indices of `entries` in display order: hidden files filtered out, folders
 /// first, then the active sort key.
 fn sorted_indices(entries: &[RemoteEntry], show_hidden: bool, sort: SftpSort) -> Vec<usize> {
+    log::trace!("sorted_indices: {} entries", entries.len());
     let mut indices: Vec<usize> = entries
         .iter()
         .enumerate()

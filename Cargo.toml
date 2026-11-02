@@ -40,8 +40,7 @@ opt-level = 1
 # optimisation than from debug assertions during normal app use.
 opt-level = 2
 
-[profile.release]
-opt-level = 3
-lto = "thin"
-codegen-units = 1
-strip = true
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = false

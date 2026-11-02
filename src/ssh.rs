@@ -1183,7 +1183,14 @@ async fn request_x11_forwarding(channel: &mut Channel<ClientMsg>, shared: &X11Sh
         );
         return;
     };
-    let auth = x11::local_auth(&display);
+    // `xauth` is a blocking subprocess; keep it off the session runtime.
+    let auth = {
+        let display = display.clone();
+        tokio::task::spawn_blocking(move || x11::local_auth(&display))
+            .await
+            .ok()
+            .flatten()
+    };
     let cookie = x11::random_cookie_hex();
     if let Err(err) = channel
         .request_x11(true, false, "MIT-MAGIC-COOKIE-1", cookie, display.screen)

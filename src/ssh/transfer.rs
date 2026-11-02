@@ -1,6 +1,5 @@
 use super::*;
 
-
 /// How a transfer treats a destination that already exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConflictPolicy {
@@ -99,9 +98,12 @@ impl TransferProgress {
     }
 }
 
-
 /// Copy `from` into `dest_dir`, giving the copy a unique name.
-pub(crate) async fn copy_into(client: &SftpClient, from: &str, dest_dir: &str) -> Result<String, String> {
+pub(crate) async fn copy_into(
+    client: &SftpClient,
+    from: &str,
+    dest_dir: &str,
+) -> Result<String, String> {
     let metadata = client
         .session
         .symlink_metadata(from)
@@ -245,7 +247,11 @@ pub(crate) async fn copy_file(client: &SftpClient, from: &str, to: &str) -> Resu
     Ok(())
 }
 
-pub(crate) async fn fetch_file(client: &SftpClient, remote: &str, local: &Path) -> Result<String, String> {
+pub(crate) async fn fetch_file(
+    client: &SftpClient,
+    remote: &str,
+    local: &Path,
+) -> Result<String, String> {
     // Reuse the chunked downloader so the editor path gets the same 64 KiB
     // streaming, temp-file cleanup and atomic rename as a panel download.
     let progress = TransferProgress::new(remote);
@@ -377,7 +383,11 @@ pub(crate) enum LocalKind {
 ///
 /// The pre-walk is what makes a progress bar possible: without it the byte
 /// total is unknown until the transfer ends.
-pub(crate) fn collect_upload(local: &Path, remote: &str, out: &mut Vec<UploadItem>) -> Result<(), String> {
+pub(crate) fn collect_upload(
+    local: &Path,
+    remote: &str,
+    out: &mut Vec<UploadItem>,
+) -> Result<(), String> {
     let metadata = std::fs::symlink_metadata(local)
         .map_err(|err| format!("could not inspect '{}': {err}", local.display()))?;
     let file_type = metadata.file_type();
@@ -439,7 +449,11 @@ pub(crate) async fn ensure_remote_dir(client: &SftpClient, path: &str) -> Result
     }
 }
 
-pub(crate) async fn upload_symlink(client: &SftpClient, target: &Path, remote: &str) -> Result<(), String> {
+pub(crate) async fn upload_symlink(
+    client: &SftpClient,
+    target: &Path,
+    remote: &str,
+) -> Result<(), String> {
     let target = target.to_string_lossy().to_string();
     if client.session.try_exists(remote).await.unwrap_or(false) {
         let _ = client.session.remove_file(remote).await;
@@ -472,7 +486,11 @@ pub(crate) async fn upload_file(
 /// that. In that case the old file is moved aside first and restored if the
 /// new one cannot be put in place — the previous version is never deleted
 /// before the replacement is known to have succeeded.
-pub(crate) async fn replace_remote_file(client: &SftpClient, part: &str, target: &str) -> Result<(), String> {
+pub(crate) async fn replace_remote_file(
+    client: &SftpClient,
+    part: &str,
+    target: &str,
+) -> Result<(), String> {
     if let Err(first) = client.session.rename(part, target).await {
         if !client.session.try_exists(target).await.unwrap_or(false) {
             return Err(format!("could not finalise '{target}': {first}"));
@@ -951,7 +969,11 @@ pub(crate) async fn download_items(
     Ok(format!("{downloaded} file(s) to {}", local_dir.display()))
 }
 
-pub(crate) async fn remove_tree(client: &SftpClient, path: &str, is_dir: bool) -> Result<(), String> {
+pub(crate) async fn remove_tree(
+    client: &SftpClient,
+    path: &str,
+    is_dir: bool,
+) -> Result<(), String> {
     if !is_dir {
         return client
             .session

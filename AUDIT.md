@@ -32,7 +32,7 @@ cargo build --no-default-features
 
 | ID | Sev | Status | Location | Issue | Fix |
 |----|-----|--------|----------|-------|-----|
-| B1 | High | [ ] | `sftp.rs:465,1489` | On a successful `UploadOne`, the journal re-reads the *current* `FileStamp`. A save during the upload is recorded as already uploaded and never retried. | Stamp the exact bytes that were uploaded (`FileStamp` captured at transfer start) and mark that stamp. |
+| B1 | High | [x] | `sftp.rs:174-214,1432,1481` | On a successful `UploadOne`, the journal re-read the *current* `FileStamp`. A save during the upload was recorded as already uploaded and never retried. | `ActiveTransfer` now stores the stamp captured at enqueue; success marks only that version. Regression test added. |
 | B2 | High | [ ] | `app.rs:1180-1197` | Reconnect replaces `session.sftp` with a fresh explorer and drops `EditJournal`; `close_session` preserves it via `detached_edits`, reconnect does not. | Carry the journal across reconnect and re-sync. |
 | B3 | High | [ ] | `ssh.rs:1358`, `app.rs:1429` | Session output uses an unbounded channel; the per-frame drain budget is shared across all tabs, so a flooding background tab grows memory without bound and starves the visible tab. | Per-session byte budget with async backpressure (pause reads at a high-water mark, never drop bytes). |
 | B4 | High | [x] | `ssh.rs:2834` | If rename failed and the target existed, the target was deleted before the retry. If the retry failed, the original remote file was gone. | `replace_remote_file` moves the old file aside and restores it on failure; never deletes first. |

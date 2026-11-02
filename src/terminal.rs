@@ -13,6 +13,15 @@ use tokio::sync::mpsc;
 const DEFAULT_BG: Color32 = Color32::from_rgb(20, 20, 25);
 const DEFAULT_FG: Color32 = Color32::from_rgb(220, 220, 220);
 
+/// Cached layout for one terminal row, so unchanged rows don't rebuild
+/// their `LayoutJob` (and re-tessellate) every frame.
+#[derive(Clone)]
+struct RowCache {
+    text: String,
+    runs: Vec<(usize, usize, Color32)>,
+    galley: Arc<egui::text::Galley>,
+}
+
 struct BgSpan {
     start_col: usize,
     end_col: usize,
@@ -420,6 +429,10 @@ pub struct TerminalView {
     pending_action: Option<TermAction>,
     /// Tracks alt-screen transitions so a stale selection is dropped.
     last_alt_screen: bool,
+    /// Per-row galley cache to avoid rebuilding LayoutJobs for unchanged rows.
+    row_cache: Vec<Option<RowCache>>,
+    /// Font size when the cache was last populated; cleared on change.
+    last_font_size: f32,
     /// Bytes destined for the PTY, produced by the terminal itself (currently
     /// xterm mouse reports). Drained by the app shell via `take_input`.
     pending_input: Vec<u8>,
@@ -467,6 +480,8 @@ impl TerminalView {
             selection: None,
             pending_action: None,
             last_alt_screen: false,
+            row_cache: Vec::new(),
+            last_font_size: 14.0,
             pending_input: Vec::new(),
             last_motion: None,
         }
@@ -924,6 +939,16 @@ impl TerminalView {
             let rows = self.rows;
             let cols = self.cols;
 
+            // Keep the row cache sized to the viewport and invalidate it when
+            // the font changes (galleys are font-specific).
+            if self.row_cache.len() != rows {
+                self.row_cache = vec![None; rows];
+            }
+            if (self.font_size - self.last_font_size).abs() > f32::EPSILON {
+                self.row_cache.fill(None);
+                self.last_font_size = self.font_size;
+            }
+
             let content = self.term.renderable_content();
             let display_offset = content.display_offset;
             let cursor_point = content.cursor.point;
@@ -935,16 +960,13 @@ impl TerminalView {
             let mut cols_emitted = 0usize;
             let mut row_bgs: Vec<(usize, Option<Color32>)> = Vec::new();
 
-            let flush_row = |ui: &egui::Ui,
-                             painter: &egui::Painter,
+            let flush_row = |painter: &egui::Painter,
                              rect: Rect,
                              row: usize,
                              char_height: f32,
                              char_width: f32,
                              bg_runs: &[BgSpan],
-                             text: &str,
-                             runs: &[(usize, usize, Color32)],
-                             font_id: &FontId| {
+                             galley: Option<Arc<egui::text::Galley>>| {
                 let y = rect.top() + row as f32 * char_height;
                 for span in bg_runs {
                     let x0 = rect.left() + span.start_col as f32 * char_width;
@@ -955,8 +977,8 @@ impl TerminalView {
                         span.color,
                     );
                 }
-                if !runs.is_empty() {
-                    paint_row(ui, painter, rect, row, char_height, text, runs, font_id);
+                if let Some(galley) = galley {
+                    painter.galley(Pos2::new(rect.left(), y), galley, Color32::PLACEHOLDER);
                 }
             };
 
@@ -974,17 +996,51 @@ impl TerminalView {
                 if row != Some(line) {
                     if let Some(prev) = row {
                         let spans = bg_runs(&row_bgs);
+                        let galley = if runs.is_empty() {
+                            None
+                        } else {
+                            let cache_hit = self
+                                .row_cache
+                                .get(prev)
+                                .and_then(|c| c.as_ref())
+                                .map(|c| c.text == text && c.runs == *runs)
+                                .unwrap_or(false);
+                            if cache_hit {
+                                Some(self.row_cache[prev].as_ref().unwrap().galley.clone())
+                            } else {
+                                let mut job = LayoutJob::default();
+                                job.wrap.max_width = f32::INFINITY;
+                                job.break_on_newline = false;
+                                for (start, end, color) in &runs {
+                                    job.append(
+                                        &text[*start..*end],
+                                        0.0,
+                                        TextFormat {
+                                            font_id: font_id.clone(),
+                                            color: *color,
+                                            ..Default::default()
+                                        },
+                                    );
+                                }
+                                let g = ui.fonts(|f| f.layout_job(job));
+                                if self.row_cache.len() > prev {
+                                    self.row_cache[prev] = Some(RowCache {
+                                        text: text.clone(),
+                                        runs: runs.clone(),
+                                        galley: g.clone(),
+                                    });
+                                }
+                                Some(g)
+                            }
+                        };
                         flush_row(
-                            ui,
                             &painter,
                             rect,
                             prev,
                             char_height,
                             char_width,
                             &spans,
-                            &text,
-                            &runs,
-                            &font_id,
+                            galley,
                         );
                     }
                     row = Some(line);
@@ -1040,17 +1096,51 @@ impl TerminalView {
 
             if let Some(prev) = row {
                 let spans = bg_runs(&row_bgs);
+                let galley = if runs.is_empty() {
+                    None
+                } else {
+                    let cache_hit = self
+                        .row_cache
+                        .get(prev)
+                        .and_then(|c| c.as_ref())
+                        .map(|c| c.text == text && c.runs == *runs)
+                        .unwrap_or(false);
+                    if cache_hit {
+                        Some(self.row_cache[prev].as_ref().unwrap().galley.clone())
+                    } else {
+                        let mut job = LayoutJob::default();
+                        job.wrap.max_width = f32::INFINITY;
+                        job.break_on_newline = false;
+                        for (start, end, color) in &runs {
+                            job.append(
+                                &text[*start..*end],
+                                0.0,
+                                TextFormat {
+                                    font_id: font_id.clone(),
+                                    color: *color,
+                                    ..Default::default()
+                                },
+                            );
+                        }
+                        let g = ui.fonts(|f| f.layout_job(job));
+                        if self.row_cache.len() > prev {
+                            self.row_cache[prev] = Some(RowCache {
+                                text: text.clone(),
+                                runs: runs.clone(),
+                                galley: g.clone(),
+                            });
+                        }
+                        Some(g)
+                    }
+                };
                 flush_row(
-                    ui,
                     &painter,
                     rect,
                     prev,
                     char_height,
                     char_width,
                     &spans,
-                    &text,
-                    &runs,
-                    &font_id,
+                    galley,
                 );
             }
 
@@ -1129,6 +1219,7 @@ fn push_char(text: &mut String, runs: &mut Vec<(usize, usize, Color32)>, ch: cha
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 fn paint_row(
     ui: &egui::Ui,
     painter: &egui::Painter,

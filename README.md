@@ -6,12 +6,13 @@
 
 A fast, lightweight, native Linux alternative to MobaXterm. SSH terminal tabs with an SFTP side panel that follows your session. Written in Rust.
 
-> **Status:** working terminal with tabs. Colours, scrollback, copy/paste, mouse
-> reporting, TOFU host-key verification, saved profiles, keyring passwords,
-> public-key/agent auth and the SFTP side panel (reconnect, rename, delete,
-> copy/paste, hidden files and an **Open with…** editor picker) are done. The UI
-> is flat and boxy with a shared, persisted theme system. General upload/download
-> transfers are next; the panel does not yet follow shell `cd`.
+> **Status:** feature-complete MVP. SSH terminal tabs with 256-colour output,
+> scrollback, copy/paste, mouse reporting, TOFU host keys, saved profiles,
+> keyring/key/agent auth and an SFTP side panel are done. The panel follows the
+> shell's `cd`, supports recursive drag-and-drop upload/download with a queue and
+> conflict prompts, and edit-and-auto-upload survives reconnects. X11 forwarding
+> and a VNC tunnel cover remote GUI tools. Remaining work, including the planned
+> module restructuring, is tracked in `handoff.md`.
 
 ## Screenshots
 
@@ -39,10 +40,10 @@ _(coming soon)_
       **Save as profile** field and a **Load / delete** saved-profile table
 - [x] Flat, boxy UI (square corners, 1 px borders, no shadows or hover glow)
 - [x] Global UI themes (Midnight / Graphite) with the choice persisted
-- [ ] SFTP panel follows the shell's working directory
-- [ ] Upload/download with drag and drop
-- [ ] Edit-and-auto-upload remote files
-- [ ] X11 forwarding / VNC tunnel for GUI tools (Verdi, DVE)
+- [x] SFTP panel follows the shell's working directory
+- [x] Upload/download with drag and drop
+- [x] Edit-and-auto-upload remote files
+- [x] X11 forwarding / VNC tunnel for GUI tools (Verdi, DVE)
 
 ## Stack
 

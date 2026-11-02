@@ -209,8 +209,9 @@ pub struct ActiveTransfer {
     pub progress: Arc<TransferProgress>,
     rx: std_mpsc::Receiver<Result<String, String>>,
     verb: &'static str,
-    /// Local copy of an editor upload, so a success can clear its journal entry.
-    local: Option<PathBuf>,
+    /// Local copy of an editor upload plus the metadata it had when the upload
+    /// started, so success clears exactly the version that was sent.
+    upload: Option<(PathBuf, FileStamp)>,
 }
 
 /// How long the local copies opened in an editor stay quiet after a filesystem
@@ -461,10 +462,14 @@ impl EditJournal {
         });
     }
 
-    /// The server now has the file as it is on disk.
-    fn mark_uploaded(&mut self, local: &Path) {
+    /// Record the exact version the server received.
+    ///
+    /// A save that landed while the upload was running leaves the file's
+    /// current stamp different from `stamp`, so the change stays pending and is
+    /// retried instead of being silently dropped.
+    fn mark_uploaded(&mut self, local: &Path, stamp: FileStamp) {
         if let Some(entry) = self.entries.iter_mut().find(|seen| seen.local == local) {
-            entry.uploaded = FileStamp::of(local);
+            entry.uploaded = Some(stamp);
             entry.offline_since = None;
         }
     }
@@ -1379,15 +1384,19 @@ impl SftpExplorer {
         true
     }
 
-    /// Cancel the running transfer or drop everything still queued.
+    /// Cancel the running transfer, if any, and drop everything still queued.
     pub fn cancel_transfer(&mut self) -> bool {
+        let queued = self.queue.len();
+        self.queue.clear();
         if let Some(transfer) = &self.transfer {
             transfer.progress.cancel();
+            if queued > 0 {
+                self.status
+                    .info(format!("Cancelling 1 running and {queued} queued"));
+            }
             return true;
         }
-        let queued = self.queue.len();
         if queued > 0 {
-            self.queue.clear();
             self.status
                 .info(format!("Cancelled {queued} queued transfer(s)"));
             return true;
@@ -1437,6 +1446,15 @@ impl SftpExplorer {
             return false;
         };
         let progress = Arc::new(TransferProgress::new(request.label.clone()));
+        // Capture the stamp *before* the transfer starts. If the file changes
+        // at any point after this, the journal keeps it pending rather than
+        // recording a version the server never received.
+        let upload = match &request.kind {
+            TransferKind::UploadOne { local, .. } => {
+                FileStamp::of(local).map(|stamp| (local.clone(), stamp))
+            }
+            _ => None,
+        };
         let (verb, receiver) = match &request.kind {
             TransferKind::Upload { local, remote_dir } => (
                 "Uploaded",
@@ -1465,15 +1483,11 @@ impl SftpExplorer {
             self.mark_unavailable(ssh);
             return false;
         };
-        let local = match &request.kind {
-            TransferKind::UploadOne { local, .. } => Some(local.clone()),
-            _ => None,
-        };
         self.transfer = Some(ActiveTransfer {
             progress,
             rx,
             verb,
-            local,
+            upload,
         });
         true
     }
@@ -1484,9 +1498,10 @@ impl SftpExplorer {
         };
         match active.rx.try_recv() {
             Ok(Ok(detail)) => {
-                if let Some(local) = &active.local {
-                    // The server now has this exact version.
-                    self.journal.mark_uploaded(local);
+                if let Some((local, stamp)) = &active.upload {
+                    // Clear only the version that was sent. A save made while
+                    // the upload was running keeps its journal entry pending.
+                    self.journal.mark_uploaded(local, *stamp);
                 }
                 self.status.success(format!("{} {detail}", active.verb));
                 self.refresh(ssh);
@@ -2487,6 +2502,34 @@ mod tests {
     }
 
     #[test]
+    fn cancelling_stops_the_running_transfer_and_clears_the_queue() {
+        let mut explorer = SftpExplorer::default();
+        let (tx, rx) = std_mpsc::channel();
+        let progress = Arc::new(TransferProgress::new("Uploading notes.txt"));
+        explorer.transfer = Some(ActiveTransfer {
+            progress: Arc::clone(&progress),
+            rx,
+            verb: "Uploaded",
+            upload: None,
+        });
+        for name in ["a.txt", "b.txt"] {
+            explorer.queue.push_back(TransferRequest {
+                label: format!("Uploading {name}"),
+                kind: TransferKind::UploadOne {
+                    local: PathBuf::from(name),
+                    remote: format!("/remote/{name}"),
+                },
+                policy: ConflictPolicy::Overwrite,
+            });
+        }
+        let _keep_tx = tx;
+
+        assert!(explorer.cancel_transfer());
+        assert!(progress.is_cancelled());
+        assert_eq!(explorer.queued_transfers(), 0);
+    }
+
+    #[test]
     fn walks_to_the_parent_and_stops_at_root() {
         assert_eq!(parent_path("/home/user"), "/home");
         assert_eq!(parent_path("/home/user/"), "/home");
@@ -2821,7 +2864,36 @@ mod tests {
         assert_eq!(pending[0].2, "notes.txt");
 
         // Once the server has the new version, nothing is pending any more.
-        journal.mark_uploaded(&local);
+        journal.mark_uploaded(&local, FileStamp::of(&local).unwrap());
+        assert!(journal.pending(now).is_empty());
+    }
+
+    #[test]
+    fn journal_keeps_a_save_made_during_an_upload() {
+        let dir = TempDir::new("edit-journal-during-upload");
+        let local = dir.0.join("notes.txt");
+        std::fs::write(&local, "one").unwrap();
+        let mut journal = EditJournal::for_profile("me@host:22");
+        let now = Instant::now();
+        journal.record(&local, "/remote/notes.txt", "notes.txt");
+
+        // Version the upload actually read.
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&local, "two-two").unwrap();
+        let sent = FileStamp::of(&local).unwrap();
+
+        // The user saves again while that upload is still in flight.
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&local, "three-three-three").unwrap();
+
+        journal.mark_uploaded(&local, sent);
+        assert_eq!(
+            journal.pending(now).len(),
+            1,
+            "a save made during the upload must stay pending"
+        );
+
+        journal.mark_uploaded(&local, FileStamp::of(&local).unwrap());
         assert!(journal.pending(now).is_empty());
     }
 
@@ -2873,6 +2945,27 @@ mod tests {
     }
 
     #[test]
+    fn taking_a_journal_keeps_its_profile_and_pending_changes() {
+        let dir = TempDir::new("edit-journal-detach");
+        let local = dir.0.join("notes.txt");
+        std::fs::write(&local, "one").unwrap();
+        let mut explorer = SftpExplorer {
+            journal: EditJournal::for_profile("me@host:22"),
+            ..SftpExplorer::default()
+        };
+        explorer
+            .journal
+            .record(&local, "/remote/notes.txt", "notes.txt");
+
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&local, "two-two").unwrap();
+
+        let mut taken = explorer.take_journal();
+        assert_eq!(taken.profile(), "me@host:22");
+        assert_eq!(taken.pending(Instant::now()).len(), 1);
+    }
+
+    #[test]
     fn journal_is_only_installed_for_the_same_profile() {
         let mut explorer = SftpExplorer::default();
         let journal = EditJournal::for_profile("me@host:22");
@@ -2895,7 +2988,7 @@ mod tests {
         std::fs::write(&local, "two").unwrap();
         assert_eq!(journal.local_copy("/remote/notes.txt"), Some(local.clone()));
 
-        journal.mark_uploaded(&local);
+        journal.mark_uploaded(&local, FileStamp::of(&local).unwrap());
         assert!(journal.local_copy("/remote/notes.txt").is_none());
     }
 

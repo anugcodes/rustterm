@@ -19,38 +19,56 @@ use tokio::net::{TcpStream, UnixStream};
 /// Length of an MIT-MAGIC-COOKIE-1 value.
 pub const COOKIE_BYTES: usize = 16;
 
-/// A parsed `$DISPLAY` value (`:0`, `host:10.0`, `unix:0`).
+/// A parsed `$DISPLAY` value (`:0`, `host:10.0`, `unix:0`, `host/unix:0`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Display {
     pub host: String,
+    /// Transport named after the host (`unix` for `host/unix:0`), if any.
+    pub transport: Option<String>,
     pub number: u32,
     pub screen: u32,
 }
 
 impl Display {
     pub fn parse(value: &str) -> Option<Self> {
-        let value = value.trim();
-        if value.is_empty() {
-            return None;
-        }
-        let split = value.rfind(':')?;
-        let host = &value[..split];
-        let rest = &value[split + 1..];
-        let (number, screen) = match rest.split_once('.') {
-            Some((number, screen)) => (number.parse().ok()?, screen.parse().ok()?),
-            None => (rest.parse().ok()?, 0),
-        };
+        let (host, transport, number, screen) = parse_display_name(value.trim())?;
         Some(Self {
-            host: host.to_string(),
+            host,
+            transport,
             number,
-            screen,
+            screen: screen.unwrap_or(0),
         })
     }
 
-    /// Unix sockets are only meaningful for a local display.
-    pub fn is_local(&self) -> bool {
-        self.host.is_empty() || matches!(self.host.as_str(), "unix" | "localhost" | "127.0.0.1")
+    fn prefers_unix_socket(&self) -> bool {
+        self.host.is_empty()
+            || self.host == "unix"
+            || matches!(self.host.as_str(), "localhost" | "127.0.0.1")
+            || self.transport.as_deref() == Some("unix")
     }
+}
+
+/// Split a display or xauth entry name into host, transport, number and screen.
+///
+/// The grammar is `[host][/transport]:number[.screen]`. The transport is only
+/// recognised when a host precedes the slash, so a launchd socket path such as
+/// `/tmp/launch-x/org.xquartz:0` keeps its full path as the host.
+fn parse_display_name(value: &str) -> Option<(String, Option<String>, u32, Option<u32>)> {
+    if value.is_empty() {
+        return None;
+    }
+    let (head, rest) = value.rsplit_once(':')?;
+    let (host, transport) = match head.split_once('/') {
+        Some((host, transport)) if !host.is_empty() && !transport.is_empty() => {
+            (host.to_string(), Some(transport.to_string()))
+        }
+        _ => (head.to_string(), None),
+    };
+    let (number, screen) = match rest.split_once('.') {
+        Some((number, screen)) => (number.parse().ok()?, Some(screen.parse().ok()?)),
+        None => (rest.parse().ok()?, None),
+    };
+    Some((host, transport, number, screen))
 }
 
 /// What a proxy needs to reach the local X server.
@@ -88,12 +106,7 @@ pub fn local_auth(display: &Display) -> Option<(String, Vec<u8>)> {
         if protocol != "MIT-MAGIC-COOKIE-1" {
             continue;
         }
-        // `name` is `host/unix:0.0`, `host:0`, or `:0`.
-        let Some((_, tail)) = name.rsplit_once(':') else {
-            continue;
-        };
-        let number = tail.split('.').next().unwrap_or(tail);
-        if number.parse::<u32>().ok() != Some(display.number) {
+        if !auth_entry_matches(name, display) {
             continue;
         }
         if let Some(bytes) = decode_hex(cookie) {
@@ -101,6 +114,43 @@ pub fn local_auth(display: &Display) -> Option<(String, Vec<u8>)> {
         }
     }
     None
+}
+
+/// Whether an `xauth list` display field belongs to `display`.
+///
+/// Entries are `host/transport:number[.screen]`; the screen is optional and,
+/// when omitted, applies to every screen of that display.
+fn auth_entry_matches(name: &str, display: &Display) -> bool {
+    let Some((host, transport, number, screen)) = parse_display_name(name) else {
+        return false;
+    };
+    if number != display.number {
+        return false;
+    }
+    if screen.is_some_and(|screen| screen != display.screen) {
+        return false;
+    }
+    if let (Some(want), Some(got)) = (display.transport.as_deref(), transport.as_deref()) {
+        if !want.eq_ignore_ascii_case(got) {
+            return false;
+        }
+    }
+    auth_host_matches(&host, transport.as_deref(), display)
+}
+
+fn auth_host_matches(host: &str, transport: Option<&str>, display: &Display) -> bool {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let want = display.host.trim_start_matches('[').trim_end_matches(']');
+    if !want.is_empty() && !want.eq_ignore_ascii_case("unix") {
+        return host.eq_ignore_ascii_case(want);
+    }
+    // A local display has no host of its own: accept the machine's Unix
+    // transport entry (the usual `hostname/unix:0`), a bare entry, or a
+    // loopback name.
+    host.is_empty()
+        || transport == Some("unix")
+        || host.eq_ignore_ascii_case("localhost")
+        || host.eq_ignore_ascii_case("unix")
 }
 
 /// A fresh random cookie, sent to the server in the `x11-req`.
@@ -130,9 +180,11 @@ pub fn random_cookie_hex() -> String {
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
-        out.push_str(&format!("{byte:02x}"));
+        out.push(DIGITS[(byte >> 4) as usize] as char);
+        out.push(DIGITS[(byte & 0x0f) as usize] as char);
     }
     out
 }
@@ -179,7 +231,7 @@ pub async fn proxy(
 }
 
 async fn connect_local(display: &Display) -> Result<LocalX11, String> {
-    if display.is_local() {
+    if display.prefers_unix_socket() {
         let path = format!("/tmp/.X11-unix/X{}", display.number);
         if let Ok(socket) = UnixStream::connect(&path).await {
             return Ok(LocalX11::Unix(socket));
@@ -195,13 +247,23 @@ async fn connect_local(display: &Display) -> Result<LocalX11, String> {
     } else {
         host
     };
-    let port = 6000 + display.number as u16;
+    let port = x11_tcp_port(display.number).ok_or_else(|| {
+        format!(
+            "display number {} cannot be reached over TCP",
+            display.number
+        )
+    })?;
     let stream = TcpStream::connect((host.as_str(), port))
         .await
         .map_err(|err| format!("could not reach the X server at {host}:{port}: {err}"))?;
     // X11 is chatty; disable Nagle on the local leg too.
     let _ = stream.set_nodelay(true);
     Ok(LocalX11::Tcp(stream))
+}
+
+/// X display `n` listens on TCP port `6000 + n`.
+fn x11_tcp_port(number: u32) -> Option<u16> {
+    u16::try_from(number).ok()?.checked_add(6000)
 }
 
 enum LocalX11 {
@@ -333,6 +395,7 @@ mod tests {
             Display::parse(":0"),
             Some(Display {
                 host: String::new(),
+                transport: None,
                 number: 0,
                 screen: 0
             })
@@ -341,6 +404,7 @@ mod tests {
             Display::parse(":10.1"),
             Some(Display {
                 host: String::new(),
+                transport: None,
                 number: 10,
                 screen: 1
             })
@@ -349,6 +413,7 @@ mod tests {
             Display::parse("localhost:10.0"),
             Some(Display {
                 host: "localhost".into(),
+                transport: None,
                 number: 10,
                 screen: 0
             })
@@ -357,12 +422,66 @@ mod tests {
             Display::parse("192.168.1.9:2"),
             Some(Display {
                 host: "192.168.1.9".into(),
+                transport: None,
+                number: 2,
+                screen: 0
+            })
+        );
+        assert_eq!(
+            Display::parse("workstation/unix:2"),
+            Some(Display {
+                host: "workstation".into(),
+                transport: Some("unix".into()),
                 number: 2,
                 screen: 0
             })
         );
         assert_eq!(Display::parse(""), None);
         assert_eq!(Display::parse("nonsense"), None);
+    }
+
+    #[test]
+    fn unix_transport_displays_are_local() {
+        for name in [":0", "unix:0", "localhost:0", "workstation/unix:0"] {
+            assert!(
+                Display::parse(name).unwrap().prefers_unix_socket(),
+                "{name} should use the Unix socket"
+            );
+        }
+        for name in ["192.168.1.9:2", "tcp/workstation:2"] {
+            assert!(
+                !Display::parse(name).unwrap().prefers_unix_socket(),
+                "{name} should use TCP"
+            );
+        }
+    }
+
+    #[test]
+    fn matches_xauth_entries_by_host_number_and_screen() {
+        let local = Display::parse(":0").unwrap();
+        assert!(auth_entry_matches("box/unix:0", &local));
+        assert!(auth_entry_matches(":0", &local));
+        assert!(!auth_entry_matches("box/unix:1", &local));
+        assert!(!auth_entry_matches("box/tcp:0", &local));
+
+        let remote = Display::parse("workstation/unix:2").unwrap();
+        assert!(auth_entry_matches("workstation/unix:2", &remote));
+        assert!(!auth_entry_matches("otherhost/unix:2", &remote));
+        assert!(!auth_entry_matches("workstation/unix:3", &remote));
+
+        // An entry without a screen applies to every screen.
+        let screen_one = Display::parse("workstation/unix:2.1").unwrap();
+        assert!(auth_entry_matches("workstation/unix:2", &screen_one));
+        assert!(auth_entry_matches("workstation/unix:2.1", &screen_one));
+        assert!(!auth_entry_matches("workstation/unix:2.0", &screen_one));
+    }
+
+    #[test]
+    fn tcp_ports_use_checked_arithmetic() {
+        assert_eq!(x11_tcp_port(0), Some(6000));
+        assert_eq!(x11_tcp_port(59_535), Some(65_535));
+        assert_eq!(x11_tcp_port(59_536), None);
+        assert_eq!(x11_tcp_port(u32::MAX), None);
     }
 
     #[test]

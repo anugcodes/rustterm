@@ -56,9 +56,15 @@ const EDIT_SAFETY_MS: u64 = 5000;
 /// Repaint delay while a save event waits out the debounce (150 ms + margin).
 const EDIT_DEBOUNCE_MS: u64 = 170;
 
-/// Upper bound on remote bytes decoded in a single frame. This keeps a large
-/// burst from stalling the UI while still allowing tens of MiB/s sustained.
+/// Upper bound on remote bytes decoded per session in a single frame. This
+/// keeps a large burst from stalling the UI while still allowing tens of MiB/s
+/// sustained. Applied per session, with the visible tab drained first.
 const MAX_OUTPUT_PER_FRAME: usize = 256 * 1024;
+
+/// How long a VNC tunnel with no viewer process and no connected client is
+/// kept alive. Covers viewers that daemonise or hand off to an existing
+/// instance (e.g. `remmina -c`) and never connect in the spawning process.
+const VNC_TUNNEL_GRACE: Duration = Duration::from_secs(15);
 
 /// Wake egui from a background thread, but coalesce calls that arrive within
 /// ~8 ms so a fast link cannot flood the UI thread with repaint requests.
@@ -678,6 +684,16 @@ impl SftpSort {
     }
 }
 
+/// Case-insensitive ordering without allocating: `to_lowercase()` in a
+/// comparator allocated twice per comparison, which is O(n log n) allocations
+/// on every frame. `flat_map(char::to_lowercase)` produces the same sequence
+/// of characters without building a string.
+fn cmp_lower(a: &str, b: &str) -> std::cmp::Ordering {
+    a.chars()
+        .flat_map(char::to_lowercase)
+        .cmp(b.chars().flat_map(char::to_lowercase))
+}
+
 /// Indices of `entries` in display order: hidden files filtered out, folders
 /// first, then the active sort key.
 fn sorted_indices(entries: &[RemoteEntry], show_hidden: bool, sort: SftpSort) -> Vec<usize> {
@@ -692,10 +708,10 @@ fn sorted_indices(entries: &[RemoteEntry], show_hidden: bool, sort: SftpSort) ->
         // Folders always stay grouped above files, whatever the key.
         b.is_dir.cmp(&a.is_dir).then_with(|| {
             let order = match sort.key {
-                SftpSortKey::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                SftpSortKey::Name => cmp_lower(&a.name, &b.name),
                 SftpSortKey::Modified => a.modified.cmp(&b.modified),
                 SftpSortKey::Size => a.size.cmp(&b.size),
-                SftpSortKey::Owner => a.owner.to_lowercase().cmp(&b.owner.to_lowercase()),
+                SftpSortKey::Owner => cmp_lower(&a.owner, &b.owner),
             };
             let order = if sort.ascending {
                 order
@@ -703,7 +719,7 @@ fn sorted_indices(entries: &[RemoteEntry], show_hidden: bool, sort: SftpSort) ->
                 order.reverse()
             };
             // Stable, predictable order for equal keys.
-            order.then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            order.then_with(|| cmp_lower(&a.name, &b.name))
         })
     });
     indices
@@ -923,6 +939,10 @@ struct DisplayUi {
     message: Option<String>,
     /// External viewer process, kept so Stop can close it.
     viewer: Option<std::process::Child>,
+    /// When the viewer process was last seen exiting. The tunnel is stopped
+    /// only after [`VNC_TUNNEL_GRACE`] with no connected client, so a viewer
+    /// that hands off to an existing instance is not cut off.
+    viewer_exited_at: Option<Instant>,
 }
 
 impl Drop for DisplayUi {
@@ -1190,7 +1210,13 @@ impl RustTermApp {
                     .terminal
                     .feed(b"\r\n\r\n--- reconnected ---\r\n\r\n");
                 session.connection_lost = false;
-                session.sftp = SftpExplorer::start(&session.ssh, &session.title);
+                // Keep unsynced editor copies: hand the old journal to the new
+                // explorer. Use the journal's own profile key because the tab
+                // title may have been changed by the remote shell's OSC title.
+                let journal = session.sftp.take_journal();
+                let profile = journal.profile().to_string();
+                session.sftp = SftpExplorer::start(&session.ssh, &profile);
+                session.sftp.install_journal(journal);
                 session.display.message = Some("Reconnected".to_string());
                 // Keep the stored config's x11 flag in sync with what was used.
                 session.config.x11 = state.config.x11;
@@ -1421,13 +1447,15 @@ impl RustTermApp {
     /// make switching tabs dump a large backlog all at once. Titles/bells also
     /// arrive for background tabs, so process them here.
     ///
-    /// At most [`MAX_OUTPUT_PER_FRAME`] bytes are decoded per frame. A huge
-    /// burst (`cat` of a large file) would otherwise block painting for
-    /// hundreds of milliseconds; the remainder is picked up on the next frame
-    /// and a repaint is requested so it is not left waiting for a wake-up.
+    /// At most [`MAX_OUTPUT_PER_FRAME`] bytes are decoded per session per
+    /// frame, starting with the visible tab. A huge burst (`cat` of a large
+    /// file) would otherwise block painting for hundreds of milliseconds; the
+    /// remainder is picked up on the next frame and a repaint is requested so
+    /// it is not left waiting for a wake-up. Draining the visible tab first
+    /// means a flooding background tab cannot starve it.
     fn pump_sessions(&mut self, ctx: &egui::Context) -> bool {
         let mut activity = false;
-        let mut budget = MAX_OUTPUT_PER_FRAME;
+        let mut exhausted = false;
         // File-save events arrive on a watcher thread; give each panel a way to
         // wake egui instead of relying on a polling timer.
         let wake: Wake = debounced_wake(ctx.clone());
@@ -1446,7 +1474,15 @@ impl RustTermApp {
             ctx.request_repaint_after(Duration::from_secs(60));
         }
 
-        for session in &mut self.sessions {
+        let count = self.sessions.len();
+        let first = self.active.checked_sub(1).filter(|index| *index < count);
+        for offset in 0..count {
+            let index = match first {
+                Some(first) => (first + offset) % count,
+                None => offset,
+            };
+            let session = &mut self.sessions[index];
+            let mut budget = MAX_OUTPUT_PER_FRAME;
             // A dead thread used to be invisible: reads returned `None`, input
             // vanished and the tab looked alive forever. Detect it once here.
             if !session.connection_lost && !session.ssh.is_alive() {
@@ -1484,6 +1520,9 @@ impl RustTermApp {
                 session.terminal.feed(&chunk);
                 activity = true;
             }
+            if budget == 0 {
+                exhausted = true;
+            }
             // The shell reports its directory through OSC 7; following is
             // decided in the explorer, which also ignores it while paused.
             if let Some(cwd) = session.terminal.take_cwd() {
@@ -1501,7 +1540,7 @@ impl RustTermApp {
             }
         }
 
-        if budget == 0 {
+        if exhausted {
             // Work was left over: keep painting until every queue is empty.
             ctx.request_repaint();
         }
@@ -3318,7 +3357,7 @@ impl RustTermApp {
         let theme = settings.theme.theme();
         let session = &mut self.sessions[index];
         let mut activity = false;
-        poll_display(session, &settings);
+        poll_display(session, &settings, ctx);
 
         // The bar is contextual: a lost connection needs a way out, and the
         // remote-display controls appear based on what the session actually
@@ -3781,7 +3820,7 @@ impl eframe::App for RustTermApp {
 }
 
 /// Process finished VNC probes and tunnel replies for one session.
-fn poll_display(session: &mut ActiveSession, settings: &Settings) {
+fn poll_display(session: &mut ActiveSession, settings: &Settings, ctx: &egui::Context) {
     if let Some(rx) = session.display.probe.take() {
         match rx.try_recv() {
             Ok(Ok(probe)) => {
@@ -3843,8 +3882,9 @@ fn poll_display(session: &mut ActiveSession, settings: &Settings) {
         }
     }
 
-    // When the viewer exits, tear the tunnel down too, so nothing is left
-    // listening once the desktop is closed.
+    // A viewer that exits is not necessarily finished: `remmina -c` and
+    // similar hand off to an already-running instance and return immediately.
+    // Stop the tunnel only after a grace period with no connected client.
     if session
         .display
         .viewer
@@ -3852,10 +3892,26 @@ fn poll_display(session: &mut ActiveSession, settings: &Settings) {
         .is_some_and(|child| child.try_wait().ok().flatten().is_some())
     {
         session.display.viewer = None;
-        let _ = session.ssh.vnc_close();
-        session.display.tunnel_port = None;
-        session.display.target = None;
-        session.display.message = Some("Viewer closed — VNC tunnel stopped".to_string());
+        session.display.viewer_exited_at = Some(Instant::now());
+    }
+    if let Some(exited) = session.display.viewer_exited_at {
+        if session.display.tunnel_port.is_none() {
+            session.display.viewer_exited_at = None;
+        } else if session.ssh.vnc_clients() > 0 {
+            // The viewer handed off to a running instance; keep the tunnel.
+            session.display.viewer_exited_at = None;
+        } else {
+            let waited = exited.elapsed();
+            if waited >= VNC_TUNNEL_GRACE {
+                session.display.viewer_exited_at = None;
+                let _ = session.ssh.vnc_close();
+                session.display.tunnel_port = None;
+                session.display.target = None;
+                session.display.message = Some("Viewer closed — VNC tunnel stopped".to_string());
+            } else {
+                ctx.request_repaint_after(VNC_TUNNEL_GRACE - waited);
+            }
+        }
     }
 }
 
@@ -3955,6 +4011,7 @@ fn stop_vnc(session: &mut ActiveSession) {
     session.display.tunnel_port = None;
     session.display.target = None;
     session.display.busy = false;
+    session.display.viewer_exited_at = None;
     session.display.message = Some("VNC tunnel closed".to_string());
 }
 
@@ -4009,9 +4066,9 @@ fn vnc_viewer_command(port: u16) -> Option<(&'static str, Vec<String>)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        sftp_header, sorted_indices, RemoteEntry, SftpColumns, SftpLayout, SftpSort, SftpSortKey,
-        COLUMN_STEP, MIN_MODIFIED_WIDTH, MIN_OWNER_WIDTH, MIN_SIZE_WIDTH, NAME_MIN_WIDTH,
-        TABLE_WIDTH,
+        cmp_lower, sftp_header, sorted_indices, RemoteEntry, SftpColumns, SftpLayout, SftpSort,
+        SftpSortKey, COLUMN_STEP, MIN_MODIFIED_WIDTH, MIN_OWNER_WIDTH, MIN_SIZE_WIDTH,
+        NAME_MIN_WIDTH, TABLE_WIDTH,
     };
     use crate::theme::ThemeId;
     use std::time::{Duration, SystemTime};
@@ -4210,6 +4267,16 @@ mod tests {
             names(&entries, &shown),
             ["Docs", "Alpha.txt", "z.bin", "beta.txt"]
         );
+    }
+
+    #[test]
+    fn case_insensitive_order_matches_lowercase_strings() {
+        let names = ["Zeta", "alpha", "İstanbul", "istanbul", "ALPHA"];
+        let mut by_helper = names;
+        by_helper.sort_by(|a, b| cmp_lower(a, b));
+        let mut by_string = names;
+        by_string.sort_by_key(|name| name.to_lowercase());
+        assert_eq!(by_helper, by_string);
     }
 
     #[test]

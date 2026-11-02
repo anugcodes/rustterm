@@ -20,7 +20,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
@@ -39,10 +39,21 @@ use russh::{compression, Channel, ChannelMsg};
 use russh_sftp::client::{Config as SftpConfig, SftpSession};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot, OnceCell};
+use tokio::sync::{mpsc, oneshot, Notify, OnceCell};
 
 /// Wakes the egui thread when asynchronous SSH data arrives.
 pub type Wake = Arc<dyn Fn() + Send + Sync>;
+
+/// Bytes the UI may have queued before the session thread stops reading the
+/// SSH channel. This is the terminal's only backpressure: without it a hidden
+/// tab running `yes` grows the process without bound and starves the visible
+/// tab of its per-frame drain budget.
+const OUTPUT_HIGH_WATER: usize = 2 * 1024 * 1024;
+
+/// Loopback viewers allowed through one VNC tunnel at a time. VNC uses two
+/// connections per viewer in some clients; the rest are refused (and closed)
+/// instead of spawning an unbounded number of tasks.
+const VNC_MAX_CLIENTS: usize = 8;
 
 #[derive(Clone)]
 pub struct SshConfig {
@@ -105,6 +116,12 @@ pub struct SshSession {
     resize_tx: mpsc::UnboundedSender<(u16, u16)>,
     disconnect_tx: mpsc::UnboundedSender<()>,
     output_rx: std_mpsc::Receiver<Vec<u8>>,
+    /// Bytes queued for the UI but not yet read. The session thread stops
+    /// reading the SSH channel while this is above [`OUTPUT_HIGH_WATER`], which
+    /// is what bounds memory when a hidden tab floods output.
+    output_backlog: Arc<AtomicUsize>,
+    /// Signalled by the UI after it drains output, so a gated session resumes.
+    output_space: Arc<Notify>,
     /// Requests for the SFTP subsystem. Always present, even when SFTP failed
     /// to open, so callers can still get a meaningful error.
     sftp_tx: mpsc::UnboundedSender<SftpRequest>,
@@ -120,6 +137,9 @@ pub struct SshSession {
     x11: Arc<X11Shared>,
     /// Whether this session requested X11 forwarding at connect time.
     x11_requested: bool,
+    /// Live viewer connections on the current VNC tunnel. The app uses this to
+    /// tell "viewer exited" apart from "viewer handed off to a daemon".
+    vnc_clients: Arc<AtomicUsize>,
 }
 
 /// Flips `alive` to false and wakes egui when the session thread ends,
@@ -538,12 +558,19 @@ impl SshSession {
         let (resize_tx, resize_rx) = mpsc::unbounded_channel::<(u16, u16)>();
         let (disconnect_tx, disconnect_rx) = mpsc::unbounded_channel::<()>();
         let (output_tx, output_rx) = std_mpsc::channel::<Vec<u8>>();
+        let output_backlog = Arc::new(AtomicUsize::new(0));
+        let output_space = Arc::new(Notify::new());
+        let vnc_clients = Arc::new(AtomicUsize::new(0));
         let (sftp_tx, sftp_rx) = mpsc::unbounded_channel::<SftpRequest>();
         let (display_tx, display_rx) = mpsc::unbounded_channel::<DisplayRequest>();
         let session_wake = wake.clone();
         let alive = Arc::new(AtomicBool::new(true));
         let alive_thread = Arc::clone(&alive);
         let guard_wake = session_wake.clone();
+        // The loop needs its own handles; the originals stay with `SshSession`.
+        let thread_backlog = Arc::clone(&output_backlog);
+        let thread_space = Arc::clone(&output_space);
+        let thread_vnc_clients = Arc::clone(&vnc_clients);
 
         std::thread::Builder::new()
             .name(format!("ssh-{}@{}", config.user, config.host))
@@ -556,6 +583,7 @@ impl SshSession {
                     session,
                     channel,
                     sftp,
+                    thread_vnc_clients,
                     SessionIo {
                         input_rx,
                         resize_rx,
@@ -563,6 +591,8 @@ impl SshSession {
                         sftp_rx,
                         display_rx,
                         output_tx,
+                        output_backlog: thread_backlog,
+                        output_space: thread_space,
                     },
                     wake,
                 ));
@@ -574,6 +604,8 @@ impl SshSession {
             resize_tx,
             disconnect_tx,
             output_rx,
+            output_backlog,
+            output_space,
             sftp_tx,
             display_tx,
             sftp_unavailable: sftp_error,
@@ -581,6 +613,7 @@ impl SshSession {
             alive,
             x11,
             x11_requested: config.x11,
+            vnc_clients,
         })
     }
 
@@ -604,6 +637,11 @@ impl SshSession {
     /// Whether this session requested X11 forwarding at connect time.
     pub fn x11_requested(&self) -> bool {
         self.x11_requested
+    }
+
+    /// Number of viewer connections currently using the VNC tunnel.
+    pub fn vnc_clients(&self) -> usize {
+        self.vnc_clients.load(Ordering::Relaxed)
     }
 
     /// Look for a VNC listener on the server, creating one if requested.
@@ -952,8 +990,21 @@ impl SshSession {
     }
 
     /// Drain one pending output chunk, if any.
+    ///
+    /// Reading a chunk releases that much of the session's backlog and wakes
+    /// the session thread if it had been gated by the high-water mark.
     pub fn try_read(&self) -> Option<Vec<u8>> {
-        self.output_rx.try_recv().ok()
+        let chunk = self.output_rx.try_recv().ok()?;
+        // The sender adds each chunk before queueing it, so this cannot
+        // underflow; the debug assertion catches an accounting mistake early.
+        let before = self
+            .output_backlog
+            .fetch_sub(chunk.len(), Ordering::Relaxed);
+        debug_assert!(before >= chunk.len(), "output backlog accounting underflow");
+        if before >= OUTPUT_HIGH_WATER {
+            self.output_space.notify_one();
+        }
+        Some(chunk)
     }
 
     /// Clone of the PTY input sender, for components that need to write bytes
@@ -1132,7 +1183,14 @@ async fn request_x11_forwarding(channel: &mut Channel<ClientMsg>, shared: &X11Sh
         );
         return;
     };
-    let auth = x11::local_auth(&display);
+    // `xauth` is a blocking subprocess; keep it off the session runtime.
+    let auth = {
+        let display = display.clone();
+        tokio::task::spawn_blocking(move || x11::local_auth(&display))
+            .await
+            .ok()
+            .flatten()
+    };
     let cookie = x11::random_cookie_hex();
     if let Err(err) = channel
         .request_x11(true, false, "MIT-MAGIC-COOKIE-1", cookie, display.screen)
@@ -1356,12 +1414,15 @@ struct SessionIo {
     sftp_rx: mpsc::UnboundedReceiver<SftpRequest>,
     display_rx: mpsc::UnboundedReceiver<DisplayRequest>,
     output_tx: std_mpsc::Sender<Vec<u8>>,
+    output_backlog: Arc<AtomicUsize>,
+    output_space: Arc<Notify>,
 }
 
 async fn run_session(
     session: Arc<Handle<ClientHandler>>,
     mut channel: Channel<ClientMsg>,
     sftp: Option<SftpSession>,
+    vnc_clients: Arc<AtomicUsize>,
     io: SessionIo,
     wake: Option<Wake>,
 ) {
@@ -1372,6 +1433,8 @@ async fn run_session(
         mut sftp_rx,
         mut display_rx,
         output_tx,
+        output_backlog,
+        output_space,
     } = io;
     // The client is behind a lock so a reconnect can swap in a fresh SFTP
     // channel while the terminal loop keeps running. Locks are only held long
@@ -1457,7 +1520,7 @@ async fn run_session(
                         if let Some(tunnel) = vnc.take() {
                             tunnel.abort();
                         }
-                        match open_vnc(&session, &host, port).await {
+                        match open_vnc(&session, &host, port, Arc::clone(&vnc_clients)).await {
                             Ok((local_port, handle)) => {
                                 vnc = Some(handle);
                                 let _ = reply.send(Ok(local_port));
@@ -1481,9 +1544,13 @@ async fn run_session(
                     }
                 }
             }
-            msg = channel.wait() => {
+            // Stop reading the SSH channel while the UI is behind. The remote
+            // sees a full window and pauses, which bounds memory without
+            // dropping a single byte.
+            msg = channel.wait(), if output_backlog.load(Ordering::Relaxed) < OUTPUT_HIGH_WATER => {
                 match msg {
                     Some(ChannelMsg::Data { data }) => {
+                        output_backlog.fetch_add(data.len(), Ordering::Relaxed);
                         if output_tx.send(data.to_vec()).is_err() {
                             break;
                         }
@@ -1492,6 +1559,7 @@ async fn run_session(
                         }
                     }
                     Some(ChannelMsg::ExtendedData { data, .. }) => {
+                        output_backlog.fetch_add(data.len(), Ordering::Relaxed);
                         if output_tx.send(data.to_vec()).is_err() {
                             break;
                         }
@@ -1503,6 +1571,8 @@ async fn run_session(
                     _ => {}
                 }
             }
+            // The UI freed space; loop around so the gate above reopens.
+            _ = output_space.notified() => {}
         }
     }
 
@@ -1761,6 +1831,7 @@ async fn open_vnc(
     session: &Arc<Handle<ClientHandler>>,
     host: &str,
     port: u16,
+    clients: Arc<AtomicUsize>,
 ) -> Result<(u16, tokio::task::JoinHandle<()>), String> {
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -1776,17 +1847,25 @@ async fn open_vnc(
             let Ok((mut socket, _)) = listener.accept().await else {
                 break;
             };
+            if clients.load(Ordering::Relaxed) >= VNC_MAX_CLIENTS {
+                // A viewer that reconnects in a loop must not spawn tasks
+                // without bound; dropping the socket closes it.
+                drop(socket);
+                continue;
+            }
             let session = Arc::clone(&session);
             let host = host.clone();
+            let clients = Arc::clone(&clients);
             tokio::spawn(async move {
-                let Ok(channel) = session
+                clients.fetch_add(1, Ordering::Relaxed);
+                if let Ok(channel) = session
                     .channel_open_direct_tcpip(host, port as u32, "127.0.0.1", 0)
                     .await
-                else {
-                    return;
-                };
-                let mut stream = channel.into_stream();
-                let _ = tokio::io::copy_bidirectional(&mut socket, &mut stream).await;
+                {
+                    let mut stream = channel.into_stream();
+                    let _ = tokio::io::copy_bidirectional(&mut socket, &mut stream).await;
+                }
+                clients.fetch_sub(1, Ordering::Relaxed);
             });
         }
     });
@@ -2553,7 +2632,18 @@ async fn copy_file(client: &SftpClient, from: &str, to: &str) -> Result<(), Stri
         .await
         .map_err(|err| format!("could not create '{to}': {err}"))?;
 
-    let copied = tokio::io::copy(&mut source, &mut destination).await;
+    let mut buffer = vec![0u8; TRANSFER_CHUNK];
+    let copied = loop {
+        match source.read(&mut buffer).await {
+            Ok(0) => break Ok(()),
+            Ok(read) => {
+                if let Err(err) = destination.write_all(&buffer[..read]).await {
+                    break Err(err);
+                }
+            }
+            Err(err) => break Err(err),
+        }
+    };
     let flushed = destination.flush().await;
     let closed_source = source.close().await;
     let closed_destination = destination.close().await;
@@ -2569,32 +2659,46 @@ async fn copy_file(client: &SftpClient, from: &str, to: &str) -> Result<(), Stri
 }
 
 async fn fetch_file(client: &SftpClient, remote: &str, local: &Path) -> Result<String, String> {
-    let mut source = client
-        .session
-        .open(remote)
-        .await
-        .map_err(|err| format!("could not open '{remote}' for reading: {err}"))?;
-    let mut destination = tokio::fs::File::create(local)
-        .await
-        .map_err(|err| format!("could not create '{}': {err}", local.display()))?;
-
-    let copied = tokio::io::copy(&mut source, &mut destination).await;
-    let flushed = destination.flush().await;
-    let closed_source = source.close().await;
-    drop(destination);
-
-    if let Err(err) = copied {
-        let _ = tokio::fs::remove_file(local).await;
-        return Err(format!("could not download '{remote}': {err}"));
+    // Reuse the chunked downloader so the editor path gets the same 64 KiB
+    // streaming, temp-file cleanup and atomic rename as a panel download.
+    let progress = TransferProgress::new(remote);
+    let part = local_temp_path(local);
+    if let Err(err) = download_file_inner(client, remote, local, &part, &progress).await {
+        let _ = tokio::fs::remove_file(&part).await;
+        return Err(err);
     }
-    flushed.map_err(|err| format!("could not finish writing '{}': {err}", local.display()))?;
-    closed_source.map_err(|err| format!("could not close '{remote}': {err}"))?;
     Ok(local.display().to_string())
 }
 
 /// Chunk size for streamed transfers. 64 KiB matches the SFTP read/write
 /// pipeline well without making cancellation feel unresponsive.
 const TRANSFER_CHUNK: usize = 64 * 1024;
+
+/// Distinguishes concurrent transfers aimed at the same target. Without it a
+/// manual transfer and an editor auto-upload share one `.part` path and
+/// overwrite each other mid-flight.
+static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Temp sibling for a remote target. It lives in the same directory so the
+/// final `rename` never crosses a filesystem boundary.
+fn remote_temp_path(target: &str) -> String {
+    format!(
+        "{target}.rustterm-{}-{}.part",
+        std::process::id(),
+        TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Temp sibling for a local download target.
+fn local_temp_path(target: &Path) -> PathBuf {
+    let mut name = target.as_os_str().to_os_string();
+    name.push(format!(
+        ".rustterm-{}-{}.part",
+        std::process::id(),
+        TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    PathBuf::from(name)
+}
 
 /// Message used when the SSH transport disappeared mid-transfer, instead of
 /// leaking library strings such as `sender dropped` into the status bar.
@@ -2767,12 +2871,50 @@ async fn upload_file(
     remote: &str,
     progress: &TransferProgress,
 ) -> Result<(), String> {
-    let part = format!("{remote}.part");
+    let part = remote_temp_path(remote);
     let result = upload_file_inner(client, local, remote, &part, progress).await;
     if result.is_err() {
         let _ = client.session.remove_file(&part).await;
     }
     result
+}
+
+/// Move `part` onto `target` without ever leaving `target` missing.
+///
+/// OpenSSH's `rename` replaces an existing file, but not every server allows
+/// that. In that case the old file is moved aside first and restored if the
+/// new one cannot be put in place — the previous version is never deleted
+/// before the replacement is known to have succeeded.
+async fn replace_remote_file(client: &SftpClient, part: &str, target: &str) -> Result<(), String> {
+    if let Err(first) = client.session.rename(part, target).await {
+        if !client.session.try_exists(target).await.unwrap_or(false) {
+            return Err(format!("could not finalise '{target}': {first}"));
+        }
+    } else {
+        return Ok(());
+    }
+
+    let backup = remote_temp_path(target);
+    client
+        .session
+        .rename(target, &backup)
+        .await
+        .map_err(|err| format!("could not move the existing '{target}' aside: {err}"))?;
+    match client.session.rename(part, target).await {
+        Ok(()) => {
+            let _ = client.session.remove_file(&backup).await;
+            Ok(())
+        }
+        Err(err) => {
+            if client.session.rename(&backup, target).await.is_ok() {
+                Err(format!("could not finalise '{target}': {err}"))
+            } else {
+                Err(format!(
+                    "could not finalise '{target}': {err} (the previous file is kept at '{backup}')"
+                ))
+            }
+        }
+    }
 }
 
 async fn upload_file_inner(
@@ -2829,20 +2971,10 @@ async fn upload_file_inner(
     }
     closed.map_err(|err| format!("could not close '{part}': {err}"))?;
 
-    // OpenSSH's rename overwrites, but not every server does. Retry once after
-    // removing the target so an overwrite never silently fails.
-    if let Err(err) = client.session.rename(part, remote).await {
-        if client.session.try_exists(remote).await.unwrap_or(false) {
-            let _ = client.session.remove_file(remote).await;
-            client
-                .session
-                .rename(part, remote)
-                .await
-                .map_err(|err| format!("could not finalise '{remote}': {err}"))?;
-        } else {
-            return Err(format!("could not finalise '{remote}': {err}"));
-        }
-    }
+    // OpenSSH's rename replaces, but not every server does. `replace_remote_file`
+    // moves the old file aside instead of deleting it, so a failed retry can
+    // never leave the destination empty.
+    replace_remote_file(client, part, remote).await?;
     Ok(())
 }
 
@@ -3044,9 +3176,7 @@ async fn download_file(
     local: &Path,
     progress: &TransferProgress,
 ) -> Result<(), String> {
-    let mut part_os = local.as_os_str().to_os_string();
-    part_os.push(".part");
-    let part = PathBuf::from(part_os);
+    let part = local_temp_path(local);
     let result = download_file_inner(client, remote, local, &part, progress).await;
     if result.is_err() {
         let _ = tokio::fs::remove_file(&part).await;
@@ -3524,6 +3654,22 @@ bob:x:1001:1001::/home/bob:/bin/sh
         assert_eq!(remote_file_name("/home/alice/"), "alice");
         assert_eq!(remote_file_name("report.txt"), "report.txt");
         assert_eq!(remote_file_name("/"), "/");
+    }
+
+    #[test]
+    fn temp_paths_are_unique_siblings() {
+        let remote_a = remote_temp_path("/home/alice/notes.txt");
+        let remote_b = remote_temp_path("/home/alice/notes.txt");
+        assert_ne!(remote_a, remote_b);
+        assert!(remote_a.starts_with("/home/alice/notes.txt."));
+        assert!(remote_a.ends_with(".part"));
+
+        let local_a = local_temp_path(Path::new("/tmp/notes.txt"));
+        let local_b = local_temp_path(Path::new("/tmp/notes.txt"));
+        assert_ne!(local_a, local_b);
+        assert_eq!(local_a.parent(), Some(Path::new("/tmp")));
+        assert!(local_a.to_string_lossy().starts_with("/tmp/notes.txt."));
+        assert!(local_a.to_string_lossy().ends_with(".part"));
     }
 
     #[test]

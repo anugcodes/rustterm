@@ -183,17 +183,8 @@ impl Settings {
             .map_err(|err| format!("could not encode settings: {err}"))?;
         let text = format!("# rustterm settings.\n\n{body}");
 
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|err| format!("could not create '{}': {err}", parent.display()))?;
-        }
-        let tmp = path.with_extension("toml.tmp");
-        fs::write(&tmp, text.as_bytes())
-            .map_err(|err| format!("could not write '{}': {err}", tmp.display()))?;
-        if let Err(err) = fs::rename(&tmp, path) {
-            let _ = fs::remove_file(&tmp);
-            return Err(format!("could not save '{}': {err}", path.display()));
-        }
+        crate::persist::atomic_write(path, text.as_bytes())
+            .map_err(|err| format!("could not save '{}': {err}", path.display()))?;
         Ok(())
     }
 }

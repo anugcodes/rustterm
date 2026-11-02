@@ -46,7 +46,7 @@ cargo build --no-default-features
 
 | ID | Sev | Status | Location | Issue | Fix |
 |----|-----|--------|----------|-------|-----|
-| P1 | Med | [ ] | `app.rs:683` | `sorted_indices` runs every frame and its name/owner comparators call `to_lowercase()` twice per comparison: O(n log n) allocations per frame. | Precompute lowercase sort keys once per listing change. |
+| P1 | Med | [x] | `app.rs:687` | `sorted_indices` ran every frame and its name/owner comparators called `to_lowercase()` twice per comparison: O(n log n) allocations per frame. | `cmp_lower` compares lowercase `char` iterators in place, so sorting allocates nothing; a test checks it matches `to_lowercase()` ordering, including a Unicode expansion. A key cache was avoided because it needs a listing revision and risks stale sorts. |
 | P2 | Med | [x] | `ssh.rs:3057+` | `copy_file`/`fetch_file` used `tokio::io::copy` (~8 KiB) while `TRANSFER_CHUNK` is 64 KiB. | Both paths now stream in 64 KiB chunks. |
 | P3 | Med | accepted | `terminal.rs:807` | The renderer rebuilds a `LayoutJob` for every visible row every frame. | **Not fixed here:** needs a profile first; a dirty-region cache is a large, risky change. Deferred to the restructuring roadmap. |
 | P4 | Low | accepted | `app.rs`, `sftp.rs`, `ssh.rs` | 150+ `.clone()` calls. | **Not fixed here:** most are required by ownership; auditing without a profile would be speculative. Deferred. |

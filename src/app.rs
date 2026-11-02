@@ -684,6 +684,16 @@ impl SftpSort {
     }
 }
 
+/// Case-insensitive ordering without allocating: `to_lowercase()` in a
+/// comparator allocated twice per comparison, which is O(n log n) allocations
+/// on every frame. `flat_map(char::to_lowercase)` produces the same sequence
+/// of characters without building a string.
+fn cmp_lower(a: &str, b: &str) -> std::cmp::Ordering {
+    a.chars()
+        .flat_map(char::to_lowercase)
+        .cmp(b.chars().flat_map(char::to_lowercase))
+}
+
 /// Indices of `entries` in display order: hidden files filtered out, folders
 /// first, then the active sort key.
 fn sorted_indices(entries: &[RemoteEntry], show_hidden: bool, sort: SftpSort) -> Vec<usize> {
@@ -698,10 +708,10 @@ fn sorted_indices(entries: &[RemoteEntry], show_hidden: bool, sort: SftpSort) ->
         // Folders always stay grouped above files, whatever the key.
         b.is_dir.cmp(&a.is_dir).then_with(|| {
             let order = match sort.key {
-                SftpSortKey::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                SftpSortKey::Name => cmp_lower(&a.name, &b.name),
                 SftpSortKey::Modified => a.modified.cmp(&b.modified),
                 SftpSortKey::Size => a.size.cmp(&b.size),
-                SftpSortKey::Owner => a.owner.to_lowercase().cmp(&b.owner.to_lowercase()),
+                SftpSortKey::Owner => cmp_lower(&a.owner, &b.owner),
             };
             let order = if sort.ascending {
                 order
@@ -709,7 +719,7 @@ fn sorted_indices(entries: &[RemoteEntry], show_hidden: bool, sort: SftpSort) ->
                 order.reverse()
             };
             // Stable, predictable order for equal keys.
-            order.then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            order.then_with(|| cmp_lower(&a.name, &b.name))
         })
     });
     indices
@@ -4056,9 +4066,9 @@ fn vnc_viewer_command(port: u16) -> Option<(&'static str, Vec<String>)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        sftp_header, sorted_indices, RemoteEntry, SftpColumns, SftpLayout, SftpSort, SftpSortKey,
-        COLUMN_STEP, MIN_MODIFIED_WIDTH, MIN_OWNER_WIDTH, MIN_SIZE_WIDTH, NAME_MIN_WIDTH,
-        TABLE_WIDTH,
+        cmp_lower, sftp_header, sorted_indices, RemoteEntry, SftpColumns, SftpLayout, SftpSort,
+        SftpSortKey, COLUMN_STEP, MIN_MODIFIED_WIDTH, MIN_OWNER_WIDTH, MIN_SIZE_WIDTH,
+        NAME_MIN_WIDTH, TABLE_WIDTH,
     };
     use crate::theme::ThemeId;
     use std::time::{Duration, SystemTime};
@@ -4257,6 +4267,16 @@ mod tests {
             names(&entries, &shown),
             ["Docs", "Alpha.txt", "z.bin", "beta.txt"]
         );
+    }
+
+    #[test]
+    fn case_insensitive_order_matches_lowercase_strings() {
+        let names = ["Zeta", "alpha", "İstanbul", "istanbul", "ALPHA"];
+        let mut by_helper = names;
+        by_helper.sort_by(|a, b| cmp_lower(a, b));
+        let mut by_string = names;
+        by_string.sort_by_key(|name| name.to_lowercase());
+        assert_eq!(by_helper, by_string);
     }
 
     #[test]

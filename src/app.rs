@@ -1190,7 +1190,13 @@ impl RustTermApp {
                     .terminal
                     .feed(b"\r\n\r\n--- reconnected ---\r\n\r\n");
                 session.connection_lost = false;
-                session.sftp = SftpExplorer::start(&session.ssh, &session.title);
+                // Keep unsynced editor copies: hand the old journal to the new
+                // explorer. Use the journal's own profile key because the tab
+                // title may have been changed by the remote shell's OSC title.
+                let journal = session.sftp.take_journal();
+                let profile = journal.profile().to_string();
+                session.sftp = SftpExplorer::start(&session.ssh, &profile);
+                session.sftp.install_journal(journal);
                 session.display.message = Some("Reconnected".to_string());
                 // Keep the stored config's x11 flag in sync with what was used.
                 session.config.x11 = state.config.x11;

@@ -2913,6 +2913,27 @@ mod tests {
     }
 
     #[test]
+    fn taking_a_journal_keeps_its_profile_and_pending_changes() {
+        let dir = TempDir::new("edit-journal-detach");
+        let local = dir.0.join("notes.txt");
+        std::fs::write(&local, "one").unwrap();
+        let mut explorer = SftpExplorer {
+            journal: EditJournal::for_profile("me@host:22"),
+            ..SftpExplorer::default()
+        };
+        explorer
+            .journal
+            .record(&local, "/remote/notes.txt", "notes.txt");
+
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&local, "two-two").unwrap();
+
+        let mut taken = explorer.take_journal();
+        assert_eq!(taken.profile(), "me@host:22");
+        assert_eq!(taken.pending(Instant::now()).len(), 1);
+    }
+
+    #[test]
     fn journal_is_only_installed_for_the_same_profile() {
         let mut explorer = SftpExplorer::default();
         let journal = EditJournal::for_profile("me@host:22");

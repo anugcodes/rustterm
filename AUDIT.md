@@ -64,11 +64,11 @@ cargo build --no-default-features
 
 | ID | Sev | Status | Location | Issue | Fix |
 |----|-----|--------|----------|-------|-----|
-| E1 | Med | [ ] | `README.md:9-14` | Status paragraph still says transfers and follow-`cd` are future work. | Rewrite to match the shipped feature set. |
-| E2 | Med | [ ] | `README.md:42-45` | Four shipped features are unchecked. | Tick follow-`cd`, drag-and-drop, edit/auto-upload, X11/VNC. |
-| E3 | Low | [ ] | `PLAN-ui-overhaul.md` | Completed plan still sits at the root. | Move to `docs/archive/` with an archived header. |
-| E4 | Low | [ ] | `handoff.md:623` | No roadmap entry for the planned module split. | Add `Post-MVP: codebase restructuring` under section 11. |
-| E5 | Med | [ ] | `.github/workflows/ci.yml` | CI runs only `fmt`, `clippy` (no `--all-targets`), and `build`; no tests, no `--no-default-features`. | Add the full gate above. |
+| E1 | Med | [x] | `README.md:9-17` | Status paragraph still said transfers and follow-`cd` were future work. | Rewritten to describe the shipped feature set. |
+| E2 | Med | [x] | `README.md:48-51` | Four shipped features were unchecked. | Follow-`cd`, drag-and-drop, edit/auto-upload and X11/VNC are ticked. |
+| E3 | Low | [x] | `docs/archive/PLAN-ui-overhaul.md` | Completed plan still sat at the root. | Moved with `git mv` and marked archived. |
+| E4 | Low | [x] | `handoff.md:693` | No roadmap entry for the planned module split. | Added `Post-MVP` item 14 with split order and deferred perf work. |
+| E5 | Med | [x] | `.github/workflows/ci.yml` | CI ran only `fmt`, `clippy` (no `--all-targets`) and `build`; no tests, no `--no-default-features`. | CI now runs `clippy --all-targets`, `test`, `test --no-default-features` and `build --no-default-features`. |
 
 ## Accepted code patterns (no change)
 

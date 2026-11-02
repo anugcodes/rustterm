@@ -1,9 +1,9 @@
 # UI overhaul plan
 
-Status: **done**
+Status: **done** (archived after the post-MVP audit; kept for history)
 
 This plan covers the SFTP side panel, the New Session page and a shared theme
-for the whole application. It is being implemented in small, compiling commits.
+for the whole application. It was implemented in small, compiling commits.
 
 ## 1. SFTP listing as a table
 

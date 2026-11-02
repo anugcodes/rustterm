@@ -688,6 +688,17 @@ through a `pty` so the byte sequences can be injected.
     into the window, Back/Forward behind a setting, SFTP `×` and the terminal
     Disconnect bar removed.
 
+### Post-MVP
+
+14. **Codebase restructuring.** Not started. `ssh.rs` (~3.9k lines) and
+    `sftp.rs` (~2.9k) carry several responsibilities. Split in this order and
+    keep the full gate green after each move: `ssh.rs` into connect/auth,
+    session I/O and transfer modules; `sftp.rs` into listing state and the
+    transfer queue; then optionally `terminal.rs`. Leave `app.rs` (~4.2k) alone
+    until it approaches 5–6k lines. Fold in the deferred performance work while
+    moving code: terminal row-layout caching (P3), the clone audit (P4) and a
+    shared `join_path` helper (D3). `AUDIT.md` records the current baseline.
+
 ---
 
 ## 12. Next step, concretely

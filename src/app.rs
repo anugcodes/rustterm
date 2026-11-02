@@ -56,9 +56,15 @@ const EDIT_SAFETY_MS: u64 = 5000;
 /// Repaint delay while a save event waits out the debounce (150 ms + margin).
 const EDIT_DEBOUNCE_MS: u64 = 170;
 
-/// Upper bound on remote bytes decoded in a single frame. This keeps a large
-/// burst from stalling the UI while still allowing tens of MiB/s sustained.
+/// Upper bound on remote bytes decoded per session in a single frame. This
+/// keeps a large burst from stalling the UI while still allowing tens of MiB/s
+/// sustained. Applied per session, with the visible tab drained first.
 const MAX_OUTPUT_PER_FRAME: usize = 256 * 1024;
+
+/// How long a VNC tunnel with no viewer process and no connected client is
+/// kept alive. Covers viewers that daemonise or hand off to an existing
+/// instance (e.g. `remmina -c`) and never connect in the spawning process.
+const VNC_TUNNEL_GRACE: Duration = Duration::from_secs(15);
 
 /// Wake egui from a background thread, but coalesce calls that arrive within
 /// ~8 ms so a fast link cannot flood the UI thread with repaint requests.
@@ -923,6 +929,10 @@ struct DisplayUi {
     message: Option<String>,
     /// External viewer process, kept so Stop can close it.
     viewer: Option<std::process::Child>,
+    /// When the viewer process was last seen exiting. The tunnel is stopped
+    /// only after [`VNC_TUNNEL_GRACE`] with no connected client, so a viewer
+    /// that hands off to an existing instance is not cut off.
+    viewer_exited_at: Option<Instant>,
 }
 
 impl Drop for DisplayUi {
@@ -3337,7 +3347,7 @@ impl RustTermApp {
         let theme = settings.theme.theme();
         let session = &mut self.sessions[index];
         let mut activity = false;
-        poll_display(session, &settings);
+        poll_display(session, &settings, ctx);
 
         // The bar is contextual: a lost connection needs a way out, and the
         // remote-display controls appear based on what the session actually
@@ -3800,7 +3810,7 @@ impl eframe::App for RustTermApp {
 }
 
 /// Process finished VNC probes and tunnel replies for one session.
-fn poll_display(session: &mut ActiveSession, settings: &Settings) {
+fn poll_display(session: &mut ActiveSession, settings: &Settings, ctx: &egui::Context) {
     if let Some(rx) = session.display.probe.take() {
         match rx.try_recv() {
             Ok(Ok(probe)) => {
@@ -3862,8 +3872,9 @@ fn poll_display(session: &mut ActiveSession, settings: &Settings) {
         }
     }
 
-    // When the viewer exits, tear the tunnel down too, so nothing is left
-    // listening once the desktop is closed.
+    // A viewer that exits is not necessarily finished: `remmina -c` and
+    // similar hand off to an already-running instance and return immediately.
+    // Stop the tunnel only after a grace period with no connected client.
     if session
         .display
         .viewer
@@ -3871,10 +3882,26 @@ fn poll_display(session: &mut ActiveSession, settings: &Settings) {
         .is_some_and(|child| child.try_wait().ok().flatten().is_some())
     {
         session.display.viewer = None;
-        let _ = session.ssh.vnc_close();
-        session.display.tunnel_port = None;
-        session.display.target = None;
-        session.display.message = Some("Viewer closed — VNC tunnel stopped".to_string());
+        session.display.viewer_exited_at = Some(Instant::now());
+    }
+    if let Some(exited) = session.display.viewer_exited_at {
+        if session.display.tunnel_port.is_none() {
+            session.display.viewer_exited_at = None;
+        } else if session.ssh.vnc_clients() > 0 {
+            // The viewer handed off to a running instance; keep the tunnel.
+            session.display.viewer_exited_at = None;
+        } else {
+            let waited = exited.elapsed();
+            if waited >= VNC_TUNNEL_GRACE {
+                session.display.viewer_exited_at = None;
+                let _ = session.ssh.vnc_close();
+                session.display.tunnel_port = None;
+                session.display.target = None;
+                session.display.message = Some("Viewer closed — VNC tunnel stopped".to_string());
+            } else {
+                ctx.request_repaint_after(VNC_TUNNEL_GRACE - waited);
+            }
+        }
     }
 }
 
@@ -3974,6 +4001,7 @@ fn stop_vnc(session: &mut ActiveSession) {
     session.display.tunnel_port = None;
     session.display.target = None;
     session.display.busy = false;
+    session.display.viewer_exited_at = None;
     session.display.message = Some("VNC tunnel closed".to_string());
 }
 

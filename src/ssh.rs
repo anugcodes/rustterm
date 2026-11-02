@@ -50,6 +50,11 @@ pub type Wake = Arc<dyn Fn() + Send + Sync>;
 /// tab of its per-frame drain budget.
 const OUTPUT_HIGH_WATER: usize = 2 * 1024 * 1024;
 
+/// Loopback viewers allowed through one VNC tunnel at a time. VNC uses two
+/// connections per viewer in some clients; the rest are refused (and closed)
+/// instead of spawning an unbounded number of tasks.
+const VNC_MAX_CLIENTS: usize = 8;
+
 #[derive(Clone)]
 pub struct SshConfig {
     pub host: String,
@@ -132,6 +137,9 @@ pub struct SshSession {
     x11: Arc<X11Shared>,
     /// Whether this session requested X11 forwarding at connect time.
     x11_requested: bool,
+    /// Live viewer connections on the current VNC tunnel. The app uses this to
+    /// tell "viewer exited" apart from "viewer handed off to a daemon".
+    vnc_clients: Arc<AtomicUsize>,
 }
 
 /// Flips `alive` to false and wakes egui when the session thread ends,
@@ -552,6 +560,7 @@ impl SshSession {
         let (output_tx, output_rx) = std_mpsc::channel::<Vec<u8>>();
         let output_backlog = Arc::new(AtomicUsize::new(0));
         let output_space = Arc::new(Notify::new());
+        let vnc_clients = Arc::new(AtomicUsize::new(0));
         let (sftp_tx, sftp_rx) = mpsc::unbounded_channel::<SftpRequest>();
         let (display_tx, display_rx) = mpsc::unbounded_channel::<DisplayRequest>();
         let session_wake = wake.clone();
@@ -561,6 +570,7 @@ impl SshSession {
         // The loop needs its own handles; the originals stay with `SshSession`.
         let thread_backlog = Arc::clone(&output_backlog);
         let thread_space = Arc::clone(&output_space);
+        let thread_vnc_clients = Arc::clone(&vnc_clients);
 
         std::thread::Builder::new()
             .name(format!("ssh-{}@{}", config.user, config.host))
@@ -573,6 +583,7 @@ impl SshSession {
                     session,
                     channel,
                     sftp,
+                    thread_vnc_clients,
                     SessionIo {
                         input_rx,
                         resize_rx,
@@ -602,6 +613,7 @@ impl SshSession {
             alive,
             x11,
             x11_requested: config.x11,
+            vnc_clients,
         })
     }
 
@@ -625,6 +637,11 @@ impl SshSession {
     /// Whether this session requested X11 forwarding at connect time.
     pub fn x11_requested(&self) -> bool {
         self.x11_requested
+    }
+
+    /// Number of viewer connections currently using the VNC tunnel.
+    pub fn vnc_clients(&self) -> usize {
+        self.vnc_clients.load(Ordering::Relaxed)
     }
 
     /// Look for a VNC listener on the server, creating one if requested.
@@ -1398,6 +1415,7 @@ async fn run_session(
     session: Arc<Handle<ClientHandler>>,
     mut channel: Channel<ClientMsg>,
     sftp: Option<SftpSession>,
+    vnc_clients: Arc<AtomicUsize>,
     io: SessionIo,
     wake: Option<Wake>,
 ) {
@@ -1495,7 +1513,7 @@ async fn run_session(
                         if let Some(tunnel) = vnc.take() {
                             tunnel.abort();
                         }
-                        match open_vnc(&session, &host, port).await {
+                        match open_vnc(&session, &host, port, Arc::clone(&vnc_clients)).await {
                             Ok((local_port, handle)) => {
                                 vnc = Some(handle);
                                 let _ = reply.send(Ok(local_port));
@@ -1806,6 +1824,7 @@ async fn open_vnc(
     session: &Arc<Handle<ClientHandler>>,
     host: &str,
     port: u16,
+    clients: Arc<AtomicUsize>,
 ) -> Result<(u16, tokio::task::JoinHandle<()>), String> {
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -1821,17 +1840,25 @@ async fn open_vnc(
             let Ok((mut socket, _)) = listener.accept().await else {
                 break;
             };
+            if clients.load(Ordering::Relaxed) >= VNC_MAX_CLIENTS {
+                // A viewer that reconnects in a loop must not spawn tasks
+                // without bound; dropping the socket closes it.
+                drop(socket);
+                continue;
+            }
             let session = Arc::clone(&session);
             let host = host.clone();
+            let clients = Arc::clone(&clients);
             tokio::spawn(async move {
-                let Ok(channel) = session
+                clients.fetch_add(1, Ordering::Relaxed);
+                if let Ok(channel) = session
                     .channel_open_direct_tcpip(host, port as u32, "127.0.0.1", 0)
                     .await
-                else {
-                    return;
-                };
-                let mut stream = channel.into_stream();
-                let _ = tokio::io::copy_bidirectional(&mut socket, &mut stream).await;
+                {
+                    let mut stream = channel.into_stream();
+                    let _ = tokio::io::copy_bidirectional(&mut socket, &mut stream).await;
+                }
+                clients.fetch_sub(1, Ordering::Relaxed);
             });
         }
     });

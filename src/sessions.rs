@@ -197,6 +197,8 @@ fn write_profiles(path: &Path, profiles: &[SessionProfile]) -> io::Result<()> {
         return Err(io::Error::other("no config directory available"));
     }
 
+    preserve_malformed(path)?;
+
     let file = SessionsFile {
         sessions: profiles.to_vec(),
     };
@@ -208,20 +210,23 @@ fn write_profiles(path: &Path, profiles: &[SessionProfile]) -> io::Result<()> {
     );
     text.push_str(&body);
 
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
     // Write next to the target, then rename, so a crash cannot leave a
     // half-written profile file. `rename` is atomic within one filesystem.
-    let tmp = path.with_extension("toml.tmp");
-    fs::write(&tmp, text.as_bytes())?;
-    if let Err(err) = fs::rename(&tmp, path) {
-        let _ = fs::remove_file(&tmp);
-        return Err(err);
-    }
+    crate::persist::atomic_write(path, text.as_bytes())
+}
 
-    Ok(())
+/// Keep a copy of a sessions file we could not parse before replacing it.
+///
+/// Loading reports the parse error but leaves the in-memory list empty, so the
+/// next save would otherwise discard the user's file wholesale.
+fn preserve_malformed(path: &Path) -> io::Result<()> {
+    let Ok(existing) = fs::read_to_string(path) else {
+        return Ok(()); // a missing file needs no backup
+    };
+    if toml::from_str::<SessionsFile>(&existing).is_ok() {
+        return Ok(());
+    }
+    fs::write(path.with_extension("toml.bak"), existing.as_bytes())
 }
 
 #[cfg(test)]
@@ -368,6 +373,20 @@ mod tests {
         let store = SessionStore::load(dir.file());
         assert!(store.profiles().is_empty());
         assert!(store.error().is_some());
+    }
+
+    #[test]
+    fn a_save_preserves_the_malformed_file_as_a_backup() {
+        let dir = TempDir::new();
+        let broken = "this is not toml = = =";
+        fs::write(dir.file(), broken).unwrap();
+
+        let mut store = SessionStore::load(dir.file());
+        store.upsert(profile("new", "example.com")).unwrap();
+
+        let backup = dir.file().with_extension("toml.bak");
+        assert_eq!(fs::read_to_string(backup).unwrap(), broken);
+        assert!(SessionStore::load(dir.file()).error().is_none());
     }
 
     #[test]

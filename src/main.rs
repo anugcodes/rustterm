@@ -1,5 +1,6 @@
 mod app;
 mod input;
+mod persist;
 mod secrets;
 mod sessions;
 mod settings;

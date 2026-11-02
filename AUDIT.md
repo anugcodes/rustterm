@@ -55,8 +55,8 @@ cargo build --no-default-features
 
 | ID | Sev | Status | Location | Issue | Fix |
 |----|-----|--------|----------|-------|-----|
-| S1 | Low | [ ] | `settings.rs`, `sessions.rs` | Writes use a fixed `.tmp` sibling and no fsync: concurrent instances collide, and a crash can lose the write. | Unique temp name per process + `sync_all` before rename. |
-| S2 | Low | [ ] | `sessions.rs` (load/save) | A malformed `sessions.toml` is reported but then overwritten wholesale on the next save. | Preserve the bad file as `sessions.toml.bak` before overwriting. |
+| S1 | Low | [x] | `persist.rs`, `settings.rs:171`, `sessions.rs:195` | Writes used a fixed `.tmp` sibling and no fsync: concurrent instances could collide, and a crash could lose the write. | Shared `atomic_write` uses a pid+counter temp name, `sync_all`, then rename. Tests cover replacement and temp cleanup. |
+| S2 | Low | [x] | `sessions.rs:224` | A malformed `sessions.toml` was reported but then overwritten wholesale on the next save. | `preserve_malformed` copies it to `sessions.toml.bak` before writing; test added. |
 | S3 | Low | accepted | `ssh.rs:2605` | `is_connection_loss` / `is_sftp_timeout` / `explain_connect_error` classify by substring. | **Accepted:** the libraries do not expose typed errors at our boundary; behaviour is covered by tests. Documented in code. |
 | S4 | Low | accepted | `secrets.rs` | Keyring passwords are never zeroized (handoff F19). | **Deferred:** zeroizing our copy is ineffective while `russh` also holds the password; needs a cross-cutting secret type, not a surgical fix. |
 

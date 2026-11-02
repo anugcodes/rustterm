@@ -179,12 +179,21 @@ impl VncTarget {
     }
 }
 
+/// What a VNC probe found: the target to tunnel to and the account's login
+/// shell, which decides how the bar sets `DISPLAY`.
+#[derive(Debug, Clone)]
+pub struct VncProbe {
+    pub target: Option<VncTarget>,
+    /// Login-shell path from `/etc/passwd`, or `$SHELL` as a fallback.
+    pub shell: Option<String>,
+}
+
 /// What the UI asks the session thread to do for remote display.
 enum DisplayAction {
     /// Find a VNC listener in the server's shell.
     Probe {
         auto_create: bool,
-        reply: std_mpsc::Sender<Result<Option<VncTarget>, String>>,
+        reply: std_mpsc::Sender<Result<VncProbe, String>>,
     },
     /// Open a local TCP listener tunneled to `host:port`.
     Open {
@@ -361,6 +370,18 @@ impl ShellKind {
             Self::Csh | Self::Tcsh => {
                 r#"if ( $?prompt ) alias cwdcmd 'printf "\033]7;file://%s\a" "$cwd"'; printf "\033]7;file://%s\a" "$cwd""#
             }
+        }
+    }
+
+    /// Text typed at a prompt to point the next command at `display`.
+    ///
+    /// `setenv` persists, which is why csh/tcsh cannot use the sh-family
+    /// `DISPLAY=:N` prefix. The trailing `; ` lets a command follow on the same
+    /// line, and pressing Enter on its own still sets the variable.
+    pub fn display_prefix(self, display: u16) -> String {
+        match self {
+            Self::Bash | Self::Zsh => format!("DISPLAY=:{display} "),
+            Self::Csh | Self::Tcsh => format!("setenv DISPLAY :{display}; "),
         }
     }
 }
@@ -586,10 +607,13 @@ impl SshSession {
     }
 
     /// Look for a VNC listener on the server, creating one if requested.
+    ///
+    /// The reply also carries the login shell so the bar can type the right
+    /// `DISPLAY` command for it.
     pub fn vnc_probe(
         &self,
         auto_create: bool,
-    ) -> Option<std_mpsc::Receiver<Result<Option<VncTarget>, String>>> {
+    ) -> Option<std_mpsc::Receiver<Result<VncProbe, String>>> {
         let (reply, rx) = std_mpsc::channel();
         self.display_tx
             .send(DisplayRequest {
@@ -1496,6 +1520,17 @@ async fn run_session(
     }
 }
 
+/// Look for a VNC session on the server and read the login shell.
+///
+/// The shell is detected on the same round trip the tunnel needs, so the bar
+/// already knows whether to type `setenv` or `DISPLAY=` by the time it can be
+/// clicked.
+async fn probe_vnc(session: &Handle<ClientHandler>, auto_create: bool) -> Result<VncProbe, String> {
+    let shell = probe_login_shell(session).await;
+    let target = probe_vnc_target(session, auto_create).await?;
+    Ok(VncProbe { target, shell })
+}
+
 /// Look for a VNC session on the server, in tiers.
 ///
 /// 1. `vncserver -list` — the user's own VNC sessions (TigerVNC/TightVNC/
@@ -1506,7 +1541,7 @@ async fn run_session(
 ///
 /// Returns `None` when nothing was found; the caller then falls back to the
 /// configured address.
-async fn probe_vnc(
+async fn probe_vnc_target(
     session: &Handle<ClientHandler>,
     auto_create: bool,
 ) -> Result<Option<VncTarget>, String> {
@@ -1557,6 +1592,32 @@ async fn probe_vnc(
         Some(err) => Err(err),
         None => Ok(None),
     }
+}
+
+/// Read the account's login shell through `/bin/sh`, falling back to `$SHELL`.
+///
+/// `getent` is not on every Unix, and a `.cshrc` may print a banner, so the
+/// output is parsed rather than trusted as a single line.
+async fn probe_login_shell(session: &Handle<ClientHandler>) -> Option<String> {
+    let output = run_remote_script(
+        session,
+        r#"s=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7); printf "%s\n" "${s:-$SHELL}""#,
+        8,
+    )
+    .await?;
+    parse_login_shell(&output)
+}
+
+/// Take the last path-like line of the shell lookup output.
+///
+/// Startup-file output may precede the answer, and only the answer starts with
+/// `/` (an absolute shell path).
+fn parse_login_shell(text: &str) -> Option<String> {
+    text.lines()
+        .map(str::trim)
+        // The answer is the last absolute path; startup output may precede it.
+        .rfind(|line| line.starts_with('/'))
+        .map(str::to_string)
 }
 
 /// Run a shell snippet on the server and return its output.
@@ -3596,6 +3657,28 @@ short:x:1
         assert_eq!(ShellKind::from_shell("/bin/sh"), None);
         assert_eq!(ShellKind::from_shell("/bin/fish"), None);
         assert_eq!(ShellKind::from_shell("bash"), Some(ShellKind::Bash));
+    }
+
+    #[test]
+    fn display_prefix_matches_the_shell() {
+        assert_eq!(ShellKind::Bash.display_prefix(1), "DISPLAY=:1 ");
+        assert_eq!(ShellKind::Zsh.display_prefix(12), "DISPLAY=:12 ");
+        assert_eq!(ShellKind::Csh.display_prefix(1), "setenv DISPLAY :1; ");
+        assert_eq!(ShellKind::Tcsh.display_prefix(2), "setenv DISPLAY :2; ");
+    }
+
+    #[test]
+    fn login_shell_output_ignores_startup_noise() {
+        assert_eq!(
+            parse_login_shell("banner from .cshrc\n/bin/csh\n").as_deref(),
+            Some("/bin/csh")
+        );
+        assert_eq!(
+            parse_login_shell("/usr/bin/zsh\r\n").as_deref(),
+            Some("/usr/bin/zsh")
+        );
+        assert_eq!(parse_login_shell(""), None);
+        assert_eq!(parse_login_shell("banner only\n"), None);
     }
 
     #[test]

@@ -38,7 +38,7 @@ open protocols.
 | 4 | SFTP side panel following the active session's path | **Done** — per-tab browsing, fixed-width Name/Modified/Size/Owner table (panel is a viewport, sortable headers, 24 px stepped columns), selection details strip, reconnect, right-click menu, hidden toggle, copy/paste, status bar with history. Follows the shell's `cd` via OSC 7 (default on, paused by manual navigation), with ‹/› history behind a setting, symlink following and a reversible shell hook for bash, zsh, csh and tcsh. |
 | 5 | Upload/download, drag & drop, progress | **Done** — file/folder upload and download with a serialised queue, conflict prompts, `.part`+rename safety, progress bar, drag & drop and cancel. |
 | 6 | Open remote file in local editor, auto-upload on save | **Done** — the **Open with…** picker downloads to a temp file, launches `$VISUAL`/`$EDITOR`, Zed, gvim, VS Code, the desktop default or a custom command, and uploads the file back to the same remote path on every save (opt-out checkbox). Saves arrive as debounced inotify events; unsynced copies survive a drop for 15 minutes and sync on reconnect or in a new session for the same profile. |
-| 7 | GUI tools via X11 forwarding (`ssh -X`) or VNC-over-tunnel | **Done** — untrusted X11 forwarding requested before the shell starts, server-opened channels proxied to the local X server with the local `xauth` cookie; VNC detected over `/bin/sh` (`ss`/`netstat`), tunneled with `direct-tcpip` to an external viewer, with an editable fallback address and Ask/Prefer behaviour. Both are off by default. |
+| 7 | GUI tools via X11 forwarding (`ssh -X`) or VNC-over-tunnel | **Done** — untrusted X11 forwarding requested before the shell starts, server-opened channels proxied to the local X server with the local `xauth` cookie; VNC detected over `/bin/sh` (`vncserver -list`/auto-create, then `ss`/`netstat`), tunneled with `direct-tcpip` to an external viewer, with an editable fallback address, Ask/Prefer behaviour and a login-shell-aware Run on :N. Both are off by default. |
 
 ---
 
@@ -680,9 +680,10 @@ through a `pty` so the byte sequences can be injected.
 11. X11 forwarding via system `ssh -X`. ✅ done — `x11-req` before the shell,
     server channels proxied with the local `xauth` cookie; status in the bottom
     bar.
-12. VNC over SSH tunnel + external viewer. ✅ done — probe via
-    `ss`/`netstat` through `/bin/sh`, `direct-tcpip` tunnel, viewer discovery,
-    editable fallback and Ask/Prefer X11/VNC.
+12. VNC over SSH tunnel + external viewer. ✅ done — vncserver-aware probe
+    and auto-create (then `ss`/`netstat`), `direct-tcpip` tunnel, viewer
+    discovery, editable fallback, Ask/Prefer X11/VNC, and a shell-aware
+    Run on :N.
 13. Settings window, decluttered tab/SFTP/terminal bars. ✅ done — theme moved
     into the window, Back/Forward behind a setting, SFTP `×` and the terminal
     Disconnect bar removed.

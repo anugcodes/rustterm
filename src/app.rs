@@ -35,7 +35,8 @@ use crate::sftp::{
     EditJournal, EditorChoice, SftpDialogKind, SftpExplorer, StatusKind,
 };
 use crate::ssh::{
-    ConflictPolicy, HostKeyPrompt, RemoteEntry, SshConfig, SshSession, VncTarget, Wake,
+    ConflictPolicy, HostKeyPrompt, RemoteEntry, ShellKind, SshConfig, SshSession, VncProbe,
+    VncTarget, Wake,
 };
 use crate::terminal::{TermAction, TerminalView};
 use crate::theme::{self, Theme, ThemeId};
@@ -911,12 +912,14 @@ struct DisplayUi {
     ask: bool,
     /// A probe or tunnel request is in flight.
     busy: bool,
-    probe: Option<std_mpsc::Receiver<Result<Option<VncTarget>, String>>>,
+    probe: Option<std_mpsc::Receiver<Result<VncProbe, String>>>,
     open: Option<std_mpsc::Receiver<Result<u16, String>>>,
     /// Local loopback port the external viewer connects to.
     tunnel_port: Option<u16>,
     /// VNC server the tunnel points at.
     target: Option<VncTarget>,
+    /// Login shell found by the probe, which decides the `DISPLAY` syntax.
+    shell: Option<ShellKind>,
     message: Option<String>,
     /// External viewer process, kept so Stop can close it.
     viewer: Option<std::process::Child>,
@@ -2170,6 +2173,8 @@ impl RustTermApp {
         let Some(session) = self.sessions.get_mut(index) else {
             return false;
         };
+        // "Enable now" types into the terminal, so it is only safe at a prompt.
+        let at_prompt = !session.terminal.is_alt_screen();
         // Split the borrow: the explorer mutates while the session only answers
         // requests.
         let (ssh, explorer) = (&session.ssh, &mut session.sftp);
@@ -2402,10 +2407,12 @@ impl RustTermApp {
                                 .color(theme.palette.muted),
                         );
                         if ui
-                            .add(egui::Button::new("Enable now").small())
-                            .on_hover_text(
-                                "At a shell prompt, runs a one-line snippet in this shell. It applies from the next prompt and is not saved.",
-                            )
+                            .add_enabled(at_prompt, egui::Button::new("Enable now").small())
+                            .on_hover_text(if at_prompt {
+                                "At a shell prompt, runs a one-line snippet in this shell. It applies from the next prompt and is not saved."
+                            } else {
+                                "Not available while a full-screen program is running"
+                            })
                             .clicked()
                         {
                             explorer.begin_session_hook(ssh);
@@ -3417,8 +3424,10 @@ impl RustTermApp {
                                     .small()
                                     .color(theme.palette.text),
                             );
-                            // Type `DISPLAY=:N ` into the shell so a GUI program
-                            // opens on the VNC desktop instead of nowhere.
+                            // Point the next command at the VNC desktop. The text
+                            // depends on the login shell: csh/tcsh need `setenv`,
+                            // bash/zsh use the temporary `DISPLAY=` prefix, and
+                            // `env` is the fallback when detection failed.
                             if let Some(display) = session
                                 .display
                                 .target
@@ -3429,20 +3438,23 @@ impl RustTermApp {
                                 // an alternate screen (vim, htop) is up the text
                                 // would go to that program instead.
                                 let at_prompt = !session.terminal.is_alt_screen();
+                                let prefix = match session.display.shell {
+                                    Some(kind) => kind.display_prefix(display),
+                                    None => format!("env DISPLAY=:{display} "),
+                                };
                                 if ui
                                     .add_enabled(
                                         at_prompt,
                                         egui::Button::new(format!("Run on :{display}")),
                                     )
                                     .on_hover_text(if at_prompt {
-                                        format!("Type \"DISPLAY=:{display} \" into the shell")
+                                        format!("Type \"{prefix}\" into the shell")
                                     } else {
                                         "Not available while a full-screen program is running"
                                             .to_string()
                                     })
                                     .clicked()
                                 {
-                                    let prefix = format!("DISPLAY=:{display} ");
                                     session.ssh.write(prefix.as_bytes().to_vec());
                                     session.display.message =
                                         Some(format!("Typed \"{prefix}\" — now type the command"));
@@ -3772,19 +3784,24 @@ impl eframe::App for RustTermApp {
 fn poll_display(session: &mut ActiveSession, settings: &Settings) {
     if let Some(rx) = session.display.probe.take() {
         match rx.try_recv() {
-            Ok(Ok(Some(found))) => {
-                session.display.target = Some(found.clone());
-                start_vnc_tunnel(session, found);
-            }
-            Ok(Ok(None)) => {
-                // Nothing was detected on the server: fall back to the
-                // configured address, which is the only way to reach a VNC
-                // server rustterm cannot see (a different host, for example).
-                let target = settings_vnc_target(settings);
-                session.display.message =
-                    Some(format!("No VNC session found — using {}", target.label()));
-                session.display.target = Some(target.clone());
-                start_vnc_tunnel(session, target);
+            Ok(Ok(probe)) => {
+                // Remember the login shell for the Run on :N button; an
+                // unsupported shell simply keeps the `env` fallback.
+                session.display.shell = probe.shell.as_deref().and_then(ShellKind::from_shell);
+                if let Some(found) = probe.target {
+                    session.display.target = Some(found.clone());
+                    start_vnc_tunnel(session, found);
+                } else {
+                    // Nothing was detected on the server: fall back to the
+                    // configured address, which is the only way to reach a VNC
+                    // server rustterm cannot see (a different host, for
+                    // example).
+                    let target = settings_vnc_target(settings);
+                    session.display.message =
+                        Some(format!("No VNC session found — using {}", target.label()));
+                    session.display.target = Some(target.clone());
+                    start_vnc_tunnel(session, target);
+                }
             }
             Ok(Err(err)) => {
                 // The probe reported a problem it cannot work around (for

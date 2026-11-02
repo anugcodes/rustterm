@@ -1170,3 +1170,58 @@ shell prompt from a full-screen program.
   display-number mapping, settings round trip and old-file defaults.
 - GUI / live-server checks: `USAGE.md` §19 and `TESTING.md` §2.10 (G1–G16).
   Not yet run.
+
+# Step: Shell-aware Run on :N and a prompt guard for Enable now
+
+## Why
+
+**Run on :N** typed `DISPLAY=:N `, which is bash/zsh syntax. The user's login
+shell is `/bin/csh`, where that text is rejected, so the quick action was
+broken on the very server VNC was built for.
+
+A first attempt used `env DISPLAY=:N `. That works when a command follows it,
+but on its own it sets the variable only for that one `env` call, so pressing
+Enter and then running a GUI program still failed. The persistent csh idiom is
+`setenv DISPLAY :N`, which the user confirmed works. There is no single
+persistent form valid in both families, so the login shell has to be known.
+
+**Enable now** (directory-tracking hint) types a snippet into the terminal but
+did not check whether a full-screen program owned it, so clicking it while
+`vim` or `htop` was open sent the snippet to that program.
+
+## What changed
+
+**`src/ssh.rs`.**
+- The VNC probe now returns `VncProbe { target, shell }`. The shell is read on
+  the same probe the bar already waits for, so it is known before **Run on :N**
+  can be clicked.
+- `probe_login_shell` runs through `/bin/sh`:
+  `getent passwd "$(id -un)"` for the seventh field, with `$SHELL` as the
+  fallback when `getent` is missing. `parse_login_shell` takes the last
+  path-like line, so a chatty `.cshrc` banner cannot confuse it.
+- `ShellKind::display_prefix`: `DISPLAY=:N ` for bash/zsh,
+  `setenv DISPLAY :N; ` for csh/tcsh.
+
+**`src/app.rs`.**
+- `DisplayUi` stores the detected `ShellKind`. The probe reply sets it, and an
+  unsupported shell keeps an `env DISPLAY=:N ` fallback.
+- **Run on :N** uses that prefix, and the hover text shows the exact text it
+  will type.
+- **Enable now** is disabled while `TerminalView::is_alt_screen()` is true, with
+  a hover reason, matching the existing guard on **Run on :N**.
+- No other code path emits shell syntax: the hook snippets were already chosen
+  by `ShellKind`, VNC detection already runs under `/bin/sh -c`, and rc edits
+  are SFTP writes.
+
+**Docs.** `USAGE.md` §14 and §19 describe the per-shell text and the disabled
+state; `TESTING.md` F15 and G15 match.
+
+## Verified
+
+- `cargo build` ✅
+- `cargo fmt --check` ✅
+- `cargo clippy --all-targets -- -D warnings` ✅
+- `cargo test` ✅ **112 passed** (default and `--no-default-features`)
+- New unit tests: `display_prefix` for all four shells, `parse_login_shell`
+  with startup-file noise and empty output.
+- Live csh check: pending `USAGE.md` §19 / `TESTING.md` G15.

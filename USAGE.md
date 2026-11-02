@@ -599,9 +599,10 @@ choices:
 
 - **Enable now** types a one-line snippet into the current shell. The login
   shell is detected first from `/etc/passwd`, then the matching hook is used:
-  bash `PROMPT_COMMAND`, zsh `precmd_functions`, or the csh/tcsh `cwdcmd` alias.
-  Nothing is written to disk. It takes effect at the next prompt. Pressing it
-  twice is harmless.
+  bash `PROMPT_COMMAND`, zsh `precmd_functions`, or the csh/tcsh `cwdcmd`
+  alias. Nothing is written to disk. It takes effect at the next prompt.
+  Pressing it twice is harmless. It is disabled while a full-screen program
+  (vim, htop) is running.
 - **Install…** detects your login shell from `/etc/passwd`, then asks before
   editing the startup file that shell actually reads: `~/.bashrc`, `~/.zshrc`,
   `~/.cshrc`, or `~/.tcshrc` when that file already exists (tcsh reads it
@@ -1063,12 +1064,24 @@ The external viewer is the first of `vncviewer`, `xtigervncviewer`,
 `gvncviewer`, or `remmina -c`. If none is installed, the tunnel stays up and
 the bar shows the copyable address (and notes that X11 is active when it is).
 
-**Run on :N** types `DISPLAY=:N ` into the shell, so the next command you type
-opens on the VNC desktop:
+**Run on :N** types the login shell's own way of setting `DISPLAY`. The VNC
+probe reads the login shell from `/etc/passwd` (falling back to `$SHELL`):
 
-```
-DISPLAY=:1 gvim notes.txt
-```
+- **bash / zsh** — `DISPLAY=:N `, which applies to the next command:
+  ```
+  DISPLAY=:1 gvim notes.txt
+  ```
+- **csh / tcsh** — `setenv DISPLAY :N; `, which persists for the rest of the
+  shell. Type a command after it, or press Enter on its own:
+  ```
+  setenv DISPLAY :1; gvim notes.txt
+  ```
+- **Anything else, or detection failed** — `env DISPLAY=:N `, which applies to
+  the next command.
+
+`DISPLAY=:N ` is bash/zsh syntax and csh rejects it; `env DISPLAY=:N` on its own
+sets the variable only for that one `env` call, so it does not survive to the
+next command in csh. That is why csh/tcsh get `setenv`.
 
 It is only typed — nothing is launched for you, and you can edit or delete it
 before pressing Enter. It is disabled while a full-screen program (vim,
@@ -1112,8 +1125,11 @@ the password set by `vncpasswd` on the server.
 - [ ] **No viewer**: temporarily hide the viewers from `PATH`, click
       **Display** → the bar shows `VNC tunnel ready at 127.0.0.1:<port>`;
       **Copy** copies it; with X11 active the message says so.
-- [ ] **Run on :N**: click **Run on :1** → `DISPLAY=:1 ` appears at the prompt;
-      type `xclock` and press Enter → the window opens in the VNC viewer.
+- [ ] **Run on :N**: in a bash/zsh login, click **Run on :1** → `DISPLAY=:1 `
+      appears at the prompt; type `xclock` and press Enter → the window opens in
+      the VNC viewer. In a csh/tcsh login the button types
+      `setenv DISPLAY :1; ` instead; type `xclock` → the same result, and later
+      GUI commands also use `:1` until you `unsetenv DISPLAY`.
 - [ ] **Both enabled, Ask**: click **Display** → the chooser appears; **X11**
       and **VNC** each do the right thing; **Cancel** closes it.
 - [ ] **Prefer X11 / Prefer VNC**: with both enabled, the matching path starts

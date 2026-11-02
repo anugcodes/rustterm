@@ -261,7 +261,9 @@ Use a scratch directory so nothing real is touched.
 - [ ] **F15 — hook hint and startup file.** In a session with no tracking, wait
       ~3 s at the first listing → the **Track the shell's folder?** strip
       appears. **×** hides it for that tab. **Enable now** types the snippet;
-      run `cd` → the panel follows and the strip is gone. Reopen a tab and
+      run `cd` → the panel follows and the strip is gone. With a full-screen
+      program (vim, htop) running the button is disabled and explains why.
+      Reopen a tab and
       choose **Install…** → the dialog names the detected shell and its startup
       file (`~/.bashrc`, `~/.zshrc`, `~/.cshrc`, or an existing `~/.tcshrc`);
       **Install** appends the marked block and creates
@@ -331,9 +333,13 @@ Use a scratch directory so nothing real is touched.
       editable address is used.
 - [ ] **G14 — missing vncpasswd.** Remove `~/.vnc/passwd` on the server, click
       **Display** → the bar says to run `vncpasswd`; nothing hangs.
-- [ ] **G15 — Run on :N.** Click **Run on :1** → `DISPLAY=:1 ` is typed at the
-      prompt; type `xclock` and press Enter → the window opens in the VNC
-      viewer. The button is disabled while a full-screen program is running.
+- [ ] **G15 — Run on :N.** In a bash/zsh login, click **Run on :1** →
+      `DISPLAY=:1 ` is typed; type `xclock` and press Enter → the window opens
+      in the VNC viewer. In a csh/tcsh login the same click types
+      `setenv DISPLAY :1; `; type `xclock` → the window opens, and a later GUI
+      command still targets `:1`. With an undetected shell (`fish`, or the
+      passwd lookup fails) the text falls back to `env DISPLAY=:1 `. The button
+      is disabled while a full-screen program is running.
 - [ ] **G16 — viewer exit.** Close the viewer window → the tunnel stops by
       itself and the bar clears.
 

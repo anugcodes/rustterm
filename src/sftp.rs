@@ -1384,15 +1384,19 @@ impl SftpExplorer {
         true
     }
 
-    /// Cancel the running transfer or drop everything still queued.
+    /// Cancel the running transfer, if any, and drop everything still queued.
     pub fn cancel_transfer(&mut self) -> bool {
+        let queued = self.queue.len();
+        self.queue.clear();
         if let Some(transfer) = &self.transfer {
             transfer.progress.cancel();
+            if queued > 0 {
+                self.status
+                    .info(format!("Cancelling 1 running and {queued} queued"));
+            }
             return true;
         }
-        let queued = self.queue.len();
         if queued > 0 {
-            self.queue.clear();
             self.status
                 .info(format!("Cancelled {queued} queued transfer(s)"));
             return true;
@@ -2495,6 +2499,34 @@ mod tests {
         assert_eq!(join_path("/", "etc"), "/etc");
         assert_eq!(join_path("", "etc"), "/etc");
         assert_eq!(join_path(".", "file"), "./file");
+    }
+
+    #[test]
+    fn cancelling_stops_the_running_transfer_and_clears_the_queue() {
+        let mut explorer = SftpExplorer::default();
+        let (tx, rx) = std_mpsc::channel();
+        let progress = Arc::new(TransferProgress::new("Uploading notes.txt"));
+        explorer.transfer = Some(ActiveTransfer {
+            progress: Arc::clone(&progress),
+            rx,
+            verb: "Uploaded",
+            upload: None,
+        });
+        for name in ["a.txt", "b.txt"] {
+            explorer.queue.push_back(TransferRequest {
+                label: format!("Uploading {name}"),
+                kind: TransferKind::UploadOne {
+                    local: PathBuf::from(name),
+                    remote: format!("/remote/{name}"),
+                },
+                policy: ConflictPolicy::Overwrite,
+            });
+        }
+        let _keep_tx = tx;
+
+        assert!(explorer.cancel_transfer());
+        assert!(progress.is_cancelled());
+        assert_eq!(explorer.queued_transfers(), 0);
     }
 
     #[test]

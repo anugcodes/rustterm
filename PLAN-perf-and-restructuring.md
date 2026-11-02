@@ -82,8 +82,11 @@ Status: **not started** — successor to `AUDIT.md` (all items resolved).
 - A short note in `handoff.md` after each step recording what moved and any
   perf delta measured.
 
-## Out of scope
+### Deferred perf work (not in scope for this restructuring)
 
-- New features.
-- Rewriting the terminal renderer.
-- Changing the SSH/SFTP wire protocol handling.
+- **Concurrency in transfers (P5)**: Process 4–8 files concurrently using
+  `tokio::task::JoinSet` to hide per-file round-trip latency. Feasible because
+  `SftpSession` methods take `&self`, but requires restructuring error
+  collection, conflict resolution, and directory pre-creation. Deferred because
+  it's a ~200-300 line change that belongs in the transfer module split.
+  See the AUDIT.md P5 entry (to be added).

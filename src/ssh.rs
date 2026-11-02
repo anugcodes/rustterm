@@ -3235,12 +3235,13 @@ async fn download_file_inner(
         }
     }
     drop(destination);
-    // Always close the remote handle; dropping it does not send CLOSE.
-    let closed = source.close().await;
+    // Fire-and-forget the close; don't block on server acknowledgment.
+    tokio::spawn(async move {
+        let _ = source.close().await;
+    });
     if let Some(err) = failure {
         return Err(err);
     }
-    closed.map_err(|err| format!("could not close '{remote}': {err}"))?;
     // `rename` replaces an existing file on Unix, so an overwrite is atomic.
     std::fs::rename(part, local)
         .map_err(|err| format!("could not finalise '{}': {err}", local.display()))

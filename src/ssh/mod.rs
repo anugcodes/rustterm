@@ -750,6 +750,21 @@ impl SshSession {
         Some(rx)
     }
 
+    /// Delete several entries, reporting how many succeeded.
+    pub fn sftp_delete_many(
+        &self,
+        paths: Vec<(String, bool)>,
+    ) -> Option<std_mpsc::Receiver<Result<String, String>>> {
+        let (reply, rx) = std_mpsc::channel();
+        self.sftp_tx
+            .send(SftpRequest {
+                action: SftpAction::DeleteMany { paths, reply },
+                wake: self.wake.clone(),
+            })
+            .ok()?;
+        Some(rx)
+    }
+
     pub fn sftp_create_dir(
         &self,
         path: &str,
@@ -761,6 +776,21 @@ impl SshSession {
                     path: path.to_string(),
                     reply,
                 },
+                wake: self.wake.clone(),
+            })
+            .ok()?;
+        Some(rx)
+    }
+
+    /// Download several files for the editor path in one operation.
+    pub fn sftp_fetch_many(
+        &self,
+        files: Vec<(String, PathBuf)>,
+    ) -> Option<std_mpsc::Receiver<Result<String, String>>> {
+        let (reply, rx) = std_mpsc::channel();
+        self.sftp_tx
+            .send(SftpRequest {
+                action: SftpAction::FetchMany { files, reply },
                 wake: self.wake.clone(),
             })
             .ok()?;
@@ -1008,6 +1038,11 @@ enum SftpAction {
         is_dir: bool,
         reply: std_mpsc::Sender<Result<String, String>>,
     },
+    DeleteMany {
+        /// Remote path and a directory hint for each entry.
+        paths: Vec<(String, bool)>,
+        reply: std_mpsc::Sender<Result<String, String>>,
+    },
     CreateDir {
         path: String,
         reply: std_mpsc::Sender<Result<String, String>>,
@@ -1020,6 +1055,10 @@ enum SftpAction {
     Fetch {
         remote: String,
         local: PathBuf,
+        reply: std_mpsc::Sender<Result<String, String>>,
+    },
+    FetchMany {
+        files: Vec<(String, PathBuf)>,
         reply: std_mpsc::Sender<Result<String, String>>,
     },
     Upload {
@@ -1102,6 +1141,28 @@ impl SftpAction {
                     .map(|()| path.clone());
                 let _ = reply.send(result);
             }
+            SftpAction::DeleteMany { paths, reply } => {
+                let total = paths.len();
+                let mut deleted = 0;
+                let mut failure = None;
+                for (path, is_dir) in paths {
+                    let is_dir = match client.session.symlink_metadata(&path).await {
+                        Ok(metadata) => metadata.file_type().is_dir(),
+                        Err(_) => is_dir,
+                    };
+                    match remove_tree(client, &path, is_dir).await {
+                        Ok(()) => deleted += 1,
+                        Err(err) => {
+                            failure.get_or_insert(err);
+                        }
+                    }
+                }
+                let result = match failure {
+                    None => Ok(format!("{deleted} items")),
+                    Some(err) => Err(format!("deleted {deleted} of {total} items: {err}")),
+                };
+                let _ = reply.send(result);
+            }
             SftpAction::CreateDir { path, reply } => {
                 let result = client
                     .session
@@ -1125,6 +1186,10 @@ impl SftpAction {
                 reply,
             } => {
                 let result = fetch_file(client, &remote, &local).await;
+                let _ = reply.send(result);
+            }
+            SftpAction::FetchMany { files, reply } => {
+                let result = fetch_files(client, files).await;
                 let _ = reply.send(result);
             }
             SftpAction::Upload {
@@ -1199,9 +1264,11 @@ impl SftpAction {
             }
             SftpAction::Rename { reply, .. }
             | SftpAction::Delete { reply, .. }
+            | SftpAction::DeleteMany { reply, .. }
             | SftpAction::CreateDir { reply, .. }
             | SftpAction::Copy { reply, .. }
             | SftpAction::Fetch { reply, .. }
+            | SftpAction::FetchMany { reply, .. }
             | SftpAction::Upload { reply, .. }
             | SftpAction::UploadOne { reply, .. }
             | SftpAction::Download { reply, .. } => send(reply),

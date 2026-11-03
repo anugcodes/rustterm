@@ -453,6 +453,35 @@ fn sftp_details_bar(ui: &mut egui::Ui, theme: &Theme, entry: &RemoteEntry, link:
     body(ui, &second, theme.palette.muted);
 }
 
+/// Two compact lines summarising a multi-row selection.
+fn sftp_multi_details_bar(ui: &mut egui::Ui, theme: &Theme, entries: &[RemoteEntry]) {
+    let folders = entries.iter().filter(|entry| entry.is_dir).count();
+    let files = entries.len() - folders;
+    let bytes: u64 = entries
+        .iter()
+        .filter(|entry| !entry.is_dir)
+        .map(|entry| entry.size)
+        .sum();
+    let mut second = format!("{files} files · {}", format_size(bytes));
+    if folders > 0 {
+        second = format!("{folders} folders · {second}");
+    }
+
+    let font = theme::body_font(theme);
+    let body = |ui: &mut egui::Ui, text: &str, color: egui::Color32| {
+        ui.add(
+            egui::Label::new(egui::RichText::new(text).font(font.clone()).color(color)).truncate(),
+        )
+        .on_hover_text(text);
+    };
+    body(
+        ui,
+        &format!("{} items selected", entries.len()),
+        theme.palette.text,
+    );
+    body(ui, &second, theme.palette.muted);
+}
+
 /// Latest SFTP message, operation state, queue depth and message history.
 fn sftp_status_bar(
     ui: &mut egui::Ui,
@@ -2271,9 +2300,15 @@ impl RustTermApp {
 
         let busy = explorer.is_busy();
         let selected = explorer.selected_entry().cloned();
+        let selected_count = explorer.selection_count();
         let can_up = !explorer.current.is_empty() && explorer.current != "/";
         let can_copy = selected.is_some() && !busy;
         let can_paste = explorer.clipboard.is_some() && !busy;
+        let download_tooltip = if selected_count > 1 {
+            format!("Download the {selected_count} selected entries…")
+        } else {
+            "Download the selected entry…".to_string()
+        };
 
         ui.horizontal_wrapped(|ui| {
             if theme::icon_button(
@@ -2348,13 +2383,14 @@ impl RustTermApp {
                 ui,
                 theme,
                 theme::icons::DOWNLOAD,
-                "Download the selected entry…",
-                selected.is_some() && !busy,
+                &download_tooltip,
+                selected_count > 0 && !busy,
             )
             .clicked()
             {
-                if let (Some(entry), Some(dir)) = (&selected, pick_download_folder()) {
-                    explorer.download_entries(ssh, std::slice::from_ref(entry), dir);
+                if let Some(dir) = pick_download_folder() {
+                    let entries = explorer.selected_entries();
+                    explorer.download_entries(ssh, &entries, dir);
                 }
                 activity = true;
             }
@@ -2391,12 +2427,21 @@ impl RustTermApp {
             .clicked()
             {
                 explorer.show_hidden = !explorer.show_hidden;
-                if !explorer.show_hidden
-                    && explorer
-                        .selected_entry()
-                        .is_some_and(|entry| entry.name.starts_with('.'))
-                {
-                    explorer.selected = None;
+                if !explorer.show_hidden {
+                    // Hidden rows cannot stay selected once they leave the
+                    // table.
+                    let entries = &explorer.entries;
+                    explorer.selected.retain(|&index| {
+                        entries.get(index).is_some_and(|e| !e.name.starts_with('.'))
+                    });
+                    let anchor_hidden = explorer.selection_anchor.is_some_and(|index| {
+                        entries
+                            .get(index)
+                            .is_some_and(|entry| entry.name.starts_with('.'))
+                    });
+                    if anchor_hidden {
+                        explorer.selection_anchor = None;
+                    }
                 }
                 activity = true;
             }
@@ -2585,21 +2630,23 @@ impl RustTermApp {
         enum RowAction {
             Navigate(String),
             FollowLink(RemoteEntry),
-            OpenWith(RemoteEntry),
+            Open(Vec<RemoteEntry>),
             Rename(RemoteEntry),
-            Delete(RemoteEntry),
+            Delete(Vec<RemoteEntry>),
             CopyPath(RemoteEntry),
             Paste(String),
-            Download(RemoteEntry),
+            Download(Vec<RemoteEntry>),
             UploadHere(String, bool),
         }
         let mut row_action: Option<RowAction> = None;
         let mut select_row: Option<usize> = None;
+        let mut toggle_row: Option<usize> = None;
+        let mut extend_row: Option<usize> = None;
 
         // Selected-entry summary. Declared before the table so the table keeps
         // the rest of the height, and after the status/transfer bars so it
         // stacks above them.
-        if let Some(entry) = &selected {
+        if selected.is_some() || selected_count > 1 {
             egui::TopBottomPanel::bottom(egui::Id::new(("sftp_details", index)))
                 .exact_height(theme.metrics.row_height * 2.0 + 6.0)
                 .frame(
@@ -2609,14 +2656,18 @@ impl RustTermApp {
                         .inner_margin(egui::Margin::symmetric(6.0, 2.0)),
                 )
                 .show_inside(ui, |ui| {
-                    let link = explorer.link_target(&entry.path);
-                    sftp_details_bar(ui, theme, entry, link);
+                    if let Some(entry) = &selected {
+                        let link = explorer.link_target(&entry.path);
+                        sftp_details_bar(ui, theme, entry, link);
+                    } else {
+                        sftp_multi_details_bar(ui, theme, &explorer.selected_entries());
+                    }
                 });
         }
 
         let row_height = theme.metrics.row_height;
         let table_width = TABLE_WIDTH;
-        egui::ScrollArea::horizontal()
+        let table_output = egui::ScrollArea::horizontal()
             .id_salt(("sftp_hscroll", index))
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -2651,7 +2702,7 @@ impl RustTermApp {
 
                             let entry_index = visible_indices[visible_index];
                             let entry = &explorer.entries[entry_index];
-                            let is_selected = explorer.selected == Some(entry_index);
+                            let is_selected = explorer.selected.contains(&entry_index);
                             let fill = if is_selected {
                                 theme.palette.selection
                             } else if response.hovered() {
@@ -2761,8 +2812,15 @@ impl RustTermApp {
                             }
 
                             let response = response.on_hover_text(details);
+                            let modifiers = ui.input(|i| i.modifiers);
                             if response.clicked() {
-                                select_row = Some(entry_index);
+                                if modifiers.ctrl || modifiers.command {
+                                    toggle_row = Some(entry_index);
+                                } else if modifiers.shift {
+                                    extend_row = Some(entry_index);
+                                } else {
+                                    select_row = Some(entry_index);
+                                }
                             }
                             if response.double_clicked() {
                                 if entry.is_symlink {
@@ -2770,33 +2828,63 @@ impl RustTermApp {
                                 } else if entry.is_dir {
                                     row_action = Some(RowAction::Navigate(entry.path.clone()));
                                 } else {
-                                    row_action = Some(RowAction::OpenWith(entry.clone()));
+                                    row_action = Some(RowAction::Open(vec![entry.clone()]));
                                 }
                             }
-                            if response.secondary_clicked() {
+                            // #6: a right-click selects the row it landed on
+                            // (keeping an existing multi-selection intact) and
+                            // opens the menu in the same frame.
+                            if response.secondary_clicked() && !is_selected {
                                 select_row = Some(entry_index);
                             }
                             response.context_menu(|ui| {
+                                // A right-click outside the selection acts on
+                                // the clicked row only; inside it, on the whole
+                                // selection.
+                                let targets: Vec<RemoteEntry> = if is_selected {
+                                    explorer.selected_entries()
+                                } else {
+                                    vec![entry.clone()]
+                                };
+                                let many = targets.len() > 1;
+                                let all_files = targets
+                                    .iter()
+                                    .all(|entry| !entry.is_dir && !entry.is_symlink);
+
                                 theme::menu_style(ui);
                                 // The header is the only variable-length text, so it is
                                 // truncated; fixed-width items alone would still let a
                                 // long filename widen the whole popup.
-                                ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(&entry.name).color(theme.palette.text),
+                                if many {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(format!(
+                                                "{} items selected",
+                                                targets.len()
+                                            ))
+                                            .color(theme.palette.text),
+                                        )
+                                        .truncate(),
+                                    );
+                                } else {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(&entry.name)
+                                                .color(theme.palette.text),
+                                        )
+                                        .truncate(),
                                     )
-                                    .truncate(),
-                                )
-                                .on_hover_text(&entry.path);
+                                    .on_hover_text(&entry.path);
+                                }
                                 ui.separator();
-                                if entry.is_symlink {
+                                if !many && entry.is_symlink {
                                     if theme::menu_item(ui, "Follow link", true, None).clicked() {
                                         row_action = Some(RowAction::FollowLink(entry.clone()));
                                         ui.close_menu();
                                     }
                                     ui.separator();
                                 }
-                                if entry.is_dir {
+                                if !many && entry.is_dir {
                                     if theme::menu_item(ui, "Open", true, None).clicked() {
                                         row_action = Some(RowAction::Navigate(entry.path.clone()));
                                         ui.close_menu();
@@ -2810,10 +2898,6 @@ impl RustTermApp {
                                     .clicked()
                                     {
                                         row_action = Some(RowAction::Paste(entry.path.clone()));
-                                        ui.close_menu();
-                                    }
-                                    if theme::menu_item(ui, "Download…", true, None).clicked() {
-                                        row_action = Some(RowAction::Download(entry.clone()));
                                         ui.close_menu();
                                     }
                                     if theme::menu_item(ui, "Upload files here…", true, None)
@@ -2830,29 +2914,54 @@ impl RustTermApp {
                                             Some(RowAction::UploadHere(entry.path.clone(), true));
                                         ui.close_menu();
                                     }
+                                }
+                                // Opening locally is only offered when every
+                                // selected row is a regular file: a folder has
+                                // nothing to open in an editor.
+                                if many {
+                                    if all_files {
+                                        let label = format!("Open {} files with…", targets.len());
+                                        if theme::menu_item(ui, &label, true, None).clicked() {
+                                            row_action = Some(RowAction::Open(targets.clone()));
+                                            ui.close_menu();
+                                        }
+                                    }
+                                } else if !entry.is_dir
+                                    && theme::menu_item(ui, "Open with…", true, None).clicked()
+                                {
+                                    row_action = Some(RowAction::Open(targets.clone()));
+                                    ui.close_menu();
+                                }
+
+                                let download = if many {
+                                    format!("Download {} items…", targets.len())
                                 } else {
-                                    if theme::menu_item(ui, "Open with…", true, None).clicked() {
-                                        row_action = Some(RowAction::OpenWith(entry.clone()));
-                                        ui.close_menu();
-                                    }
-                                    if theme::menu_item(ui, "Download…", true, None).clicked() {
-                                        row_action = Some(RowAction::Download(entry.clone()));
-                                        ui.close_menu();
-                                    }
-                                }
-                                if theme::menu_item(ui, "Rename…", true, None).clicked() {
-                                    row_action = Some(RowAction::Rename(entry.clone()));
+                                    "Download…".to_string()
+                                };
+                                if theme::menu_item(ui, &download, true, None).clicked() {
+                                    row_action = Some(RowAction::Download(targets.clone()));
                                     ui.close_menu();
                                 }
-                                if theme::menu_item(ui, "Copy path", true, None).clicked() {
-                                    row_action = Some(RowAction::CopyPath(entry.clone()));
-                                    ui.close_menu();
+                                if !many {
+                                    if theme::menu_item(ui, "Rename…", true, None).clicked() {
+                                        row_action = Some(RowAction::Rename(entry.clone()));
+                                        ui.close_menu();
+                                    }
+                                    if theme::menu_item(ui, "Copy path", true, None).clicked() {
+                                        row_action = Some(RowAction::CopyPath(entry.clone()));
+                                        ui.close_menu();
+                                    }
                                 }
                                 ui.separator();
-                                if theme::menu_item(ui, "Delete…", true, Some(theme.palette.danger))
+                                let delete = if many {
+                                    format!("Delete {} items…", targets.len())
+                                } else {
+                                    "Delete…".to_string()
+                                };
+                                if theme::menu_item(ui, &delete, true, Some(theme.palette.danger))
                                     .clicked()
                                 {
-                                    row_action = Some(RowAction::Delete(entry.clone()));
+                                    row_action = Some(RowAction::Delete(targets.clone()));
                                     ui.close_menu();
                                 }
                             });
@@ -2865,8 +2974,53 @@ impl RustTermApp {
             });
 
         if let Some(index) = select_row {
-            explorer.selected = Some(index);
+            explorer.select_row(index);
             activity = true;
+        }
+        if let Some(index) = toggle_row {
+            explorer.toggle_row(index);
+            activity = true;
+        }
+        if let Some(index) = extend_row {
+            explorer.extend_selection(index);
+            activity = true;
+        }
+
+        // Arrow keys move the selection while the table is hovered and no
+        // text field has focus, so typing a path is never hijacked.
+        if !visible_indices.is_empty()
+            && ui.rect_contains_pointer(table_output.inner_rect)
+            && ui.memory(|memory| memory.focused().is_none())
+        {
+            let extend = ui.input(|input| input.modifiers.shift);
+            let delta = ui.input(|input| {
+                if input.key_pressed(egui::Key::ArrowDown) {
+                    Some(1)
+                } else if input.key_pressed(egui::Key::ArrowUp) {
+                    Some(-1)
+                } else {
+                    None
+                }
+            });
+            if let Some(delta) = delta {
+                let position = explorer
+                    .selection_anchor
+                    .and_then(|anchor| visible_indices.iter().position(|&i| i == anchor));
+                let next = match position {
+                    Some(position) => (position as isize + delta)
+                        .clamp(0, visible_indices.len() as isize - 1)
+                        as usize,
+                    None if delta > 0 => 0,
+                    None => visible_indices.len() - 1,
+                };
+                let entry_index = visible_indices[next];
+                if extend {
+                    explorer.extend_selection(entry_index);
+                } else {
+                    explorer.select_row(entry_index);
+                }
+                activity = true;
+            }
         }
         if let Some(action) = row_action {
             match action {
@@ -2874,14 +3028,14 @@ impl RustTermApp {
                 RowAction::FollowLink(entry) => {
                     explorer.open_link(ssh, &entry);
                 }
-                RowAction::OpenWith(entry) => {
-                    explorer.begin_open_with(&entry);
+                RowAction::Open(entries) => {
+                    explorer.begin_open_with(&entries);
                 }
                 RowAction::Rename(entry) => {
                     explorer.begin_rename(&entry);
                 }
-                RowAction::Delete(entry) => {
-                    explorer.begin_delete(&entry);
+                RowAction::Delete(entries) => {
+                    explorer.begin_delete_many(&entries);
                 }
                 RowAction::CopyPath(entry) => {
                     ui.ctx().copy_text(entry.path.clone());
@@ -2892,9 +3046,9 @@ impl RustTermApp {
                 RowAction::Paste(path) => {
                     explorer.paste_into(ssh, path);
                 }
-                RowAction::Download(entry) => {
+                RowAction::Download(entries) => {
                     if let Some(dir) = pick_download_folder() {
-                        explorer.download_entries(ssh, std::slice::from_ref(&entry), dir);
+                        explorer.download_entries(ssh, &entries, dir);
                     }
                 }
                 RowAction::UploadHere(dir, folder) => {
@@ -2959,6 +3113,9 @@ impl RustTermApp {
             // The heading names the entry, so the body does not repeat
             // "Delete \"name\"?" a second time.
             SftpDialogKind::Delete { name, .. } => (format!("Delete “{name}”"), None),
+            SftpDialogKind::DeleteMany { names, .. } => {
+                (format!("Delete {} items", names.len()), None)
+            }
         };
 
         egui::Window::new(&title)
@@ -3039,6 +3196,32 @@ impl RustTermApp {
                             ui.colored_label(theme.palette.danger, err);
                         }
                     }
+                    SftpDialogKind::DeleteMany { names, .. } => {
+                        theme::callout_frame(theme, theme.palette.danger_soft).show(ui, |ui| {
+                            let warning = format!(
+                                "{} selected entries will be permanently deleted, including everything inside selected folders. This cannot be undone.",
+                                names.len()
+                            );
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(warning)
+                                        .color(theme.palette.danger),
+                                )
+                                .wrap(),
+                            );
+                        });
+                        ui.add_space(8.0);
+                        for name in names.iter().take(6) {
+                            theme::muted(ui, theme, name);
+                        }
+                        if names.len() > 6 {
+                            theme::muted(ui, theme, format!("…and {} more", names.len() - 6));
+                        }
+                        if let Some(err) = &dialog.error {
+                            ui.add_space(4.0);
+                            ui.colored_label(theme.palette.danger, err);
+                        }
+                    }
                 }
 
                 ui.add_space(theme.metrics.card_padding);
@@ -3046,9 +3229,14 @@ impl RustTermApp {
                     let primary = match &kind {
                         SftpDialogKind::Rename { .. } => "Rename",
                         SftpDialogKind::NewFolder { .. } => "Create",
-                        SftpDialogKind::Delete { .. } => "Delete",
+                        SftpDialogKind::Delete { .. } | SftpDialogKind::DeleteMany { .. } => {
+                            "Delete"
+                        }
                     };
-                    let primary_button = if matches!(kind, SftpDialogKind::Delete { .. }) {
+                    let primary_button = if matches!(
+                        kind,
+                        SftpDialogKind::Delete { .. } | SftpDialogKind::DeleteMany { .. }
+                    ) {
                         theme::danger_button(theme, primary)
                     } else {
                         theme::primary_button(theme, primary)
@@ -3210,6 +3398,12 @@ impl RustTermApp {
 
         let mut submit = false;
         let mut cancel = false;
+        let count = picker.entries.len();
+        let heading = if count == 1 {
+            format!("Open “{}”", picker.entries[0].name)
+        } else {
+            format!("Open {count} files")
+        };
 
         egui::Window::new("Open with")
             .id(egui::Id::new(("sftp_editor_picker", index)))
@@ -3222,7 +3416,7 @@ impl RustTermApp {
             .show(ctx, |ui| {
                 ui.set_width(theme::dialog_inner_width(theme));
                 ui.horizontal(|ui| {
-                    theme::modal_heading(ui, theme, &format!("Open “{}”", picker.entry.name));
+                    theme::modal_heading(ui, theme, &heading);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if theme::modal_close(ui) {
                             cancel = true;
@@ -3230,8 +3424,14 @@ impl RustTermApp {
                     });
                 });
                 ui.add_space(4.0);
-                theme::muted(ui, theme, "Download this file, then open it in:");
-                theme::modal_path(ui, theme, &picker.entry.path);
+                if count == 1 {
+                    theme::muted(ui, theme, "Download this file, then open it in:");
+                    theme::modal_path(ui, theme, &picker.entries[0].path);
+                } else {
+                    theme::muted(ui, theme, "Download these files, then open each in:");
+                    theme::modal_path(ui, theme, &picker.entries[0].path);
+                    theme::muted(ui, theme, format!("…and {} more", count - 1));
+                }
                 ui.add_space(10.0);
 
                 for choice in EditorChoice::ALL {
@@ -3254,11 +3454,13 @@ impl RustTermApp {
                         .hint_text("e.g. kate, nvim, /usr/local/bin/editor")
                         .desired_width(ui.available_width()),
                 );
-                ui.add_space(6.0);
-                ui.checkbox(
-                    &mut picker.auto_upload,
-                    "Upload changes automatically when the file is saved",
-                );
+                if count == 1 {
+                    ui.add_space(6.0);
+                    ui.checkbox(
+                        &mut picker.auto_upload,
+                        "Upload changes automatically when the file is saved",
+                    );
+                }
 
                 if let Some(err) = &picker.error {
                     ui.add_space(4.0);

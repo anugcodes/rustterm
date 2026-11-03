@@ -263,6 +263,19 @@ pub(crate) async fn fetch_file(
     Ok(local.display().to_string())
 }
 
+/// Download several files for the editor path. Stops at the first failure so a
+/// partial batch never gets opened as if it were complete.
+pub(crate) async fn fetch_files(
+    client: &SftpClient,
+    files: Vec<(String, PathBuf)>,
+) -> Result<String, String> {
+    let count = files.len();
+    for (remote, local) in files {
+        fetch_file(client, &remote, &local).await?;
+    }
+    Ok(format!("{count} files"))
+}
+
 /// Chunk size for streamed transfers. 64 KiB matches the SFTP read/write
 /// pipeline well without making cancellation feel unresponsive.
 const TRANSFER_CHUNK: usize = 64 * 1024;

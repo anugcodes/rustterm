@@ -51,7 +51,7 @@ impl EditorChoice {
 /// State for the "Open with…" dialog.
 #[derive(Debug, Clone)]
 pub struct EditorPicker {
-    pub entry: RemoteEntry,
+    pub entries: Vec<RemoteEntry>,
     pub choice: EditorChoice,
     pub custom: String,
     /// Re-upload the local copy whenever the editor saves it.
@@ -566,8 +566,11 @@ impl SftpExplorer {
     }
 
     /// Open the "Open with…" dialog for a file.
-    pub fn begin_open_with(&mut self, entry: &RemoteEntry) -> bool {
-        if entry.is_dir {
+    pub fn begin_open_with(&mut self, entries: &[RemoteEntry]) -> bool {
+        if entries.is_empty() {
+            return true;
+        }
+        if entries.iter().any(|entry| entry.is_dir) {
             self.status
                 .error("Folders cannot be opened in a local editor");
             return true;
@@ -576,7 +579,7 @@ impl SftpExplorer {
             return true;
         }
         self.editor_picker = Some(EditorPicker {
-            entry: entry.clone(),
+            entries: entries.to_vec(),
             choice: self.last_editor,
             custom: String::new(),
             auto_upload: self.last_auto_upload,
@@ -602,13 +605,11 @@ impl SftpExplorer {
         self.last_editor = picker.choice;
         self.last_auto_upload = picker.auto_upload;
         let custom = (picker.choice == EditorChoice::Custom).then(|| picker.custom.clone());
-        self.open_in_editor(
-            ssh,
-            &picker.entry,
-            picker.choice,
-            custom,
-            picker.auto_upload,
-        );
+        if picker.entries.len() > 1 {
+            self.open_many_in_editor(ssh, &picker.entries, picker.choice, custom);
+        } else if let Some(entry) = picker.entries.first() {
+            self.open_in_editor(ssh, entry, picker.choice, custom, picker.auto_upload);
+        }
         true
     }
 
@@ -671,6 +672,54 @@ impl SftpExplorer {
         );
         true
     }
+
+    /// Download several files and open each in `editor`.
+    ///
+    /// Auto-upload and the edit journal only track single files, so a batch
+    /// opens copies without watching them.
+    fn open_many_in_editor(
+        &mut self,
+        ssh: &SshSession,
+        entries: &[RemoteEntry],
+        editor: EditorChoice,
+        custom: Option<String>,
+    ) -> bool {
+        if entries.iter().any(|entry| entry.is_dir || entry.is_symlink) {
+            self.status
+                .error("Only regular files can be opened in an editor");
+            return true;
+        }
+        if !self.can_start_operation() {
+            return true;
+        }
+        let mut files = Vec::with_capacity(entries.len());
+        let mut locals = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let local = match temp_download_path(&entry.name) {
+                Ok(path) => path,
+                Err(err) => {
+                    self.status.error(err);
+                    return true;
+                }
+            };
+            files.push((entry.path.clone(), local.clone()));
+            locals.push(local);
+        }
+        let Some(rx) = ssh.sftp_fetch_many(files) else {
+            self.mark_unavailable(ssh);
+            return true;
+        };
+        self.start_operation(
+            format!("Downloading {} files…", entries.len()),
+            OnSuccess::LaunchEditors {
+                editor,
+                custom,
+                locals,
+            },
+            rx,
+        );
+        true
+    }
 }
 
 /// POSIX path join for remote entries.
@@ -693,7 +742,11 @@ fn temp_download_path(name: &str) -> Result<PathBuf, String> {
     Ok(directory.join(safe))
 }
 
-fn launch_editor(choice: EditorChoice, custom: Option<&str>, path: &Path) -> Result<(), String> {
+pub(super) fn launch_editor(
+    choice: EditorChoice,
+    custom: Option<&str>,
+    path: &Path,
+) -> Result<(), String> {
     let (program, args) = editor_command(choice, custom);
     let mut child = Command::new(&program)
         .args(args)

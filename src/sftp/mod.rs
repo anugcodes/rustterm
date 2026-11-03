@@ -5,7 +5,7 @@
 //! `ssh.rs`; this module tracks the current path, the last listing, clipboard
 //! contents, dialogs and the in-flight request or file operation.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc as std_mpsc;
@@ -119,6 +119,11 @@ pub enum SftpDialogKind {
         path: String,
         name: String,
         is_dir: bool,
+    },
+    DeleteMany {
+        /// Remote path and a directory hint for each selected entry.
+        paths: Vec<(String, bool)>,
+        names: Vec<String>,
     },
 }
 
@@ -295,7 +300,10 @@ pub struct SftpExplorer {
     /// Directory history behind Back/Forward.
     history: SftpHistory,
     pub entries: Vec<RemoteEntry>,
-    pub selected: Option<usize>,
+    /// Indices into `entries` that are selected in the table.
+    pub selected: BTreeSet<usize>,
+    /// Row a shift range extends from; also the keyboard cursor.
+    pub selection_anchor: Option<usize>,
     pub loading: bool,
     /// Set when the server has no SFTP subsystem; disables the controls until a
     /// reconnect succeeds.
@@ -378,6 +386,11 @@ enum OnSuccess {
         name: String,
         auto_upload: bool,
     },
+    LaunchEditors {
+        editor: EditorChoice,
+        custom: Option<String>,
+        locals: Vec<PathBuf>,
+    },
 }
 
 impl SftpExplorer {
@@ -453,7 +466,7 @@ impl SftpExplorer {
                     // Only a successful listing becomes part of history.
                     self.history.visit(&path, intent);
                     self.listed_path = path;
-                    self.selected = None;
+                    self.clear_selection();
                     self.loading = false;
                     // Keep an operation result visible; otherwise report the
                     // number of entries for this navigation.
@@ -522,7 +535,7 @@ impl SftpExplorer {
                         self.follow = false;
                         self.start_list(ssh, entry.path, NavIntent::User);
                     } else {
-                        self.begin_open_with(&entry);
+                        self.begin_open_with(std::slice::from_ref(&entry));
                     }
                     true
                 }
@@ -662,6 +675,20 @@ impl SftpExplorer {
                 name,
                 auto_upload,
             } => self.launch_local_copy(editor, custom, local, remote, name, auto_upload),
+            OnSuccess::LaunchEditors {
+                editor,
+                custom,
+                locals,
+            } => {
+                let count = locals.len();
+                for local in &locals {
+                    if let Err(err) = launch_editor(editor, custom.as_deref(), local) {
+                        self.status.error(err);
+                        return;
+                    }
+                }
+                self.status.success(format!("Opened {count} files"));
+            }
         }
     }
 
@@ -825,8 +852,60 @@ impl SftpExplorer {
         }
     }
 
+    /// The selected entry when exactly one row is selected.
     pub fn selected_entry(&self) -> Option<&RemoteEntry> {
-        self.selected.and_then(|index| self.entries.get(index))
+        if self.selected.len() != 1 {
+            return None;
+        }
+        self.selected
+            .iter()
+            .next()
+            .and_then(|&index| self.entries.get(index))
+    }
+
+    /// Every selected entry, in table order.
+    pub fn selected_entries(&self) -> Vec<RemoteEntry> {
+        self.selected
+            .iter()
+            .filter_map(|&index| self.entries.get(index))
+            .cloned()
+            .collect()
+    }
+
+    pub fn selection_count(&self) -> usize {
+        self.selected.len()
+    }
+
+    /// Replace the selection with one row and move the anchor there.
+    pub fn select_row(&mut self, index: usize) {
+        self.selected.clear();
+        self.selected.insert(index);
+        self.selection_anchor = Some(index);
+    }
+
+    /// Ctrl-click: add the row, or remove it if it was already selected.
+    pub fn toggle_row(&mut self, index: usize) {
+        if !self.selected.remove(&index) {
+            self.selected.insert(index);
+        }
+        self.selection_anchor = Some(index);
+    }
+
+    /// Shift-click: select the range from the anchor, replacing the selection.
+    pub fn extend_selection(&mut self, index: usize) {
+        let anchor = self.selection_anchor.unwrap_or(index);
+        let (low, high) = if anchor <= index {
+            (anchor, index)
+        } else {
+            (index, anchor)
+        };
+        self.selected = (low..=high).collect();
+        self.selection_anchor.get_or_insert(anchor);
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selected.clear();
+        self.selection_anchor = None;
     }
 
     /// Remember a remote entry for a later "Paste".
@@ -902,6 +981,31 @@ impl SftpExplorer {
                 is_dir: entry.is_dir,
             },
             name: entry.name.clone(),
+            error: None,
+        });
+        true
+    }
+
+    /// Confirm deletion of every selected entry in one dialog.
+    pub fn begin_delete_many(&mut self, entries: &[RemoteEntry]) -> bool {
+        if entries.is_empty() {
+            return true;
+        }
+        if entries.len() == 1 {
+            return self.begin_delete(&entries[0]);
+        }
+        if !self.can_start_operation() {
+            return true;
+        }
+        self.dialog = Some(SftpDialog {
+            kind: SftpDialogKind::DeleteMany {
+                paths: entries
+                    .iter()
+                    .map(|entry| (entry.path.clone(), entry.is_dir))
+                    .collect(),
+                names: entries.iter().map(|entry| entry.name.clone()).collect(),
+            },
+            name: format!("{} items", entries.len()),
             error: None,
         });
         true
@@ -999,6 +1103,20 @@ impl SftpExplorer {
                 };
                 self.start_operation(
                     format!("Deleting {name}…"),
+                    OnSuccess::Refresh { verb: "Deleted" },
+                    rx,
+                );
+            }
+            SftpDialogKind::DeleteMany { paths, names } => {
+                let count = names.len();
+                let Some(rx) = ssh.sftp_delete_many(paths) else {
+                    dialog.error = Some("the SFTP session is no longer available".to_string());
+                    self.dialog = Some(dialog);
+                    self.mark_unavailable(ssh);
+                    return true;
+                };
+                self.start_operation(
+                    format!("Deleting {count} items…"),
                     OnSuccess::Refresh { verb: "Deleted" },
                     rx,
                 );
@@ -1233,6 +1351,55 @@ impl SftpExplorer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn entry(name: &str, is_dir: bool) -> RemoteEntry {
+        RemoteEntry {
+            name: name.to_string(),
+            path: format!("/tmp/{name}"),
+            is_dir,
+            is_symlink: false,
+            size: 0,
+            owner: "alice".to_string(),
+            permissions: None,
+            modified: None,
+        }
+    }
+
+    #[test]
+    fn selection_replaces_toggles_and_extends() {
+        let mut explorer = SftpExplorer {
+            entries: vec![entry("a", false), entry("b", false), entry("c", true)],
+            ..SftpExplorer::default()
+        };
+
+        explorer.select_row(1);
+        assert_eq!(explorer.selected_entries().len(), 1);
+        assert_eq!(explorer.selected_entry().unwrap().name, "b");
+
+        explorer.toggle_row(0);
+        assert_eq!(explorer.selection_count(), 2);
+        // More than one row: no single "selected entry".
+        assert!(explorer.selected_entry().is_none());
+
+        explorer.toggle_row(0);
+        assert_eq!(explorer.selection_count(), 1);
+
+        // Shift extends from the last plain click (row 1).
+        explorer.select_row(1);
+        explorer.extend_selection(2);
+        assert_eq!(
+            explorer
+                .selected_entries()
+                .iter()
+                .map(|e| &e.name)
+                .collect::<Vec<_>>(),
+            ["b", "c"]
+        );
+
+        explorer.clear_selection();
+        assert_eq!(explorer.selection_count(), 0);
+        assert!(explorer.selection_anchor.is_none());
+    }
 
     #[test]
     fn history_records_moves_and_drops_duplicates() {

@@ -6,13 +6,15 @@
 
 A fast, lightweight, native Linux alternative to MobaXterm. SSH terminal tabs with an SFTP side panel that follows your session. Written in Rust.
 
-> **Status:** feature-complete MVP. SSH terminal tabs with 256-colour output,
-> scrollback, copy/paste, mouse reporting, TOFU host keys, saved profiles,
-> keyring/key/agent auth and an SFTP side panel are done. The panel follows the
-> shell's `cd`, supports recursive drag-and-drop upload/download with a queue and
-> conflict prompts, and edit-and-auto-upload survives reconnects. X11 forwarding
-> and a VNC tunnel cover remote GUI tools. Remaining work, including the planned
-> module restructuring, is tracked in `handoff.md`.
+> **Status:** **v1.0.0**. SSH terminal tabs with 256-colour output, scrollback,
+> copy/paste, mouse reporting, TOFU host keys, saved profiles, keyring/key/agent
+> auth and an SFTP side panel are done. The panel follows the shell's `cd`,
+> supports recursive drag-and-drop upload/download with a queue and conflict
+> prompts, edit-and-auto-upload surviving reconnects, multi-select with bulk
+> download/delete/open, a Permissions column, and a bundled JetBrains Mono
+> terminal font. X11 forwarding and a VNC tunnel cover remote GUI tools. The
+> post-1.0 roadmap (permissions editor, macros/plugins, concurrent transfers, …)
+> is in `handoff.md` §11.15 and `ROADMAP.md`.
 
 ## Screenshots
 
@@ -29,8 +31,10 @@ _(coming soon)_
 - [x] Host-key verification (TOFU) against `~/.ssh/known_hosts`
 - [x] Saved profiles + optional system-keyring passwords
 - [x] Public-key and ssh-agent authentication
-- [x] SFTP side panel per session: **Name / Owner / Modified / Size** table with
-      header-only column resizing
+- [x] SFTP side panel per session: **Name / Modified / Size / Owner /
+      Permissions** table with header-only column resizing, multi-select
+      (Ctrl/Shift), bulk download/delete/open, and a bundled JetBrains Mono
+      terminal font
 - [x] SFTP message status bar with history and per-operation progress
 - [x] SFTP reconnect without dropping the terminal
 - [x] SFTP rename, delete, new folder, copy/paste and file operations

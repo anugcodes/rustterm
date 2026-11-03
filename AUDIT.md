@@ -70,7 +70,7 @@ cargo build --no-default-features
 | E4 | Low | [x] | `handoff.md:693` | No roadmap entry for the planned module split. | Added `Post-MVP` item 14 with split order and deferred perf work. |
 | E5 | Med | [x] | `.github/workflows/ci.yml` | CI ran only `fmt`, `clippy` (no `--all-targets`) and `build`; no tests, no `--no-default-features`. | CI now runs `clippy --all-targets`, `test`, `test --no-default-features` and `build --no-default-features`. |
 
-| P5 | Med | deferred | `ssh.rs:2883,3283` | Recursive transfers process files sequentially; per-file round-trip latency dominates for folders with many small files. | Process 4–8 files concurrently via `tokio::task::JoinSet`. Feasible (`SftpSession` takes `&self`) but requires restructuring error collection, conflict resolution, and directory pre-creation. Deferred to the transfer module split. |
+| P5 | Med | deferred | `src/ssh/transfer.rs` | Recursive transfers process files sequentially; per-file round-trip latency dominates for folders with many small files. | Process 4–8 files concurrently via `tokio::task::JoinSet`. Feasible (`SftpSession` takes `&self`) but requires restructuring error collection, conflict resolution, and directory pre-creation. Deferred to the 1.1 roadmap. |
 
 - `terminal.rs` `input_tx.lock().unwrap()`: the mutex is never held across a
   panic path; recovering from poisoning would hide real bugs.

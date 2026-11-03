@@ -690,7 +690,22 @@ through a `pty` so the byte sequences can be injected.
 
 ### Post-MVP
 
-14. **Codebase restructuring.** Not started. `ssh.rs` (~3.9k lines) and
+14. **Codebase restructuring.** ✅ done — `ssh.rs` (4060 lines) split into
+    `src/ssh/{mod,connect,session,transfer,vnc}.rs` (commit `afb6921`); `sftp.rs`
+    (3019 lines) split into `src/sftp/{mod,paths,edit,transfer}.rs` (commits
+    `4f833bd`, `1451389`, `75a8a18`); full gate green after each cut. `app.rs`
+    left as-is pending the 1.1 work.
+
+15. **Post-1.0 roadmap.** Planned for 1.1+:
+    - Permissions editor (chmod): `SftpSession::set_metadata` + `FileAttributes::permissions`
+      are available in `russh-sftp 3.0.1`; column already ships in 1.0.
+    - Macros / plugin support (remote command templates, reusable snippets).
+    - Concurrent transfers (P5): parallelise recursive uploads/downloads.
+    - Terminal performance: dirty-region redraw, background terminal thread.
+    - SFTP QoL: rename/move across folders, in-panel search, drag reorder.
+    - Settings UI: font and colour-palette pickers.
+    - P4 clone audit + F19 in-memory zeroization + splitting `app.rs` (~5k lines).
+    - `~/.ssh/config` import.
     `sftp.rs` (~2.9k) carry several responsibilities. Split in this order and
     keep the full gate green after each move: `ssh.rs` into connect/auth,
     session I/O and transfer modules; `sftp.rs` into listing state and the

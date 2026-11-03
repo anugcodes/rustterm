@@ -193,6 +193,31 @@ remote palettes).
 - [ ] The 24-step grey ramp is smooth:
       `for i in $(seq 232 255); do printf "\033[48;5;${i}m "; done; printf '\033[0m\n'`
 
+### Colour diagnostics — when a prompt is not coloured
+
+rustterm requests `xterm-256color` at connect time and parses the full named and
+256-colour palette (`src/ssh/connect.rs`, `src/terminal.rs`). That `ls --color=auto`
+shows blue folders proves the ANSI escapes reach the emulator and are rendered,
+so a missing colour in the prompt itself is **not** a rustterm bug.
+
+The prompt is printed by the remote shell, and it only adds colour when its own
+configuration says so:
+
+- `ash` / BusyBox / Dash print a plain prompt by default. A colourful prompt
+  requires `PS1` to contain colour escapes, e.g. `PS1='\\[\\033[1;32m\\]\\u@\\h\\$\\[\\033[0m\\] '`.
+- Bash reads `.bashrc` only for interactive non-login shells. A login shell
+  (what rustterm usually starts) reads `.bash_profile`/`.profile`, which often
+  does not source `.bashrc`, so `.bashrc` colours are never applied. Add
+  `source ~/.bashrc` to `.bash_profile`, or set `PS1` in `.bash_profile`.
+- zsh reads `.zshrc` for interactive shells; make sure the colour setup lives
+  there rather than in `.zprofile`.
+
+To check the active shell and prompt: `echo "$SHELL"; echo "$PS1"; echo "$TERM"`.
+`$TERM` should be `xterm-256color`. If it is not, the shell or a startup file
+is overriding it; remove the override. To test the palette directly, paste
+`printf '\\033[31mred\\033[0m \\033[32mgreen\\033[0m \\033[34mblue\\033[0m\\n'`
+into the terminal — all three words should be coloured.
+
 ## 9. Mouse reporting — [U]
 
 **How:** when the remote program enables xterm mouse reporting (`?1000` press /

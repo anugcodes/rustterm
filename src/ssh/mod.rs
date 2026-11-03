@@ -321,6 +321,8 @@ pub struct RemoteEntry {
     /// Best-effort owner name: `/etc/passwd` lookup, then the name supplied by
     /// the server, then the numeric UID.
     pub owner: String,
+    /// POSIX mode bits as reported by the server, including the file-type bits.
+    pub permissions: Option<u32>,
     pub modified: Option<SystemTime>,
 }
 
@@ -1558,6 +1560,7 @@ async fn remote_list(client: &SftpClient, path: &str) -> Result<Vec<RemoteEntry>
             is_symlink: file_type.is_symlink(),
             size: metadata.len(),
             owner: owner_name(owners, metadata.uid, metadata.user.as_deref()),
+            permissions: metadata.permissions,
             modified: metadata.modified().ok(),
         });
     }

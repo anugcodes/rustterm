@@ -123,6 +123,32 @@ pub fn format_owner(entry: &RemoteEntry) -> &str {
     }
 }
 
+/// `drwxr-xr-x`-style mode string for the permissions column.
+///
+/// Servers may omit the attribute; the column then shows an em dash instead of
+/// pretending the file has a mode.
+pub fn format_permissions(entry: &RemoteEntry) -> String {
+    let Some(mode) = entry.permissions else {
+        return "—".to_string();
+    };
+    let kind = if entry.is_symlink {
+        'l'
+    } else if entry.is_dir {
+        'd'
+    } else {
+        '-'
+    };
+    let mut text = String::with_capacity(10);
+    text.push(kind);
+    for shift in [6, 3, 0] {
+        let bits = (mode >> shift) & 0o7;
+        text.push(if bits & 0o4 != 0 { 'r' } else { '-' });
+        text.push(if bits & 0o2 != 0 { 'w' } else { '-' });
+        text.push(if bits & 0o1 != 0 { 'x' } else { '-' });
+    }
+    text
+}
+
 /// Reject names that cannot be a single path component.
 pub fn validate_name(name: &str) -> Result<(), String> {
     let name = name.trim();
@@ -171,6 +197,7 @@ mod tests {
             is_symlink: false,
             size: 0,
             owner: "alice".to_string(),
+            permissions: None,
             modified: None,
         }
     }
@@ -277,6 +304,25 @@ mod tests {
         assert_eq!(stamp.len(), "1970-01-01 00:00".len());
         assert!(stamp.contains('-'));
         assert!(stamp.contains(':'));
+    }
+
+    #[test]
+    fn formats_permission_bits() {
+        let mut file = entry("notes.txt", false);
+        file.permissions = Some(0o644);
+        assert_eq!(format_permissions(&file), "-rw-r--r--");
+
+        let mut folder = entry("src", true);
+        folder.permissions = Some(0o755);
+        assert_eq!(format_permissions(&folder), "drwxr-xr-x");
+
+        let mut link = entry("link", false);
+        link.is_symlink = true;
+        link.permissions = Some(0o777);
+        assert_eq!(format_permissions(&link), "lrwxrwxrwx");
+
+        let missing = entry("unknown", false);
+        assert_eq!(format_permissions(&missing), "—");
     }
 
     #[test]

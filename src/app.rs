@@ -31,8 +31,8 @@ use crate::secrets;
 use crate::sessions::{SessionProfile, SessionStore};
 use crate::settings::{DisplayPref, Settings};
 use crate::sftp::{
-    command_available, editor_program, format_age, format_owner, format_size, format_timestamp,
-    EditJournal, EditorChoice, SftpDialogKind, SftpExplorer, StatusKind,
+    command_available, editor_program, format_age, format_owner, format_permissions, format_size,
+    format_timestamp, EditJournal, EditorChoice, SftpDialogKind, SftpExplorer, StatusKind,
 };
 use crate::ssh::{
     ConflictPolicy, HostKeyPrompt, RemoteEntry, ShellKind, SshConfig, SshSession, VncProbe,
@@ -279,8 +279,8 @@ fn tab_button(
 
 /// Column layout of the SFTP table, persisted per session.
 ///
-/// Columns are ordered **Name, Modified, Size, Owner** and each one owns a
-/// fixed number of pixels on a table canvas that never changes width. The side
+/// Columns are ordered **Name, Modified, Size, Owner, Permissions** and each one
+/// owns a fixed number of pixels on a table canvas that never changes width. The side
 /// panel is only a viewport on top of that canvas: resizing it clips or reveals
 /// the table instead of reflowing it. Dividers move in whole `COLUMN_STEP`
 /// pixels rather than following the pointer freely.
@@ -290,6 +290,7 @@ struct SftpColumns {
     modified: f32,
     size: f32,
     owner: f32,
+    permissions: f32,
 }
 
 /// Width of the table canvas, in pixels.
@@ -297,16 +298,17 @@ struct SftpColumns {
 /// This is deliberately independent of the side panel: the panel may shrink
 /// below it (the table then scrolls horizontally) or grow past it (blank space
 /// appears to the right), but the columns themselves never move.
-const TABLE_WIDTH: f32 = 430.0;
+const TABLE_WIDTH: f32 = 560.0;
 
 impl Default for SftpColumns {
     fn default() -> Self {
-        // `Name` gets half the canvas; the metadata columns share the rest.
+        // `Name` gets the largest share; the metadata columns split the rest.
         Self {
-            name: TABLE_WIDTH * 0.50,
-            modified: TABLE_WIDTH * 0.22,
+            name: TABLE_WIDTH * 0.42,
+            modified: TABLE_WIDTH * 0.18,
             size: TABLE_WIDTH * 0.10,
-            owner: TABLE_WIDTH * 0.18,
+            owner: TABLE_WIDTH * 0.14,
+            permissions: TABLE_WIDTH * 0.16,
         }
     }
 }
@@ -315,28 +317,38 @@ const NAME_MIN_WIDTH: f32 = 90.0;
 const MIN_MODIFIED_WIDTH: f32 = 64.0;
 const MIN_SIZE_WIDTH: f32 = 36.0;
 const MIN_OWNER_WIDTH: f32 = 44.0;
+const MIN_PERMISSIONS_WIDTH: f32 = 72.0;
 /// A divider only ever moves by this many pixels per step.
 const COLUMN_STEP: f32 = 24.0;
 
-const COLUMN_MINS: [f32; 4] = [
+const COLUMN_MINS: [f32; 5] = [
     NAME_MIN_WIDTH,
     MIN_MODIFIED_WIDTH,
     MIN_SIZE_WIDTH,
     MIN_OWNER_WIDTH,
+    MIN_PERMISSIONS_WIDTH,
 ];
 
 impl SftpColumns {
     /// Pixel widths in column order.
-    fn widths(self) -> [f32; 4] {
-        [self.name, self.modified, self.size, self.owner].map(|w| w.max(0.0))
+    fn widths(self) -> [f32; 5] {
+        [
+            self.name,
+            self.modified,
+            self.size,
+            self.owner,
+            self.permissions,
+        ]
+        .map(|w| w.max(0.0))
     }
 
-    fn from_widths(widths: [f32; 4]) -> Self {
+    fn from_widths(widths: [f32; 5]) -> Self {
         Self {
             name: widths[0],
             modified: widths[1],
             size: widths[2],
             owner: widths[3],
+            permissions: widths[4],
         }
     }
 
@@ -347,7 +359,7 @@ impl SftpColumns {
     /// `COLUMN_STEP` from its current position, and only the two neighbours
     /// change, so every other column keeps its width.
     fn drag_divider(&mut self, boundary: usize, offset: f32) {
-        if !(1..4).contains(&boundary) {
+        if !(1..5).contains(&boundary) {
             return;
         }
         let widths = self.widths();
@@ -385,6 +397,7 @@ struct SftpLayout {
     modified: egui::Rect,
     size: egui::Rect,
     owner: egui::Rect,
+    permissions: egui::Rect,
 }
 
 impl SftpLayout {
@@ -401,6 +414,7 @@ impl SftpLayout {
             modified: cell(widths[1]),
             size: cell(widths[2]),
             owner: cell(widths[3]),
+            permissions: cell(widths[4]),
         }
     }
 }
@@ -646,6 +660,7 @@ enum SftpSortKey {
     Modified,
     Size,
     Owner,
+    Permissions,
 }
 
 /// Current sort of the SFTP table, kept per session.
@@ -713,6 +728,7 @@ fn sorted_indices(entries: &[RemoteEntry], show_hidden: bool, sort: SftpSort) ->
                 SftpSortKey::Modified => a.modified.cmp(&b.modified),
                 SftpSortKey::Size => a.size.cmp(&b.size),
                 SftpSortKey::Owner => cmp_lower(&a.owner, &b.owner),
+                SftpSortKey::Permissions => a.permissions.cmp(&b.permissions),
             };
             let order = if sort.ascending {
                 order
@@ -755,6 +771,12 @@ fn sftp_header(
         (layout.modified, 6.0, SftpSortKey::Modified, "Modified"),
         (layout.size, 6.0, SftpSortKey::Size, "Size"),
         (layout.owner, 6.0, SftpSortKey::Owner, "Owner"),
+        (
+            layout.permissions,
+            6.0,
+            SftpSortKey::Permissions,
+            "Permissions",
+        ),
     ] {
         if cell.width() <= inset + 4.0 {
             continue;
@@ -815,6 +837,7 @@ fn sftp_header(
         (1_usize, layout.modified),
         (2, layout.size),
         (3, layout.owner),
+        (4, layout.permissions),
     ] {
         if column.width() > 0.0 {
             separators.push((boundary, column.left()));
@@ -2687,6 +2710,16 @@ impl RustTermApp {
                                     ui,
                                     layout.owner.shrink2(egui::vec2(4.0, 0.0)),
                                     format_owner(entry),
+                                    font.clone(),
+                                    theme.palette.muted,
+                                    egui::Align::Min,
+                                );
+                            }
+                            if layout.permissions.width() > 0.0 {
+                                paint_cell(
+                                    ui,
+                                    layout.permissions.shrink2(egui::vec2(4.0, 0.0)),
+                                    &format_permissions(entry),
                                     font,
                                     theme.palette.muted,
                                     egui::Align::Min,
@@ -3764,8 +3797,8 @@ impl eframe::App for RustTermApp {
                     let max_width = (ctx.screen_rect().width() * 0.55).clamp(320.0, 720.0);
                     egui::SidePanel::left("sftp_panel")
                         .resizable(true)
-                        .default_width(450.0)
-                        .min_width(340.0)
+                        .default_width(560.0)
+                        .min_width(260.0)
                         .max_width(max_width)
                         .frame(theme::panel_frame(theme))
                         .show(ctx, |ui| {
@@ -4068,8 +4101,8 @@ fn vnc_viewer_command(port: u16) -> Option<(&'static str, Vec<String>)> {
 mod tests {
     use super::{
         cmp_lower, sftp_header, sorted_indices, RemoteEntry, SftpColumns, SftpLayout, SftpSort,
-        SftpSortKey, COLUMN_STEP, MIN_MODIFIED_WIDTH, MIN_OWNER_WIDTH, MIN_SIZE_WIDTH,
-        NAME_MIN_WIDTH, TABLE_WIDTH,
+        SftpSortKey, COLUMN_STEP, MIN_MODIFIED_WIDTH, MIN_OWNER_WIDTH, MIN_PERMISSIONS_WIDTH,
+        MIN_SIZE_WIDTH, NAME_MIN_WIDTH, TABLE_WIDTH,
     };
     use crate::theme::ThemeId;
     use std::time::{Duration, SystemTime};
@@ -4082,6 +4115,7 @@ mod tests {
             is_symlink: false,
             size,
             owner: owner.to_string(),
+            permissions: None,
             modified: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(age_secs)),
         }
     }
@@ -4098,7 +4132,8 @@ mod tests {
         assert!((layout.name.right() - layout.modified.left()).abs() < 0.01);
         assert!((layout.modified.right() - layout.size.left()).abs() < 0.01);
         assert!((layout.size.right() - layout.owner.left()).abs() < 0.01);
-        assert!((layout.owner.right() - rect.right()).abs() < 0.01);
+        assert!((layout.owner.right() - layout.permissions.left()).abs() < 0.01);
+        assert!((layout.permissions.right() - rect.right()).abs() < 0.01);
     }
 
     /// The panel is only a viewport: the same columns must land on the same
@@ -4117,9 +4152,13 @@ mod tests {
                 (layout.owner.width() - expected[3]).abs() < 0.01,
                 "w {width}"
             );
+            assert!(
+                (layout.permissions.width() - expected[4]).abs() < 0.01,
+                "w {width}"
+            );
             // The table itself keeps its canvas width; it is merely clipped.
             assert!(
-                (layout.owner.right() - rect.left() - TABLE_WIDTH).abs() < 0.01,
+                (layout.permissions.right() - rect.left() - TABLE_WIDTH).abs() < 0.01,
                 "w {width}"
             );
         }
@@ -4145,12 +4184,13 @@ mod tests {
     }
 
     #[test]
-    fn default_layout_gives_the_name_half_the_canvas() {
+    fn default_layout_shares_the_canvas_between_five_columns() {
         let w = SftpColumns::default().widths();
-        assert!((w[0] - TABLE_WIDTH / 2.0).abs() < 0.01, "name {}", w[0]);
+        assert!((w[0] - TABLE_WIDTH * 0.42).abs() < 0.01, "name {}", w[0]);
         assert!(w[1] >= MIN_MODIFIED_WIDTH);
         assert!(w[2] >= MIN_SIZE_WIDTH);
         assert!(w[3] >= MIN_OWNER_WIDTH);
+        assert!(w[4] >= MIN_PERMISSIONS_WIDTH);
         assert!((w.iter().sum::<f32>() - TABLE_WIDTH).abs() < 0.01);
     }
 

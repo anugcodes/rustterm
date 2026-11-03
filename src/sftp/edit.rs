@@ -1,5 +1,17 @@
 use super::*;
 
+/// How long the local copies opened in an editor stay quiet after a filesystem
+/// event before the save is uploaded. Editors emit several events per write.
+const EDIT_DEBOUNCE: Duration = Duration::from_millis(150);
+
+/// Safety pass while a file is open: catches events inotify can miss (network
+/// mounts, watcher limits) and notices a deleted temporary copy.
+const EDIT_SAFETY_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How long a missing local file is tolerated. Editors that save atomically
+/// replace the file, so it is briefly absent.
+const EDIT_GONE_GRACE: Duration = Duration::from_secs(12);
+
 /// Where a remote file should be opened locally.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EditorChoice {

@@ -472,6 +472,17 @@ pub fn icon_button(
     ui.add_enabled(enabled, button).on_hover_text(tooltip)
 }
 
+/// A compact icon button that opens a menu instead of acting immediately.
+pub fn icon_menu_button(
+    ui: &mut egui::Ui,
+    icon: &str,
+    tooltip: &str,
+    add_contents: impl FnOnce(&mut egui::Ui),
+) -> egui::Response {
+    let response = ui.menu_button(egui::RichText::new(icon).size(13.0), add_contents);
+    response.response.on_hover_text(tooltip)
+}
+
 /// A compact toggle button used for the hidden-files switch.
 pub fn icon_toggle(
     ui: &mut egui::Ui,
@@ -503,6 +514,7 @@ pub mod icons {
     pub const DOWNLOAD: &str = "📥";
     pub const UPLOAD: &str = "📤";
     pub const HIDDEN: &str = "👁";
+    pub const FOLLOW: &str = "🎯";
     pub const RECONNECT: &str = "⚡";
     pub const GO: &str = "➡";
     pub const CLOSE: &str = "×";
@@ -514,8 +526,8 @@ pub mod icons {
     /// Every icon above, for the font-coverage test.
     #[cfg(test)]
     pub const ALL: &[&str] = &[
-        HOME, UP, REFRESH, NEW_FOLDER, COPY, PASTE, DOWNLOAD, UPLOAD, HIDDEN, RECONNECT, GO, CLOSE,
-        SORT_ASC, SORT_DESC, BACK, FORWARD,
+        HOME, UP, REFRESH, NEW_FOLDER, COPY, PASTE, DOWNLOAD, UPLOAD, HIDDEN, FOLLOW, RECONNECT,
+        GO, CLOSE, SORT_ASC, SORT_DESC, BACK, FORWARD,
     ];
 }
 

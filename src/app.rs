@@ -454,7 +454,13 @@ fn sftp_details_bar(ui: &mut egui::Ui, theme: &Theme, entry: &RemoteEntry, link:
 }
 
 /// Latest SFTP message, operation state, queue depth and message history.
-fn sftp_status_bar(ui: &mut egui::Ui, theme: &Theme, explorer: &mut SftpExplorer) {
+fn sftp_status_bar(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    explorer: &mut SftpExplorer,
+    ssh: &SshSession,
+) -> bool {
+    let mut activity = false;
     let busy = explorer.busy_label().map(str::to_string);
     let queued = explorer.queued_transfers();
     let current = explorer.status.current().cloned();
@@ -523,8 +529,21 @@ fn sftp_status_bar(ui: &mut egui::Ui, theme: &Theme, explorer: &mut SftpExplorer
                 }
             });
             response.response.on_hover_text("Message history");
+            if theme::icon_button(
+                ui,
+                theme,
+                theme::icons::RECONNECT,
+                "Reconnect SFTP without dropping the terminal",
+                !explorer.is_busy(),
+            )
+            .clicked()
+            {
+                explorer.reconnect(ssh);
+                activity = true;
+            }
         });
     });
+    activity
 }
 
 /// Running transfer: byte bar, byte count, file count and cancel.
@@ -2256,7 +2275,7 @@ impl RustTermApp {
         let can_copy = selected.is_some() && !busy;
         let can_paste = explorer.clipboard.is_some() && !busy;
 
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if theme::icon_button(
                 ui,
                 theme,
@@ -2339,12 +2358,27 @@ impl RustTermApp {
                 }
                 activity = true;
             }
-            if theme::icon_button(ui, theme, theme::icons::UPLOAD, "Upload files here…", !busy)
-                .clicked()
-            {
-                if let Some(paths) = pick_upload_files() {
-                    explorer.upload_paths(ssh, paths);
-                }
+            let upload = theme::icon_menu_button(
+                ui,
+                theme::icons::UPLOAD,
+                "Upload files or folders here…",
+                |ui| {
+                    theme::menu_style(ui);
+                    if theme::menu_item(ui, "Upload files…", true, None).clicked() {
+                        if let Some(paths) = pick_upload_files() {
+                            explorer.upload_paths(ssh, paths);
+                        }
+                        ui.close_menu();
+                    }
+                    if theme::menu_item(ui, "Upload folder…", true, None).clicked() {
+                        if let Some(paths) = pick_upload_folder() {
+                            explorer.upload_paths(ssh, paths);
+                        }
+                        ui.close_menu();
+                    }
+                },
+            );
+            if upload.clicked() {
                 activity = true;
             }
             if theme::icon_toggle(
@@ -2366,16 +2400,25 @@ impl RustTermApp {
                 }
                 activity = true;
             }
-            if theme::icon_button(
+            let follow = theme::icon_toggle(
                 ui,
                 theme,
-                theme::icons::RECONNECT,
-                "Reconnect SFTP without dropping the terminal",
-                !busy,
-            )
-            .clicked()
-            {
-                explorer.reconnect(ssh);
+                theme::icons::FOLLOW,
+                "Follow the shell's folder — right-click to set up tracking",
+                explorer.follow,
+            );
+            follow.context_menu(|ui| {
+                theme::menu_style(ui);
+                if theme::menu_item(ui, "Set up directory tracking…", true, None).clicked() {
+                    if explorer.begin_hook_prompt(ssh) {
+                        explorer.dismiss_hook_hint();
+                    }
+                    ui.close_menu();
+                }
+            });
+            if follow.clicked() {
+                let next = !explorer.follow;
+                explorer.set_follow(ssh, next);
                 activity = true;
             }
         });
@@ -2409,11 +2452,8 @@ impl RustTermApp {
                 }
             }
 
-            // Reserve room for Go and Follow so the field cannot push them
-            // outside a 340 px panel.
-            let follow_width = 58.0;
-            let reserved = control + follow_width + 8.0;
-            let width = (ui.available_width() - reserved).max(80.0);
+            // Reserve room for Go so it stays inside the panel at any width.
+            let width = (ui.available_width() - control - 8.0).max(80.0);
             let edit = ui.add_sized(
                 [width, control],
                 text_field(theme, &mut explorer.path_edit).hint_text("Remote path"),
@@ -2429,30 +2469,6 @@ impl RustTermApp {
             if theme::icon_button(ui, theme, theme::icons::GO, "Open this path", true).clicked() {
                 let path = explorer.path_edit.clone();
                 explorer.navigate(ssh, path);
-                activity = true;
-            }
-            let follow = ui
-                .add(
-                    egui::Button::new(egui::RichText::new("Follow").size(11.0))
-                        .selected(explorer.follow)
-                        .min_size(egui::vec2(0.0, control))
-                        .rounding(egui::Rounding::ZERO),
-                )
-                .on_hover_text(
-                    "Follow the shell's folder (OSC 7). Manual navigation pauses it. Right-click to set up tracking.",
-                );
-            follow.context_menu(|ui| {
-                theme::menu_style(ui);
-                if theme::menu_item(ui, "Set up directory tracking…", true, None).clicked() {
-                    if explorer.begin_hook_prompt(ssh) {
-                        explorer.dismiss_hook_hint();
-                    }
-                    ui.close_menu();
-                }
-            });
-            if follow.clicked() {
-                let next = !explorer.follow;
-                explorer.set_follow(ssh, next);
                 activity = true;
             }
         });
@@ -2517,7 +2533,7 @@ impl RustTermApp {
                     .inner_margin(egui::Margin::symmetric(4.0, 2.0)),
             )
             .show_inside(ui, |ui| {
-                sftp_status_bar(ui, theme, explorer);
+                activity |= sftp_status_bar(ui, theme, explorer, ssh);
             });
 
         if explorer.transfer.is_some() || explorer.queued_transfers() > 0 {

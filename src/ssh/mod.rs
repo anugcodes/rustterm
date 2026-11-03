@@ -42,8 +42,8 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, Notify, OnceCell};
 
 mod connect;
-mod vnc;
 mod session;
+mod vnc;
 use session::*;
 use vnc::*;
 mod transfer;

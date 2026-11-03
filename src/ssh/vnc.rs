@@ -1,12 +1,15 @@
-use tokio::net::TcpListener;
 use super::*;
+use tokio::net::TcpListener;
 
 /// Look for a VNC session on the server and read the login shell.
 ///
 /// The shell is detected on the same round trip the tunnel needs, so the bar
 /// already knows whether to type `setenv` or `DISPLAY=` by the time it can be
 /// clicked.
-pub(crate) async fn probe_vnc(session: &Handle<ClientHandler>, auto_create: bool) -> Result<VncProbe, String> {
+pub(crate) async fn probe_vnc(
+    session: &Handle<ClientHandler>,
+    auto_create: bool,
+) -> Result<VncProbe, String> {
     let shell = probe_login_shell(session).await;
     let target = probe_vnc_target(session, auto_create).await?;
     Ok(VncProbe { target, shell })
@@ -282,4 +285,3 @@ pub(crate) async fn open_vnc(
     });
     Ok((local, handle))
 }
-

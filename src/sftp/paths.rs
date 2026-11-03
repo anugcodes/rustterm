@@ -141,7 +141,10 @@ pub fn validate_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub(super) fn copy_target_allowed(clipboard: &ClipboardEntry, dest_dir: &str) -> Result<(), String> {
+pub(super) fn copy_target_allowed(
+    clipboard: &ClipboardEntry,
+    dest_dir: &str,
+) -> Result<(), String> {
     if !clipboard.is_dir {
         return Ok(());
     }
@@ -155,7 +158,6 @@ pub(super) fn copy_target_allowed(clipboard: &ClipboardEntry, dest_dir: &str) ->
     }
     Ok(())
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -173,7 +175,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn joins_remote_paths() {
         assert_eq!(join_path("/home/user", "file"), "/home/user/file");
@@ -182,7 +183,6 @@ mod tests {
         assert_eq!(join_path("", "etc"), "/etc");
         assert_eq!(join_path(".", "file"), "./file");
     }
-
 
     #[test]
     fn walks_to_the_parent_and_stops_at_root() {
@@ -224,7 +224,6 @@ mod tests {
         assert_eq!(normalize_shell_path("~/src"), None);
         assert_eq!(normalize_shell_path(""), None);
     }
-
 
     #[test]
     fn sorts_directories_first_then_names_case_insensitively() {
@@ -311,5 +310,4 @@ mod tests {
         };
         assert!(copy_target_allowed(&file, "/srv/data.txt").is_ok());
     }
-
 }

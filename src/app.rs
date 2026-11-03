@@ -2643,27 +2643,26 @@ impl RustTermApp {
         let mut toggle_row: Option<usize> = None;
         let mut extend_row: Option<usize> = None;
 
-        // Selected-entry summary. Declared before the table so the table keeps
-        // the rest of the height, and after the status/transfer bars so it
-        // stacks above them.
-        if selected.is_some() || selected_count > 1 {
-            egui::TopBottomPanel::bottom(egui::Id::new(("sftp_details", index)))
-                .exact_height(theme.metrics.row_height * 2.0 + 6.0)
-                .frame(
-                    egui::Frame::none()
-                        .fill(theme.palette.surface)
-                        .stroke(egui::Stroke::new(1.0_f32, theme.palette.border))
-                        .inner_margin(egui::Margin::symmetric(6.0, 2.0)),
-                )
-                .show_inside(ui, |ui| {
-                    if let Some(entry) = &selected {
-                        let link = explorer.link_target(&entry.path);
-                        sftp_details_bar(ui, theme, entry, link);
-                    } else {
-                        sftp_multi_details_bar(ui, theme, &explorer.selected_entries());
-                    }
-                });
-        }
+        // Selected-entry summary. Always reserved so selecting a row never
+        // reflows the table under the pointer.
+        egui::TopBottomPanel::bottom(egui::Id::new(("sftp_details", index)))
+            .exact_height(theme.metrics.row_height * 2.0 + 6.0)
+            .frame(
+                egui::Frame::none()
+                    .fill(theme.palette.surface)
+                    .stroke(egui::Stroke::new(1.0_f32, theme.palette.border))
+                    .inner_margin(egui::Margin::symmetric(6.0, 2.0)),
+            )
+            .show_inside(ui, |ui| {
+                if let Some(entry) = &selected {
+                    let link = explorer.link_target(&entry.path);
+                    sftp_details_bar(ui, theme, entry, link);
+                } else if selected_count > 1 {
+                    sftp_multi_details_bar(ui, theme, &explorer.selected_entries());
+                } else {
+                    theme::muted(ui, theme, "Select an entry to see its details.");
+                }
+            });
 
         let row_height = theme.metrics.row_height;
         let table_width = TABLE_WIDTH;
@@ -2831,7 +2830,7 @@ impl RustTermApp {
                                     row_action = Some(RowAction::Open(vec![entry.clone()]));
                                 }
                             }
-                            // #6: a right-click selects the row it landed on
+                            // A right-click selects the row it landed on
                             // (keeping an existing multi-selection intact) and
                             // opens the menu in the same frame.
                             if response.secondary_clicked() && !is_selected {

@@ -490,17 +490,18 @@ Setup: a local sshd with `PubkeyAuthentication yes`, plus
 ## 14. SFTP side panel — [U]
 
 **How:** after a successful connection, the remote file panel appears on the
-left. It opens at 450 px, can be dragged between 340 px and 55% of the window
+left. It opens at 560 px, can be dragged between 260 px and 55% of the window
 (capped at 720 px), so the terminal always stays visible. It starts at the remote
 login directory (`canonicalize(".")`, usually `$HOME`) and lists entries in a
-table with a fixed header: **Name**, **Modified**, **Size** and **Owner**. The
-**Files** toggle in the tab bar shows/hides it, and the panel's **×** hides it
-too. Each tab keeps its own width, directory, selection, column widths and sort.
+table with a fixed header: **Name**, **Modified**, **Size**, **Owner** and
+**Permissions**. The **Files** toggle in the tab bar shows/hides it, and the
+panel's **×** hides it too. Each tab keeps its own width, directory, selection,
+column widths and sort.
 
-The table is its own **fixed 430 px canvas**. The panel is only a window onto it:
+The table is its own **fixed 560 px canvas**. The panel is only a window onto it:
 shrinking the panel clips the table and adds a horizontal scrollbar; growing it
-reveals more of the canvas (or blank space past Owner). Resizing the panel never
-reflows the columns or hides one.
+reveals more of the canvas (or blank space past Permissions). Resizing the panel
+never reflows the columns or hides one.
 
 - Entries are **folders first**, then ordered by the active column. Click a
   header to sort by it; click it again to reverse. The active column shows a
@@ -520,24 +521,34 @@ reflows the columns or hides one.
   below its minimum readable width. File rows never show resize handles.
 - Selecting a row shows a **two-line details strip** above the status bar with
   the full remote path, type, exact size, owner, exact timestamp and relative
-  age. It disappears when nothing is selected, giving the height back to the
-  table.
+  age. The strip is always present (it shows a hint when nothing is selected),
+  so the table does not move when the selection changes.
 - Hovering a row still shows a compact tooltip with its path, size, owner and
   timestamp.
-- **Single click** selects a row. **Double click** opens it: folders navigate,
-  symlinks are followed, files open the **Open with…** picker. A single click
-  never opens a menu.
+- **Single click** selects a row. **Ctrl+click** adds or removes one row,
+  **Shift+click** selects the range from the last clicked row, and **Up/Down**
+  move the selection while the table is hovered and no text field has focus.
+  **Double click** opens the row: folders navigate, symlinks are followed, files
+  open the **Open with…** picker. A single click never opens a menu.
 - **Right-click** selects the row and opens its menu. File: **Open with…**,
   **Rename…**, **Copy path**, **Delete…**. Folder: **Open**, **Paste into this
   folder** (when something has been copied), **Rename…**, **Copy path**,
   **Delete…**. A symlink also gets **Follow link** at the top of its menu.
+  With several rows selected, the menu acts on the whole selection
+  (**Download N items…**, **Delete N items…**) and **Open N files with…** is
+  only offered when every selected row is a regular file.
+- On desktops that use click-to-focus, the first click on an inactive window may
+  be consumed by the window manager to raise it. Click once to activate the
+  window, then right-click the row; the menu opens normally afterwards.
 - The icon toolbar (hover for a tooltip) provides 🏠 **Home** (login directory),
   📂 **Up one level**, 🔄 **Refresh**, ➕ **New folder**, 🗐 **Copy**,
-  📋 **Paste**, 📥 **Download**, 📤 **Upload**, 👁 **Hidden** (dotfiles, per
-  tab), ⚡ **Reconnect** and × **Hide**. Every icon is checked against the
-  bundled fonts by `theme::tests::icons_have_glyphs`, so a missing glyph cannot
-  come back as an empty box. The toolbar no longer draws a spinner next to
-  **Reconnect**; the status bar reports the reconnect attempt.
+  📋 **Paste**, 📥 **Download** (the whole selection), 📤 **Upload** (a menu with
+  **Upload files…** and **Upload folder…**), 👁 **Hidden** (dotfiles, per tab)
+  and 🎯 **Follow** (right-click it for directory tracking). ⚡ **Reconnect**
+  sits in the status bar next to ☰, and × **Hide** closes the panel. Every icon
+  is checked against the bundled fonts by `theme::tests::icons_have_glyphs`, so
+  a missing glyph cannot come back as an empty box. The status bar reports the
+  reconnect attempt while it runs.
 - **Status bar:** the bottom of the panel always shows the latest message with a
   colour-coded icon. While a listing or file operation runs it shows a spinner
   and the operation label; a transfer's queue depth is appended there as
@@ -631,31 +642,37 @@ so delete/copy tests cannot touch real data.
       with `pwd` / `ls -la` in the terminal.
 - [ ] **Columns**: the header reads **Name / Modified / Size / Owner**, uses the
       same font size as the rows, is not bold and stays visible while scrolling.
-      Name is about half the table. Owner and local `YYYY-MM-DD HH:MM` match
-      `stat -c '%U %y' file`; folders show an em dash for size. Drag a divider
-      in the header: it moves in **24 px** steps and only the two neighbouring
-      columns change (dividers are not drawn on file rows). Narrow the panel to
-      ~340 px: the table keeps its column widths, is clipped at the panel edge
-      and gains a horizontal scrollbar; widen the panel and the same table is
-      revealed again.
+      Name is about 42% of the table. Owner and local `YYYY-MM-DD HH:MM` match
+      `stat -c '%U %y' file`; folders show an em dash for size. Permissions show
+      the `drwxr-xr-x`-style mode. Drag a divider in the header: it moves in
+      **24 px** steps and only the two neighbouring columns change (dividers are
+      not drawn on file rows). Narrow the panel to ~260 px: the table keeps its
+      column widths, is clipped at the panel edge and gains a horizontal
+      scrollbar; widen the panel and the same table is revealed again.
 - [ ] **Sorting**: directories come first, then the active column. Click
-      **Size** / **Modified** / **Owner** in the header → the arrow (⏶/⏷)
-      appears, the order changes, and a second click reverses it. Click
-      **Name** to restore the default case-insensitive name order.
+      **Size** / **Modified** / **Owner** / **Permissions** in the header → the
+      arrow (⏶/⏷) appears, the order changes, and a second click reverses it.
+      Click **Name** to restore the default case-insensitive name order.
 - [ ] **Details strip**: select a row → two lines above the status bar show the
       full path, type, size, owner, exact timestamp and age. Click a different
-      row → it updates; refresh/navigate → it disappears with the selection.
-- [ ] **Select vs open**: one click highlights a row without navigating; double
-      click a folder → path and listing update; double click a file → the
-      **Open with…** modal appears.
+      row → it updates; refresh/navigate → the strip shows its hint and the table
+      does not move.
+- [ ] **Select vs open**: one click highlights a row without navigating;
+      Ctrl+click adds/removes rows; Shift+click selects a range; Up/Down move
+      the selection while the table is hovered. Double click a folder → path and
+      listing update; double click a file → the **Open with…** modal appears.
 - [ ] **Right-click menu**: right-click a file → Open with…, Rename…, Copy path,
       Delete…; right-click a folder → Open, Rename…, Copy path, Delete…, plus
       Paste into this folder after copying an entry. A left click does not open
       this menu. **Copy**, **New folder…** and **Refresh** are absent by design.
+      Select three files → right-click one of them → the menu offers
+      **Open 3 files with…**, **Download 3 items…** and **Delete 3 items…**.
+      Include a folder in the selection → **Open** disappears.
 - [ ] **Toolbar**: every icon draws a real glyph (no empty boxes) and shows a
       tooltip; 🏠 Home / 📂 Up / 🔄 Refresh / ➕ New folder / 🗐 Copy / 📋 Paste /
-      📥 Download / 📤 Upload / 👁 Hidden / ⚡ Reconnect / × Hide all work. Up,
-      Copy and Paste are disabled when they cannot run.
+      📥 Download / 📤 Upload (files or folder menu) / 👁 Hidden / 🎯 Follow /
+      × Hide all work, and ⚡ Reconnect sits in the status bar. Up, Copy and
+      Paste are disabled when they cannot run.
 - [ ] **Path box**: type `/tmp` + **Enter** → `/tmp` is listed; repeat with ➡.
       Type a bogus path → an error in the status bar, previous listing stays.
 - [ ] **Refresh**: `touch /tmp/rt-new-file` in the terminal, press 🔄 in `/tmp`

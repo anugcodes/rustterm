@@ -18,7 +18,7 @@ jobs:
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libxkbcommon-dev libssl-dev
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.1
         with:
           components: rustfmt, clippy
 
@@ -28,13 +28,13 @@ jobs:
         run: cargo fmt --check
 
       - name: clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: test
-        run: cargo test
+        run: cargo test --locked
 
       - name: test without default features
-        run: cargo test --no-default-features
+        run: cargo test --locked --no-default-features
 
       - name: build without default features
-        run: cargo build --no-default-features
+        run: cargo build --locked --no-default-features

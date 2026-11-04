@@ -24,3 +24,6 @@ Planned for 1.1 and later. 1.0 ships the MVP and V2 milestones.
 - P4 clone audit + F19 in-memory zeroization.
 - Split `app.rs` (~5k lines) into focused modules.
 - Terminal font/colour selection persistence.
+- **Theme-aware scrollbars**: give `Palette` a scrollbar token and have every
+  scrollbar (including the terminal's custom-painted one, which currently uses a
+  hardcoded grey) pick its colour from the active theme.

@@ -129,6 +129,82 @@ impl Selection {
     }
 }
 
+/// Painted width of the terminal's custom scrollbar thumb.
+const SCROLLBAR_WIDTH: f32 = 4.0;
+/// Wider, invisible strip used for hit-testing so the thin thumb is easy to
+/// grab with the pointer.
+const SCROLLBAR_HIT_WIDTH: f32 = 12.0;
+
+/// Geometry of the terminal's custom scrollbar for one frame.
+///
+/// The terminal paints its own scrollbar rather than using egui's
+/// `ScrollArea`, so it also owns the pointer interaction: the thumb is drawn
+/// on the right edge and a wider strip is registered with `ui.interact`.
+struct ScrollbarGeometry {
+    /// Invisible, widened strip that captures pointer input.
+    hit_rect: Rect,
+    /// The visible thumb.
+    thumb_rect: Rect,
+    /// Top of the track, cached for the pointer-to-offset conversion.
+    track_top: f32,
+    /// Distance the thumb can travel from top to bottom.
+    travel: f32,
+    /// Height of the thumb.
+    thumb_height: f32,
+    /// Total scrollback lines, to convert a thumb position into an offset.
+    history_size: usize,
+}
+
+impl ScrollbarGeometry {
+    fn new(rect: Rect, rows: usize, history_size: usize, display_offset: usize) -> Option<Self> {
+        if history_size == 0 {
+            return None;
+        }
+
+        let track_h = rect.height();
+        let view_fraction = rows as f32 / (history_size + rows) as f32;
+        let thumb_height = (track_h * view_fraction).max(16.0).min(track_h);
+        let travel = (track_h - thumb_height).max(1.0);
+        // display_offset == history_size is the top of the scrollback;
+        // display_offset == 0 is the live bottom.
+        let from_top = (history_size - display_offset) as f32 / history_size as f32;
+        let thumb_y = rect.top() + from_top.clamp(0.0, 1.0) * travel;
+
+        Some(Self {
+            hit_rect: Rect::from_min_max(
+                Pos2::new(rect.right() - SCROLLBAR_HIT_WIDTH, rect.top()),
+                Pos2::new(rect.right(), rect.bottom()),
+            ),
+            thumb_rect: Rect::from_min_size(
+                Pos2::new(rect.right() - SCROLLBAR_WIDTH, thumb_y),
+                Vec2::new(SCROLLBAR_WIDTH, thumb_height),
+            ),
+            track_top: rect.top(),
+            travel,
+            thumb_height,
+            history_size,
+        })
+    }
+
+    /// Grab offset (within the thumb) to use when a drag starts at `pos`.
+    ///
+    /// Grabbing the thumb keeps its current position; clicking the empty track
+    /// centres the thumb under the pointer.
+    fn grab_offset(&self, pos: Pos2) -> f32 {
+        if self.thumb_rect.contains(pos) {
+            pos.y - self.thumb_rect.top()
+        } else {
+            self.thumb_height * 0.5
+        }
+    }
+
+    /// Convert a pointer y (offset by `grab`) into a display offset.
+    fn display_offset_at(&self, pointer_y: f32, grab: f32) -> usize {
+        let frac = ((pointer_y - grab - self.track_top) / self.travel).clamp(0.0, 1.0);
+        ((1.0 - frac) * self.history_size as f32).round() as usize
+    }
+}
+
 /// Map a pointer position to a grid point, clamped to the visible grid.
 fn point_at(
     rect: Rect,
@@ -438,6 +514,9 @@ pub struct TerminalView {
     pending_input: Vec<u8>,
     /// Last motion report `(col, row, code)` so identical motion is not repeated.
     last_motion: Option<(usize, usize, u8)>,
+    /// Offset inside the scrollbar thumb where a drag grabbed it, so the thumb
+    /// does not jump under the pointer.
+    scrollbar_grab: Option<f32>,
 }
 
 impl TerminalView {
@@ -484,6 +563,7 @@ impl TerminalView {
             last_font_size: 14.0,
             pending_input: Vec::new(),
             last_motion: None,
+            scrollbar_grab: None,
         }
     }
 
@@ -623,6 +703,15 @@ impl TerminalView {
 
     pub fn scroll_to_bottom(&mut self) {
         self.term.scroll_display(Scroll::Bottom);
+    }
+
+    /// Move the viewport to an absolute scrollback offset (0 = live bottom).
+    fn scroll_to_offset(&mut self, offset: usize) {
+        let current = self.term.grid().display_offset();
+        let delta = offset as i64 - current as i64;
+        if delta != 0 {
+            self.term.scroll_display(Scroll::Delta(delta as i32));
+        }
     }
 
     pub fn handle_scroll_event(&mut self, event: &egui::Event) -> bool {
@@ -874,10 +963,57 @@ impl TerminalView {
         let reporting = term_mode.intersects(TermMode::MOUSE_MODE);
         let forward_mouse = reporting && !ui.input(|i| i.modifiers.shift);
 
+        // Custom scrollbar interaction. The terminal paints its own bar (see the
+        // paint block below); registering a wider strip on top of the selection
+        // surface lets the pointer drag or click it. egui resolves overlapping
+        // widgets back-to-front, so this widget wins inside its strip while the
+        // rest of the terminal still handles text selection. It is skipped while
+        // the pointer is forwarded to a mouse-aware remote app.
+        let history_size = self.term.grid().history_size();
+        let scrollbar = ScrollbarGeometry::new(
+            rect,
+            self.rows,
+            history_size,
+            self.term.grid().display_offset(),
+        );
+        let scrollbar_response = if forward_mouse {
+            None
+        } else {
+            scrollbar.as_ref().map(|sb| {
+                ui.interact(
+                    sb.hit_rect,
+                    ui.id().with("terminal_scrollbar"),
+                    egui::Sense::click_and_drag(),
+                )
+            })
+        };
+
+        if let (Some(sb), Some(sbr)) = (&scrollbar, &scrollbar_response) {
+            if sbr.hovered() || sbr.dragged() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if sbr.drag_started() || sbr.clicked() {
+                if let Some(pos) = sbr.interact_pointer_pos() {
+                    self.scrollbar_grab = Some(sb.grab_offset(pos));
+                }
+            }
+            if sbr.dragged() || sbr.clicked() {
+                if let Some(pos) = sbr.interact_pointer_pos() {
+                    let grab = self.scrollbar_grab.unwrap_or(sb.thumb_height * 0.5);
+                    self.scroll_to_offset(sb.display_offset_at(pos.y, grab));
+                }
+            }
+            if sbr.drag_stopped() {
+                self.scrollbar_grab = None;
+            }
+        }
+
         if forward_mouse {
             self.forward_mouse(ui, rect, char_width, char_height);
         } else {
-            if response.hovered() {
+            // `contains_pointer` rather than `hovered` so the wheel still works
+            // over the scrollbar strip, which sits on top of the terminal.
+            if response.contains_pointer() {
                 let dy = ui.input(|i| i.raw_scroll_delta.y);
                 if dy != 0.0 {
                     self.scroll_accum += dy;
@@ -1183,20 +1319,21 @@ impl TerminalView {
                 );
             }
 
-            if history_size > 0 && (display_offset > 0 || response.hovered()) {
-                let track_h = rect.height();
-                let view_fraction = rows as f32 / (history_size + rows) as f32;
-                let thumb_h = (track_h * view_fraction).max(16.0);
-                let from_top = (history_size - display_offset) as f32 / history_size as f32;
-                let thumb_y = rect.top() + from_top * (track_h - thumb_h);
-                painter.rect_filled(
-                    Rect::from_min_size(
-                        Pos2::new(rect.right() - 4.0, thumb_y),
-                        Vec2::new(4.0, thumb_h),
-                    ),
-                    2.0,
-                    Color32::from_rgba_unmultiplied(150, 150, 165, 140),
-                );
+            if let Some(sb) = ScrollbarGeometry::new(rect, rows, history_size, display_offset) {
+                // Show the thumb while scrolled back, while the terminal is
+                // hovered, or while the pointer is interacting with the bar.
+                let bar_visible = display_offset > 0
+                    || response.hovered()
+                    || scrollbar_response
+                        .as_ref()
+                        .is_some_and(|r| r.hovered() || r.dragged());
+                if bar_visible {
+                    painter.rect_filled(
+                        sb.thumb_rect,
+                        2.0,
+                        Color32::from_rgba_unmultiplied(150, 150, 165, 140),
+                    );
+                }
             }
         }
 
@@ -1393,6 +1530,33 @@ mod tests {
     fn bg_runs_empty_when_all_default() {
         let cells = [(0, None), (1, None)];
         assert!(bg_runs(&cells).is_empty());
+    }
+
+    #[test]
+    fn scrollbar_thumb_at_bottom_maps_to_live_offset() {
+        let track = Rect::from_min_size(Pos2::ZERO, Vec2::new(100.0, 200.0));
+        let sb = ScrollbarGeometry::new(track, 24, 100, 0).unwrap();
+        // The thumb sits at the bottom when display_offset == 0.
+        assert!((sb.thumb_rect.bottom() - track.bottom()).abs() < 0.01);
+        // Dragging the thumb to the bottom must return to the live view.
+        assert_eq!(sb.display_offset_at(track.bottom(), sb.thumb_height), 0);
+    }
+
+    #[test]
+    fn scrollbar_thumb_at_top_maps_to_oldest_line() {
+        let track = Rect::from_min_size(Pos2::ZERO, Vec2::new(100.0, 200.0));
+        let sb = ScrollbarGeometry::new(track, 24, 100, 100).unwrap();
+        assert!((sb.thumb_rect.top() - track.top()).abs() < 0.01);
+        assert_eq!(sb.display_offset_at(track.top(), 0.0), 100);
+    }
+
+    #[test]
+    fn scrollbar_grab_keeps_thumb_under_pointer() {
+        let track = Rect::from_min_size(Pos2::ZERO, Vec2::new(100.0, 200.0));
+        let sb = ScrollbarGeometry::new(track, 24, 100, 50).unwrap();
+        let pos = sb.thumb_rect.center();
+        let grab = sb.grab_offset(pos);
+        assert_eq!(sb.display_offset_at(pos.y, grab), 50);
     }
 
     /// Reverse video with default colours must not be white-on-white.

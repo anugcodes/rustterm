@@ -129,8 +129,10 @@ impl Selection {
     }
 }
 
-/// Painted width of the terminal's custom scrollbar thumb.
+/// Painted width of the terminal's custom scrollbar thumb when idle.
 const SCROLLBAR_WIDTH: f32 = 4.0;
+/// Painted width while the pointer hovers the bar or drags it.
+const SCROLLBAR_HOVER_WIDTH: f32 = 6.0;
 /// Wider, invisible strip used for hit-testing so the thin thumb is easy to
 /// grab with the pointer.
 const SCROLLBAR_HIT_WIDTH: f32 = 12.0;
@@ -143,8 +145,10 @@ const SCROLLBAR_HIT_WIDTH: f32 = 12.0;
 struct ScrollbarGeometry {
     /// Invisible, widened strip that captures pointer input.
     hit_rect: Rect,
-    /// The visible thumb.
-    thumb_rect: Rect,
+    /// Right edge the thumb is aligned to.
+    right: f32,
+    /// Top of the thumb; its height never changes.
+    thumb_top: f32,
     /// Top of the track, cached for the pointer-to-offset conversion.
     track_top: f32,
     /// Distance the thumb can travel from top to bottom.
@@ -175,10 +179,8 @@ impl ScrollbarGeometry {
                 Pos2::new(rect.right() - SCROLLBAR_HIT_WIDTH, rect.top()),
                 Pos2::new(rect.right(), rect.bottom()),
             ),
-            thumb_rect: Rect::from_min_size(
-                Pos2::new(rect.right() - SCROLLBAR_WIDTH, thumb_y),
-                Vec2::new(SCROLLBAR_WIDTH, thumb_height),
-            ),
+            right: rect.right(),
+            thumb_top: thumb_y,
             track_top: rect.top(),
             travel,
             thumb_height,
@@ -186,13 +188,21 @@ impl ScrollbarGeometry {
         })
     }
 
+    /// The visible thumb at the given width, aligned to the right edge.
+    fn thumb_rect(&self, width: f32) -> Rect {
+        Rect::from_min_size(
+            Pos2::new(self.right - width, self.thumb_top),
+            Vec2::new(width, self.thumb_height),
+        )
+    }
+
     /// Grab offset (within the thumb) to use when a drag starts at `pos`.
     ///
     /// Grabbing the thumb keeps its current position; clicking the empty track
     /// centres the thumb under the pointer.
-    fn grab_offset(&self, pos: Pos2) -> f32 {
-        if self.thumb_rect.contains(pos) {
-            pos.y - self.thumb_rect.top()
+    fn grab_offset(&self, pos: Pos2, width: f32) -> f32 {
+        if self.thumb_rect(width).contains(pos) {
+            pos.y - self.thumb_top
         } else {
             self.thumb_height * 0.5
         }
@@ -988,13 +998,28 @@ impl TerminalView {
             })
         };
 
+        // Grow the bar while it is hovered or dragged. The right edge stays
+        // fixed, so the thumb widens leftwards like a normal scrollbar.
+        let scrollbar_active = scrollbar_response
+            .as_ref()
+            .is_some_and(|r| r.hovered() || r.dragged() || r.is_pointer_button_down_on());
+        let grow = ui.ctx().animate_bool_with_time(
+            ui.id().with("terminal_scrollbar_hover"),
+            scrollbar_active,
+            0.12,
+        );
+        let scrollbar_width = SCROLLBAR_WIDTH + (SCROLLBAR_HOVER_WIDTH - SCROLLBAR_WIDTH) * grow;
+
         if let (Some(sb), Some(sbr)) = (&scrollbar, &scrollbar_response) {
-            if sbr.hovered() || sbr.dragged() {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            // egui surrenders keyboard focus when a press lands on a widget
+            // covering the focused one, which the scrollbar strip does. Take it
+            // back so clicking or dragging the bar never interrupts typing.
+            if sbr.is_pointer_button_down_on() || sbr.drag_started() || sbr.clicked() {
+                response.request_focus();
             }
             if sbr.drag_started() || sbr.clicked() {
                 if let Some(pos) = sbr.interact_pointer_pos() {
-                    self.scrollbar_grab = Some(sb.grab_offset(pos));
+                    self.scrollbar_grab = Some(sb.grab_offset(pos, scrollbar_width));
                 }
             }
             if sbr.dragged() || sbr.clicked() {
@@ -1329,7 +1354,7 @@ impl TerminalView {
                         .is_some_and(|r| r.hovered() || r.dragged());
                 if bar_visible {
                     painter.rect_filled(
-                        sb.thumb_rect,
+                        sb.thumb_rect(scrollbar_width),
                         2.0,
                         Color32::from_rgba_unmultiplied(150, 150, 165, 140),
                     );
@@ -1537,7 +1562,7 @@ mod tests {
         let track = Rect::from_min_size(Pos2::ZERO, Vec2::new(100.0, 200.0));
         let sb = ScrollbarGeometry::new(track, 24, 100, 0).unwrap();
         // The thumb sits at the bottom when display_offset == 0.
-        assert!((sb.thumb_rect.bottom() - track.bottom()).abs() < 0.01);
+        assert!((sb.thumb_rect(SCROLLBAR_WIDTH).bottom() - track.bottom()).abs() < 0.01);
         // Dragging the thumb to the bottom must return to the live view.
         assert_eq!(sb.display_offset_at(track.bottom(), sb.thumb_height), 0);
     }
@@ -1546,7 +1571,7 @@ mod tests {
     fn scrollbar_thumb_at_top_maps_to_oldest_line() {
         let track = Rect::from_min_size(Pos2::ZERO, Vec2::new(100.0, 200.0));
         let sb = ScrollbarGeometry::new(track, 24, 100, 100).unwrap();
-        assert!((sb.thumb_rect.top() - track.top()).abs() < 0.01);
+        assert!((sb.thumb_rect(SCROLLBAR_WIDTH).top() - track.top()).abs() < 0.01);
         assert_eq!(sb.display_offset_at(track.top(), 0.0), 100);
     }
 
@@ -1554,8 +1579,8 @@ mod tests {
     fn scrollbar_grab_keeps_thumb_under_pointer() {
         let track = Rect::from_min_size(Pos2::ZERO, Vec2::new(100.0, 200.0));
         let sb = ScrollbarGeometry::new(track, 24, 100, 50).unwrap();
-        let pos = sb.thumb_rect.center();
-        let grab = sb.grab_offset(pos);
+        let pos = sb.thumb_rect(SCROLLBAR_WIDTH).center();
+        let grab = sb.grab_offset(pos, SCROLLBAR_WIDTH);
         assert_eq!(sb.display_offset_at(pos.y, grab), 50);
     }
 

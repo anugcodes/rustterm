@@ -531,6 +531,7 @@ fn sftp_status_bar(
                 // Cap the list so a long session cannot grow the menu past the
                 // bottom of the window.
                 egui::ScrollArea::vertical()
+                    .auto_shrink([false, true])
                     .max_height(320.0)
                     .show(ui, |ui| {
                         for entry in explorer.status.history() {

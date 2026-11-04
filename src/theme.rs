@@ -263,7 +263,7 @@ pub fn apply(ctx: &egui::Context, theme: &Theme) {
     // Thin scrollbars that only appear while the pointer is over the area, so
     // they do not add visual noise to the flat surfaces.
     style.spacing.scroll = egui::style::ScrollStyle::floating();
-    style.spacing.scroll.bar_width = 8.0;
+    style.spacing.scroll.bar_width = 6.0;
     style.spacing.scroll.floating_width = 4.0;
     style.animation_time = 0.1;
     style.text_styles = [

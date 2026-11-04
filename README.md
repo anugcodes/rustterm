@@ -14,7 +14,7 @@ A fast, lightweight, native Linux alternative to MobaXterm. SSH terminal tabs wi
 > download/delete/open, a Permissions column, and a bundled JetBrains Mono
 > terminal font. X11 forwarding and a VNC tunnel cover remote GUI tools. The
 > post-1.0 roadmap (permissions editor, macros/plugins, concurrent transfers, …)
-> is in `handoff.md` §11.15 and `ROADMAP.md`.
+> is in `docs/handoff.md` §11.15 and `docs/ROADMAP.md`.
 
 ## Screenshots
 
@@ -88,13 +88,16 @@ This builds `target/release/rustterm` if needed, then installs the binary to
 
 ## Documentation
 
-- [`USAGE.md`](USAGE.md) — how each feature works, plus a manual test checklist.
-- [`TESTING.md`](TESTING.md) — the manual smoke and full test procedures.
-- [`handoff.md`](handoff.md) — architecture, status and the development roadmap.
+- [`docs/USAGE.md`](docs/USAGE.md) — how each feature works, plus a manual test
+  checklist.
+- [`docs/TESTING.md`](docs/TESTING.md) — the manual smoke and full test
+  procedures.
+- [`docs/handoff.md`](docs/handoff.md) — architecture, status and development
+  history.
 
 ## Roadmap
 
-See the project brief. MVP target: terminal + tabs + saved sessions + SFTP panel.
+See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the post-1.0 plan.
 
 ## License
 

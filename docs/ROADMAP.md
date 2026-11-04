@@ -19,8 +19,8 @@ be verified without guesswork.
    - Done when: switching Midnight/Graphite recolours every scrollbar.
 
 3. **Terminal performance**
-   - Measure with the existing `profiling` profile, then add dirty-region
-     redraw, then move VTE decoding off the UI thread.
+   - Measure with the existing `profiling` profile; the follow-up work is in
+     [Optimization](#optimization).
    - Done when: idle CPU stays near zero and large output (`seq 1 200000`) does
      not stall keyboard input.
 
@@ -50,15 +50,37 @@ be verified without guesswork.
 
 - **P4 clone audit + F19 zeroization**: review `Clone` implementations that
   handle secrets and zeroize in-memory credentials.
-- **Release automation**: tag-driven CI artifacts, checksums and signing.
+
+## Optimization
+
+Build-level tuning (release profile, trimmed `tokio` features, locked builds)
+ships with 1.1. These runtime items are measured, riskier follow-ups.
+
+- **Terminal dirty-region redraw (P3)**: use damage tracking to shape only the
+  rows that changed instead of the whole visible grid.
+  - Done when: `seq 1 200000` and an idle `vim` both show a measurable drop in
+    frame time.
+- **Off-thread VTE decode (P3)**: move the parser off the UI thread behind a
+  snapshot/damage channel.
+  - Separate, benchmarked change: input, resize, selection and scrollback must
+    keep working.
+- **Size / lean build**: run `cargo bloat --release --crates` to find the real
+  hotspots and document `--no-default-features` (no keyring/zbus) as an
+  optional artifact.
+  - Done when: the release binary size has a recorded baseline.
 
 ## Packaging
 
-- **Phase 0 (this release)**: app icon, `assets/rustterm.desktop` and
-  `install.sh` for a user-local install under `~/.local`.
-- **Phase 1 (next)**: tag-driven GitHub Releases, building a tarball plus a
-  `curl | sh` installer and SHA-256 checksums.
-- **Phase 2**: `.deb` via `cargo-deb`, then an AppImage; AUR only if there is
-  demand.
-- **Deferred**: Flatpak. Sandboxing complicates the SSH agent, `~/.ssh` access
+- **Phase 0 (done)**: app icon (`assets/rustterm.svg`), window icon,
+  `assets/rustterm.desktop` and `install.sh` for a user-local install under
+  `~/.local`.
+
+## Later
+
+- **Phase 1 — distribution (deferred)**: tag-driven GitHub Releases building a
+  tarball, a `curl | sh` installer and SHA-256 checksums. Not required for
+  daily use, so it waits until the roadmap above settles.
+- **Phase 2 — native packages**: `.deb` via `cargo-deb`, then an AppImage; AUR
+  only if there is demand.
+- **Flatpak**: deferred. Sandboxing complicates the SSH agent, `~/.ssh` access
   and X11 forwarding.

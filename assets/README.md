@@ -15,6 +15,12 @@ the file next to the executable.
 Subtle terminal-prompt icon used by the desktop entry. `install.sh` installs it
 into `~/.local/share/icons/hicolor/scalable/apps/`.
 
+## `rustterm.png`
+
+256x256 raster of the same icon, embedded in the binary with `include_bytes!`
+for the X11/Windows window and taskbar icon (`with_icon`). It is not installed
+separately.
+
 ## `rustterm.desktop`
 
 Launcher entry. `install.sh` installs it into

@@ -1,0 +1,64 @@
+name: Bug report
+description: Report a reproducible problem with rustterm
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Remove passwords, private keys and host-key
+        contents from logs and screenshots before submitting.
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      description: The release tag, or `git describe --tags --always` for a source build.
+      placeholder: v1.0.0 (b8a5139)
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: How did you install rustterm?
+      options:
+        - Built from source (cargo run or ./install.sh)
+        - Prebuilt binary
+        - Other (describe below)
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: Distribution and session
+      description: Distro and version, plus X11 or Wayland.
+      placeholder: Ubuntu 24.04, Wayland
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open New Session
+        2. Connect to ...
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: behaviour
+    attributes:
+      label: Expected and actual behaviour
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Run `RUST_LOG=debug rustterm` and paste the relevant lines. Remove credentials first.
+      render: shell
+  - type: checkboxes
+    id: secrets
+    attributes:
+      label: Checklist
+      options:
+        - label: I removed passwords, private keys and host-key contents from this report.
+          required: true

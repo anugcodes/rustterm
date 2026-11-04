@@ -4,7 +4,7 @@ Thanks for helping build rustterm. This is an early-stage project, so the most v
 
 ## Development setup
 
-1. Install Rust (1.75+): https://rustup.rs
+1. Install Rust stable (CI builds with 1.99.1): https://rustup.rs
 2. Install Linux GUI deps:
    ```sh
    sudo apt install libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
@@ -15,6 +15,15 @@ Thanks for helping build rustterm. This is an early-stage project, so the most v
 ```
 cargo run
 ```
+
+## Reporting issues
+
+Use the [bug report template](.github/ISSUE_TEMPLATE/bug_report.yml). Include
+the version or commit, whether you built from source, your distribution and
+X11/Wayland session, reproduction steps, and `RUST_LOG=debug rustterm` logs.
+
+Never paste passwords, private keys, or host-key contents. Blur hostnames and
+usernames in screenshots if they are sensitive.
 
 ## Pull requests
 

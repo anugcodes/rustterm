@@ -2,7 +2,7 @@
 
 [![Build](https://github.com/anugcodes/rustterm/actions/workflows/ci.yml/badge.svg)](https://github.com/anugcodes/rustterm/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.75%2B-blue.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-stable-blue.svg)](https://www.rust-lang.org)
 
 A fast, lightweight, native Linux alternative to MobaXterm. SSH terminal tabs with an SFTP side panel that follows your session. Written in Rust.
 
@@ -18,7 +18,11 @@ A fast, lightweight, native Linux alternative to MobaXterm. SSH terminal tabs wi
 
 ## Screenshots
 
-_(coming soon)_
+<img src="assets/screenshots/01-main.png" alt="rustterm window with two SSH tabs and an SFTP panel listing the remote home directory, with Name, Modified, Size, Owner and Permissions columns" width="100%">
+
+| New SSH session | SFTP file actions |
+|---|---|
+| <img src="assets/screenshots/02-new-session.png" alt="New SSH session form with Host, Port, User and Password fields, private-key and ssh-agent checkboxes, and a saved-profile list" width="100%"> | <img src="assets/screenshots/03-sftp.png" alt="SFTP panel context menu with Open, Paste into this folder, Upload files here, Upload folder here, Download, Rename, Copy path and Delete" width="100%"> |
 
 ## Features
 
@@ -60,20 +64,38 @@ _(coming soon)_
 | Async | `tokio` |
 | Timestamps | `chrono` |
 
+## Prerequisites
+
+Building from source requires:
+
+- **Rust stable and Cargo** — install with [rustup](https://rustup.rs). CI
+  builds with Rust 1.99.1.
+- Linux build dependencies:
+  ```bash
+  sudo apt install libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
+  ```
+- A C linker and `pkg-config` (usually installed with the toolchain).
+- X11 or Wayland with OpenGL; D-Bus is only needed for the optional system
+  keyring.
+
+No prebuilt binaries are published yet, so installing currently means building
+from source. Once release binaries exist, running one will not require Rust or
+Cargo.
+
 ## Build
 
 ```bash
-sudo apt install libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
-cargo build --release
+cargo build --release --locked
 ```
 
-Run:
+Run the local binary with:
 
-```
-cargo run --release
+```bash
+cargo run --release --locked
 ```
 
-Enter a host, port, username, and password, then click **Connect**.
+From the app, enter a host, port, username, and password, then click
+**Connect**.
 
 ## Install (user-local)
 
@@ -81,10 +103,20 @@ Enter a host, port, username, and password, then click **Connect**.
 ./install.sh
 ```
 
-This builds `target/release/rustterm` if needed, then installs the binary to
+This builds the release binary with `--locked`, then installs the binary to
 `~/.local/bin`, the launcher to `~/.local/share/applications`, and the icon to
 `~/.local/share/icons`. For a system-wide prefix, use
 `PREFIX=/usr/local ./install.sh` (the prefix must be writable by your user).
+
+To remove it:
+
+```bash
+./install.sh --uninstall          # binary, launcher and icon
+./install.sh --uninstall --purge  # also ~/.config/rustterm (settings, profiles)
+```
+
+Passwords stored in the desktop keyring are managed by the keyring itself and
+are not removed by the script.
 
 ## Documentation
 

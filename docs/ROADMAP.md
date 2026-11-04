@@ -67,6 +67,8 @@ ships with 1.1. These runtime items are measured, riskier follow-ups.
 - **Size / lean build**: run `cargo bloat --release --crates` to find the real
   hotspots and document `--no-default-features` (no keyring/zbus) as an
   optional artifact.
+  - Baseline: 15 MB stripped x86_64 release binary (rustc 1.99.1, default
+    features, `lto = "thin"`).
   - Done when: the release binary size has a recorded baseline.
 
 ## Packaging

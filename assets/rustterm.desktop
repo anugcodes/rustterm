@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=rustterm
+GenericName=SSH Terminal
+Comment=Lightweight SSH terminal with an SFTP panel
+Exec=rustterm
+Icon=rustterm
+Terminal=false
+Categories=Network;RemoteAccess;TerminalEmulator;
+Keywords=ssh;sftp;terminal;remote;
+StartupNotify=true
+StartupWMClass=rustterm

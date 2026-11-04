@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-label="rustterm">
+  <rect x="10" y="10" width="236" height="236" rx="44" fill="#12161b" stroke="#2a323c" stroke-width="4"/>
+  <path d="M66 92 L108 128 L66 164" fill="none" stroke="#4a86e8" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="126" y="150" width="66" height="14" rx="7" fill="#8b96a5"/>
+</svg>

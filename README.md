@@ -75,6 +75,17 @@ cargo run --release
 
 Enter a host, port, username, and password, then click **Connect**.
 
+## Install (user-local)
+
+```bash
+./install.sh
+```
+
+This builds `target/release/rustterm` if needed, then installs the binary to
+`~/.local/bin`, the launcher to `~/.local/share/applications`, and the icon to
+`~/.local/share/icons`. For a system-wide prefix, use
+`PREFIX=/usr/local ./install.sh` (the prefix must be writable by your user).
+
 ## Documentation
 
 - [`USAGE.md`](USAGE.md) — how each feature works, plus a manual test checklist.

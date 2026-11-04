@@ -3844,36 +3844,44 @@ impl RustTermApp {
                 );
             });
 
-            let events = ui.input(|i| i.events.clone());
             let mods = ui.input(|i| i.modifiers);
             // DECCKM (`?1h`): ncurses programs expect SS3 cursor keys.
             let app_cursor = session.terminal.app_cursor_mode();
-            for event in &events {
-                // Shift+PgUp/PgDn/Home/End scroll the local scrollback instead
-                // of being encoded and sent to the remote program.
-                if session.terminal.handle_scroll_event(event) {
-                    activity = true; // viewport changed: repaint next frame
-                    continue;
-                }
-                // Ctrl+Shift+C copies the mouse selection to the system
-                // clipboard. egui reports it as `Event::Copy`, the same event
-                // as Ctrl+C, so the current modifiers disambiguate the two.
-                if input::is_copy_gesture(event, mods) {
-                    if let Some(text) = session.terminal.selected_text() {
-                        ctx.copy_text(text);
+            // Iterate borrowed events instead of cloning the list every frame.
+            // `ctx.copy_text` takes the same context lock as `input`, so it is
+            // deferred until the callback returns.
+            let mut copied = None;
+            ui.input(|i| {
+                for event in &i.events {
+                    // Shift+PgUp/PgDn/Home/End scroll the local scrollback instead
+                    // of being encoded and sent to the remote program.
+                    if session.terminal.handle_scroll_event(event) {
+                        activity = true; // viewport changed: repaint next frame
+                        continue;
                     }
-                    activity = true;
-                    continue;
+                    // Ctrl+Shift+C copies the mouse selection to the system
+                    // clipboard. egui reports it as `Event::Copy`, the same event
+                    // as Ctrl+C, so the current modifiers disambiguate the two.
+                    if input::is_copy_gesture(event, mods) {
+                        if let Some(text) = session.terminal.selected_text() {
+                            copied = Some(text);
+                        }
+                        activity = true;
+                        continue;
+                    }
+                    if let Some(bytes) = input::event_to_bytes(event, mods, app_cursor) {
+                        session.ssh.write(bytes);
+                        // Typing clears the selection and returns to the live view:
+                        // input while scrolled back would otherwise go somewhere the
+                        // user cannot see.
+                        session.terminal.clear_selection();
+                        session.terminal.scroll_to_bottom();
+                        activity = true;
+                    }
                 }
-                if let Some(bytes) = input::event_to_bytes(event, mods, app_cursor) {
-                    session.ssh.write(bytes);
-                    // Typing clears the selection and returns to the live view:
-                    // input while scrolled back would otherwise go somewhere the
-                    // user cannot see.
-                    session.terminal.clear_selection();
-                    session.terminal.scroll_to_bottom();
-                    activity = true;
-                }
+            });
+            if let Some(text) = copied {
+                ctx.copy_text(text);
             }
         }
 
